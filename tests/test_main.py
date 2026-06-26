@@ -28,11 +28,18 @@ def test_query_builder():
     assert f'"{title}" "{author}" reseña' in queries
     assert f'"{isbn}" "{title}"' in queries
     assert f'"{title}" "{author}" review' in queries
+    assert f'"{title}" "{author}" reseña -comprar -amazon -fnac -casadellibro -iberlibro' in queries
     
     # Ensure double quotes inside titles are escaped/handled
     title_with_quotes = 'El "Quijote"'
     queries_q = query_builder.build_queries(title_with_quotes, author, isbn)
     assert f'"El \'Quijote\'" "{author}"' in queries_q
+
+    # Verify site-specific queries
+    domains = ["revistadelibros.com", "aceprensa.com"]
+    queries_d = query_builder.build_queries(title, author, isbn, review_domains=domains)
+    assert 'site:revistadelibros.com "Ficciones" "Jorge Luis Borges"' in queries_d
+    assert 'site:aceprensa.com "Ficciones" reseña' in queries_d
 
 def test_deduplicator_normalization():
     """

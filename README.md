@@ -98,6 +98,15 @@ Copia el string resultante y pégalo en el valor de la variable en tu archivo `.
     pytest
     ```
 
+> [!NOTE]
+> **Nota sobre codificación en Windows (PowerShell)**:
+> Si en la terminal de PowerShell observas caracteres con problemas de codificación (como `EjecuciÃ³n`, `reseÃ±as` o `IntroducciÃ³n`), esto es únicamente un comportamiento visual de la terminal de Windows. Google Sheets recibe y escribe los caracteres correctamente en formato UTF-8 nativo.
+> Para corregir la visualización en tu sesión de PowerShell, ejecuta el siguiente comando antes de lanzar el servidor o consultar resultados:
+> ```powershell
+> chcp 65001
+> ```
+
+
 ---
 
 ## 🐳 Ejecución con Docker / Dokploy

@@ -104,8 +104,9 @@ class RunService:
 
     def execute_run(self, run_id: str, limit_books: int, dry_run: bool):
         sheet_id = settings.GOOGLE_SHEET_ID
-        self._add_in_memory_log(run_id, "INFO", "RUN_START", f"Iniciando run global (limit_books={limit_books}, dry_run={dry_run})")
-        logger_service.log("INFO", "RUN_START", f"Iniciando ejecución {run_id}", sheet_id=sheet_id, run_id=run_id)
+        log_prefix = "[PRUEBA] " if dry_run else ""
+        self._add_in_memory_log(run_id, "INFO", "RUN_START", f"{log_prefix}Iniciando run global (limit_books={limit_books}, dry_run={dry_run})")
+        logger_service.log("INFO", "RUN_START", f"{log_prefix}Iniciando ejecución {run_id}", sheet_id=sheet_id, run_id=run_id)
 
         try:
             current_runs[run_id]["status"] = "running"
@@ -118,7 +119,10 @@ class RunService:
             min_score = run_config["MIN_MATCH_SCORE"]
             openai_model = run_config["OPENAI_MODEL"]
             
-            self._add_in_memory_log(run_id, "INFO", "CONFIG_LOADED", f"Configuraciones leídas: Max libros={max_books}, Min score={min_score}, Modelo OpenAI={openai_model}")
+            review_domains_str = run_config.get("REVIEW_DOMAINS", "")
+            review_domains = [d.strip() for d in review_domains_str.split(",") if d.strip()]
+            
+            self._add_in_memory_log(run_id, "INFO", "CONFIG_LOADED", f"Configuraciones leídas: Max libros={max_books}, Min score={min_score}, Dominios específicos={len(review_domains)}")
             
             # 2. Get pending books
             pending_books = sheets_service.get_pending_books(sheet_id, limit=max_books)
@@ -147,28 +151,54 @@ class RunService:
                 author = book["author"]
                 row_index = book["row_index"]
 
-                self._process_book(
-                    run_id=run_id,
-                    sheet_id=sheet_id,
-                    row_index=row_index,
-                    isbn=isbn,
-                    title=title,
-                    author=author,
-                    max_pages=max_pages,
-                    max_candidates=max_candidates,
-                    min_score=min_score,
-                    openai_model=openai_model,
-                    existing_hashes=existing_hashes,
-                    existing_secondary_keys=existing_secondary_keys,
-                    dry_run=dry_run
-                )
-                
-                current_runs[run_id]["books_processed"] += 1
+                try:
+                    final_status = self._process_book(
+                        run_id=run_id,
+                        sheet_id=sheet_id,
+                        row_index=row_index,
+                        isbn=isbn,
+                        title=title,
+                        author=author,
+                        max_pages=max_pages,
+                        max_candidates=max_candidates,
+                        min_score=min_score,
+                        openai_model=openai_model,
+                        existing_hashes=existing_hashes,
+                        existing_secondary_keys=existing_secondary_keys,
+                        review_domains=review_domains,
+                        dry_run=dry_run
+                    )
+                    
+                    if final_status == "completado":
+                        current_runs[run_id]["books_completed"] += 1
+                    elif final_status == "sin_resultados":
+                        current_runs[run_id]["books_no_results"] += 1
+                    elif final_status == "error":
+                        current_runs[run_id]["books_failed"] += 1
+                except Exception as e:
+                    logger_service.log("ERROR", "BOOK_PROCESS_FAIL", f"Error procesando libro '{title}': {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                    self._add_in_memory_log(run_id, "ERROR", "BOOK_PROCESS_FAIL", str(e), isbn=isbn)
+                    current_runs[run_id]["books_failed"] += 1
+                    
+                    if not dry_run:
+                        try:
+                            sheets_service.update_book_status(
+                                sheet_id=sheet_id,
+                                row_index=row_index,
+                                status="error",
+                                last_run=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                reviews_found=0,
+                                observations=f"Error de proceso: {str(e)}"
+                            )
+                        except Exception as e_sheet:
+                            logger_service.log("ERROR", "SHEET_UPDATE_FAIL", f"Fallo al marcar estado 'error' en Libros: {e_sheet}", isbn=isbn, sheet_id=sheet_id)
+                finally:
+                    current_runs[run_id]["books_processed"] += 1
             
             current_runs[run_id]["status"] = "completed"
             current_runs[run_id]["message"] = f"Ejecución completada. Procesados {current_runs[run_id]['books_processed']} libros."
-            self._add_in_memory_log(run_id, "INFO", "RUN_END", "Ejecución global completada con éxito.")
-            logger_service.log("INFO", "RUN_END", "Ejecución global completada.", sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "INFO", "RUN_END", f"Ejecución global completada. Completados={current_runs[run_id]['books_completed']}, Sin resultados={current_runs[run_id]['books_no_results']}, Fallidos={current_runs[run_id]['books_failed']}")
+            logger_service.log("INFO", "RUN_END", f"Ejecución global completada. Completados={current_runs[run_id]['books_completed']}, Sin resultados={current_runs[run_id]['books_no_results']}, Fallidos={current_runs[run_id]['books_failed']}", sheet_id=sheet_id, run_id=run_id)
 
         except Exception as e:
             current_runs[run_id]["status"] = "failed"
@@ -178,8 +208,9 @@ class RunService:
 
     def execute_single_book(self, run_id: str, isbn: str, dry_run: bool):
         sheet_id = settings.GOOGLE_SHEET_ID
-        self._add_in_memory_log(run_id, "INFO", "RUN_START", f"Iniciando run individual para ISBN {isbn} (dry_run={dry_run})")
-        logger_service.log("INFO", "RUN_START", f"Iniciando ejecución individual {run_id} para ISBN {isbn}", sheet_id=sheet_id, run_id=run_id)
+        log_prefix = "[PRUEBA] " if dry_run else ""
+        self._add_in_memory_log(run_id, "INFO", "RUN_START", f"{log_prefix}Iniciando run individual para ISBN {isbn} (dry_run={dry_run})")
+        logger_service.log("INFO", "RUN_START", f"{log_prefix}Iniciando ejecución individual {run_id} para ISBN {isbn}", sheet_id=sheet_id, run_id=run_id)
 
         try:
             current_runs[run_id]["status"] = "running"
@@ -190,6 +221,9 @@ class RunService:
             max_candidates = run_config["MAX_CANDIDATES_PER_BOOK"]
             min_score = run_config["MIN_MATCH_SCORE"]
             openai_model = run_config["OPENAI_MODEL"]
+            
+            review_domains_str = run_config.get("REVIEW_DOMAINS", "")
+            review_domains = [d.strip() for d in review_domains_str.split(",") if d.strip()]
 
             # Get book by ISBN
             book = sheets_service.get_book_by_isbn(sheet_id, isbn)
@@ -205,23 +239,50 @@ class RunService:
             existing_hashes = deduplicator.extract_hashes_from_reviews(existing_reviews)
             existing_secondary_keys = deduplicator.extract_secondary_keys_from_reviews(existing_reviews)
 
-            self._process_book(
-                run_id=run_id,
-                sheet_id=sheet_id,
-                row_index=book["row_index"],
-                isbn=book["isbn"],
-                title=book["title"],
-                author=book["author"],
-                max_pages=max_pages,
-                max_candidates=max_candidates,
-                min_score=min_score,
-                openai_model=openai_model,
-                existing_hashes=existing_hashes,
-                existing_secondary_keys=existing_secondary_keys,
-                dry_run=dry_run
-            )
+            try:
+                final_status = self._process_book(
+                    run_id=run_id,
+                    sheet_id=sheet_id,
+                    row_index=book["row_index"],
+                    isbn=book["isbn"],
+                    title=book["title"],
+                    author=book["author"],
+                    max_pages=max_pages,
+                    max_candidates=max_candidates,
+                    min_score=min_score,
+                    openai_model=openai_model,
+                    existing_hashes=existing_hashes,
+                    existing_secondary_keys=existing_secondary_keys,
+                    review_domains=review_domains,
+                    dry_run=dry_run
+                )
+                
+                if final_status == "completado":
+                    current_runs[run_id]["books_completed"] += 1
+                elif final_status == "sin_resultados":
+                    current_runs[run_id]["books_no_results"] += 1
+                elif final_status == "error":
+                    current_runs[run_id]["books_failed"] += 1
+            except Exception as e:
+                logger_service.log("ERROR", "BOOK_PROCESS_FAIL", f"Error procesando libro '{book['title']}': {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                self._add_in_memory_log(run_id, "ERROR", "BOOK_PROCESS_FAIL", str(e), isbn=isbn)
+                current_runs[run_id]["books_failed"] += 1
+                
+                if not dry_run:
+                    try:
+                        sheets_service.update_book_status(
+                            sheet_id=sheet_id,
+                            row_index=book["row_index"],
+                            status="error",
+                            last_run=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            reviews_found=0,
+                            observations=f"Error de proceso: {str(e)}"
+                        )
+                    except Exception as e_sheet:
+                        logger_service.log("ERROR", "SHEET_UPDATE_FAIL", f"Fallo al marcar estado 'error' en Libros: {e_sheet}", isbn=isbn, sheet_id=sheet_id)
+            finally:
+                current_runs[run_id]["books_processed"] = 1
 
-            current_runs[run_id]["books_processed"] = 1
             current_runs[run_id]["status"] = "completed"
             current_runs[run_id]["message"] = f"Ejecución completada para ISBN {isbn}."
             self._add_in_memory_log(run_id, "INFO", "RUN_END", f"Ejecución individual para ISBN {isbn} completada.")
@@ -247,13 +308,15 @@ class RunService:
         openai_model: str,
         existing_hashes: Set[str],
         existing_secondary_keys: Set[str],
-        dry_run: bool
-    ):
+        review_domains: List[str] = None,
+        dry_run: bool = False
+    ) -> str:
         """
         Runs the extraction and validation pipeline for a single book.
         """
-        logger_service.log("INFO", "BOOK_PROCESS_START", f"Procesando libro: '{title}' por {author}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-        self._add_in_memory_log(run_id, "INFO", "BOOK_PROCESS_START", f"Procesando: '{title}' por {author}", isbn=isbn)
+        log_prefix = "[PRUEBA] " if dry_run else ""
+        logger_service.log("INFO", "BOOK_PROCESS_START", f"{log_prefix}Procesando libro: '{title}' por {author}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+        self._add_in_memory_log(run_id, "INFO", "BOOK_PROCESS_START", f"{log_prefix}Procesando: '{title}' por {author}", isbn=isbn)
 
         # Mark as processing in sheets if not dry run
         if not dry_run:
@@ -271,23 +334,45 @@ class RunService:
                 self._add_in_memory_log(run_id, "ERROR", "BOOK_STATUS_UPDATE_FAIL", f"Fallo al marcar procesando: {e}", isbn=isbn)
 
         # 1. Generate queries
-        queries = query_builder.build_queries(title, author, isbn)
-        self._add_in_memory_log(run_id, "INFO", "QUERIES_GENERATED", f"Generadas {len(queries)} queries.", isbn=isbn)
+        queries = query_builder.build_queries(title, author, isbn, review_domains=review_domains)
+        self._add_in_memory_log(run_id, "INFO", "QUERIES_GENERATED", f"{log_prefix}Generadas {len(queries)} queries.", isbn=isbn)
 
-        # 2. Gather candidate URLs
-        candidate_urls: List[str] = []
+        # 2. Gather candidate URLs tracking their query origins
+        candidate_origin: Dict[str, str] = {}
         for q in queries:
-            if len(candidate_urls) >= max_candidates:
+            if len(candidate_origin) >= max_candidates:
                 break
             found_urls = search_service.search(q, max_pages=max_pages)
             for url in found_urls:
-                if url not in candidate_urls:
-                    candidate_urls.append(url)
-                    if len(candidate_urls) >= max_candidates:
+                if url not in candidate_origin:
+                    candidate_origin[url] = q
+                    if len(candidate_origin) >= max_candidates:
                         break
 
-        self._add_in_memory_log(run_id, "INFO", "SEARCH_COMPLETED", f"Búsqueda finalizada. Encontradas {len(candidate_urls)} URLs candidatas.", isbn=isbn)
-        logger_service.log("INFO", "SEARCH_COMPLETED", f"Encontradas {len(candidate_urls)} URLs candidatas.", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+        candidate_urls = list(candidate_origin.keys())
+
+        # Log each candidate found with its originating query
+        for url, origin_query in candidate_origin.items():
+            logger_service.log(
+                level="INFO",
+                action="CANDIDATE_FOUND",
+                message=f"{log_prefix}Candidato: {url}",
+                isbn=isbn,
+                detail=f"Query: {origin_query}",
+                sheet_id=sheet_id,
+                run_id=run_id
+            )
+            self._add_in_memory_log(
+                run_id=run_id,
+                level="INFO",
+                action="CANDIDATE_FOUND",
+                message=f"{log_prefix}Candidato: {url}",
+                isbn=isbn,
+                detail=f"Query: {origin_query}"
+            )
+
+        self._add_in_memory_log(run_id, "INFO", "SEARCH_COMPLETED", f"{log_prefix}Búsqueda finalizada. Encontradas {len(candidate_urls)} URLs candidatas.", isbn=isbn)
+        logger_service.log("INFO", "SEARCH_COMPLETED", f"{log_prefix}Encontradas {len(candidate_urls)} URLs candidatas.", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
 
         reviews_added = 0
         descartes_added = 0
@@ -296,28 +381,21 @@ class RunService:
 
         # 3. Process candidate URLs
         for url in candidate_urls:
+            origin_query = candidate_origin.get(url, "")
+            
             # Check primary duplicate
             norm_url = deduplicator.normalize_url(url)
             prim_hash = deduplicator.get_primary_hash(isbn, url)
             
             if prim_hash in existing_hashes:
                 # Save to descartes
-                logger_service.log("DEBUG", "DEDUPLICATE_SKIP", f"Saltando URL duplicada: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                logger_service.log("DEBUG", "DEDUPLICATE_SKIP", f"{log_prefix}Saltando URL duplicada: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
                 if not dry_run:
-                    # ISBN, Título, Autor, Query, URL, Título detectado, Motivo de descarte, Score, Fecha extracción
                     sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, "", url, "", "duplicado", 0, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        isbn, title, author, origin_query, url, "", "duplicado", 0, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     ])
                 descartes_added += 1
                 continue
-
-            # Secondary deduplication check (log but don't block)
-            try:
-                domain = urlparse(url).netloc
-                sec_key = deduplicator.get_secondary_key(isbn, domain, "") # Note: without article title, but we check if matches
-                # If we want exact title matching, we check after extraction. Let's do it after extraction!
-            except Exception:
-                pass
 
             # Extract article content
             article_data = {}
@@ -329,10 +407,10 @@ class RunService:
                 if "texto insuficiente" in err_msg:
                     reason = "texto insuficiente"
 
-                logger_service.log("WARNING", "EXTRACTION_FAILED", f"Error extrayendo {url}: {err_msg}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                logger_service.log("WARNING", "EXTRACTION_FAILED", f"{log_prefix}Error extrayendo {url}: {err_msg}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
                 if not dry_run:
                     sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, "", url, "", reason, 0, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        isbn, title, author, origin_query, url, "", reason, 0, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     ])
                 descartes_added += 1
                 failed_extractions += 1
@@ -343,7 +421,7 @@ class RunService:
             art_domain = urlparse(url).netloc
             sec_key = deduplicator.get_secondary_key(isbn, art_domain, art_title)
             if sec_key in existing_secondary_keys:
-                logger_service.log("WARNING", "DEDUPLICATE_SECONDARY_WARN", f"Posible duplicado secundario detectado para URL: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                logger_service.log("WARNING", "DEDUPLICATE_SECONDARY_WARN", f"{log_prefix}Posible duplicado secundario detectado para URL: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
                 self._add_in_memory_log(run_id, "WARNING", "DEDUPLICATE_SECONDARY_WARN", f"Posible duplicado secundario: {url}", isbn=isbn)
 
             # Analyze content with OpenAI
@@ -352,7 +430,7 @@ class RunService:
                     isbn=isbn,
                     book_title=title,
                     book_author=author,
-                    query="",
+                    query=origin_query,
                     url=url,
                     article_title=art_title,
                     article_text=article_data.get("text") or "",
@@ -362,10 +440,10 @@ class RunService:
                     model_override=openai_model
                 )
             except Exception as e:
-                logger_service.log("ERROR", "OPENAI_FAILED", f"Error OpenAI para {url}: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                logger_service.log("ERROR", "OPENAI_FAILED", f"{log_prefix}Error OpenAI para {url}: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
                 if not dry_run:
                     sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, "", url, art_title, "error OpenAI", 0, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        isbn, title, author, origin_query, url, art_title, "error OpenAI", 0, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     ])
                 descartes_added += 1
                 continue
@@ -377,7 +455,6 @@ class RunService:
             # Map OpenAI reason or scores to descarte categories
             descarte_reason = ""
             if not is_valid:
-                # Decide if it speaks only about author or doesn't mention book at all
                 openai_reason_lower = openai_reason.lower()
                 if "autor" in openai_reason_lower and ("sólo" in openai_reason_lower or "solo" in openai_reason_lower or "no habla" in openai_reason_lower):
                     descarte_reason = "habla solo del autor"
@@ -387,18 +464,18 @@ class RunService:
                 descarte_reason = "score bajo"
 
             if descarte_reason:
-                logger_service.log("INFO", "ARTICLE_DISCARDED", f"URL descartada ({descarte_reason}, score: {score}): {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-                self._add_in_memory_log(run_id, "INFO", "ARTICLE_DISCARDED", f"Descarte ({descarte_reason}, score={score}): {url}", isbn=isbn)
+                logger_service.log("INFO", "ARTICLE_DISCARDED", f"{log_prefix}URL descartada ({descarte_reason}, score: {score}): {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                self._add_in_memory_log(run_id, "INFO", "ARTICLE_DISCARDED", f"{log_prefix}Descarte ({descarte_reason}, score={score}): {url}", isbn=isbn)
                 
                 if not dry_run:
                     sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, "", url, art_title, descarte_reason, score, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        isbn, title, author, origin_query, url, art_title, descarte_reason, score, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     ])
                 descartes_added += 1
             else:
                 # Valid Review!
-                logger_service.log("INFO", "ARTICLE_ACCEPTED", f"Reseña válida aceptada (score: {score}): {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-                self._add_in_memory_log(run_id, "INFO", "ARTICLE_ACCEPTED", f"Aceptada (score={score}): {url}", isbn=isbn)
+                logger_service.log("INFO", "ARTICLE_ACCEPTED", f"{log_prefix}Reseña válida aceptada (score: {score}): {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                self._add_in_memory_log(run_id, "INFO", "ARTICLE_ACCEPTED", f"{log_prefix}Aceptada (score={score}): {url}", isbn=isbn)
 
                 if not dry_run:
                     # Col schema for 'Reseñas' tab:
@@ -408,7 +485,7 @@ class RunService:
                         isbn,
                         title,
                         author,
-                        "", # Query (could be empty or last query used, let's keep empty or simple)
+                        origin_query,
                         url,
                         norm_url,
                         art_title,
@@ -424,7 +501,7 @@ class RunService:
                         analysis.get("content_type", ""),
                         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         prim_hash,
-                        "pendiente" # Default state for reviews (preparing for Phase 2 wordpress publication)
+                        "pendiente"
                     ])
                     # Add to existing hashes to prevent duplicates within the same run
                     existing_hashes.add(prim_hash)
@@ -442,11 +519,23 @@ class RunService:
         else:
             observation = f"Proceso finalizado. Encontradas y guardadas {reviews_added} reseñas. {descartes_added} descartes."
 
-        logger_service.log("INFO", "BOOK_PROCESS_END", f"Libro finalizado con estado '{final_status}'. {observation}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-        self._add_in_memory_log(run_id, "INFO", "BOOK_PROCESS_END", f"Finalizado: {final_status}. {observation}", isbn=isbn)
+        logger_service.log("INFO", "BOOK_PROCESS_END", f"{log_prefix}Libro finalizado con estado '{final_status}'. {observation}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+        self._add_in_memory_log(run_id, "INFO", "BOOK_PROCESS_END", f"{log_prefix}Finalizado: {final_status}. {observation}", isbn=isbn)
 
         if dry_run:
-            return
+            # Update row in Libros to show proof run, but KEEP status as 'pendiente'
+            try:
+                sheets_service.update_book_status(
+                    sheet_id=sheet_id,
+                    row_index=row_index,
+                    status="pendiente", # Keep pending!
+                    last_run=f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (Prueba)",
+                    reviews_found=reviews_added,
+                    observations=f"[PRUEBA] {observation}"
+                )
+            except Exception as e:
+                logger_service.log("WARNING", "BOOK_STATUS_UPDATE_FAIL", f"No se pudo actualizar logs de prueba en Libros: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+            return final_status
 
         # Update book status in Sheets
         try:
@@ -461,16 +550,8 @@ class RunService:
         except Exception as e:
             logger_service.log("ERROR", "BOOK_STATUS_UPDATE_FAIL", f"No se pudo actualizar el estado final: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
             self._add_in_memory_log(run_id, "ERROR", "BOOK_STATUS_UPDATE_FAIL", f"Fallo al actualizar estado final: {e}", isbn=isbn)
-            
-            # Increment failed count in stats if update failed?
-            if run_id in current_runs:
-                current_runs[run_id]["books_failed"] += 1
-            return
+            return "error"
 
-        if run_id in current_runs:
-            if final_status == "completado":
-                current_runs[run_id]["books_completed"] += 1
-            elif final_status == "sin_resultados":
-                current_runs[run_id]["books_no_results"] += 1
+        return final_status
 
 run_service = RunService()

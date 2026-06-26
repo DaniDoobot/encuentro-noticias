@@ -87,7 +87,8 @@ class SheetsService:
             {"Clave": "MAX_SEARCH_PAGES_PER_QUERY", "Valor": str(settings.MAX_SEARCH_PAGES_PER_QUERY), "Descripción": "Páginas máximas del buscador a escanear por query"},
             {"Clave": "MAX_CANDIDATES_PER_BOOK", "Valor": str(settings.MAX_CANDIDATES_PER_BOOK), "Descripción": "Cantidad máxima de URLs candidatas a evaluar por libro"},
             {"Clave": "MIN_MATCH_SCORE", "Valor": str(settings.MIN_MATCH_SCORE), "Descripción": "Score mínimo de validación de OpenAI para aceptar una reseña (0-100)"},
-            {"Clave": "OPENAI_MODEL", "Valor": settings.OPENAI_MODEL, "Descripción": "Modelo de OpenAI a usar para análisis"}
+            {"Clave": "OPENAI_MODEL", "Valor": settings.OPENAI_MODEL, "Descripción": "Modelo de OpenAI a usar para análisis"},
+            {"Clave": "REVIEW_DOMAINS", "Valor": "revistadelibros.com,nueva-revista.net,aceprensa.com,elcultural.com,zendalibros.com,babelia.elpais.com", "Descripción": "Dominios culturales/literarios recomendados para búsquedas específicas (separados por coma)"}
         ]
 
         for config in default_configs:
@@ -123,7 +124,8 @@ class SheetsService:
                 "MAX_SEARCH_PAGES_PER_QUERY": int(config_dict.get("MAX_SEARCH_PAGES_PER_QUERY", settings.MAX_SEARCH_PAGES_PER_QUERY)),
                 "MAX_CANDIDATES_PER_BOOK": int(config_dict.get("MAX_CANDIDATES_PER_BOOK", settings.MAX_CANDIDATES_PER_BOOK)),
                 "MIN_MATCH_SCORE": int(config_dict.get("MIN_MATCH_SCORE", settings.MIN_MATCH_SCORE)),
-                "OPENAI_MODEL": config_dict.get("OPENAI_MODEL", settings.OPENAI_MODEL)
+                "OPENAI_MODEL": config_dict.get("OPENAI_MODEL", settings.OPENAI_MODEL),
+                "REVIEW_DOMAINS": config_dict.get("REVIEW_DOMAINS", "")
             }
         except Exception:
             # Fallback to local configs if sheet configs fail to read
@@ -132,7 +134,8 @@ class SheetsService:
                 "MAX_SEARCH_PAGES_PER_QUERY": settings.MAX_SEARCH_PAGES_PER_QUERY,
                 "MAX_CANDIDATES_PER_BOOK": settings.MAX_CANDIDATES_PER_BOOK,
                 "MIN_MATCH_SCORE": settings.MIN_MATCH_SCORE,
-                "OPENAI_MODEL": settings.OPENAI_MODEL
+                "OPENAI_MODEL": settings.OPENAI_MODEL,
+                "REVIEW_DOMAINS": ""
             }
 
     def get_pending_books(self, sheet_id: str, limit: int = 10) -> List[Dict[str, Any]]:
