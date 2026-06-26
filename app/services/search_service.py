@@ -1,127 +1,149 @@
-import httpx
-from bs4 import BeautifulSoup
-from urllib.parse import urlparse, parse_qs, unquote, urljoin
-from app.config import settings
 import time
 import logging
+from typing import List, Tuple, Set, Dict, Any
+
+from app.config import settings
+from app.services.logger_service import logger_service
+from app.services.search_providers import (
+    SearchProvider,
+    DuckDuckGoSearchProvider,
+    BingHtmlSearchProvider,
+    GoogleNewsRssSearchProvider,
+    SearchProviderRateLimitError,
+    SearchProviderError
+)
 
 logger = logging.getLogger("encuentro-noticias")
 
 class SearchService:
     def __init__(self):
-        self.base_url = "https://html.duckduckgo.com/html/"
-        self.headers = {
-            "User-Agent": settings.SCRAPER_USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3"
-        }
-
-    def _extract_real_url(self, href: str) -> str:
-        """
-        Extracts the destination URL from DuckDuckGo's redirection link format.
-        DuckDuckGo HTML link: /l/?uddg=https%3A%2F%2Fwww.example.com%2Fpath&rut=...
-        """
-        if not href:
-            return ""
+        self.ddg_provider = DuckDuckGoSearchProvider()
+        self.bing_provider = BingHtmlSearchProvider()
+        self.rss_provider = GoogleNewsRssSearchProvider()
         
-        # If it's a redirect link
-        if "uddg=" in href:
+        # Keep track of blocked providers for the current execution run
+        self.blocked_providers: Set[str] = set()
+        self.provider_errors_count = 0
+
+    def reset_blocked_providers(self):
+        """
+        Resets provider block states at the start of a run.
+        """
+        self.blocked_providers.clear()
+        self.provider_errors_count = 0
+        logger.info("Search providers blocked status reset.")
+
+    def get_and_reset_errors_count(self) -> int:
+        """
+        Returns the accumulated provider error count and resets it to 0.
+        """
+        errs = self.provider_errors_count
+        self.provider_errors_count = 0
+        return errs
+
+    def search_with_fallback(
+        self,
+        query: str,
+        max_pages: int,
+        sheet_id: str,
+        run_id: str,
+        isbn: str,
+        config: Dict[str, Any]
+    ) -> List[Tuple[str, str]]:
+        """
+        Executes a search query using active search providers.
+        DuckDuckGo is the primary search. If blocked or failing, it falls back to Bing.
+        If Google News RSS is enabled, it queries Google News RSS as a complement.
+        Returns a list of tuples: (url, provider_name)
+        """
+        results: List[Tuple[str, str]] = []
+        
+        # Load configs
+        backoff_seconds = config.get("SEARCH_BACKOFF_SECONDS", settings.SEARCH_BACKOFF_SECONDS)
+        enable_rss = config.get("ENABLE_GOOGLE_NEWS_RSS", settings.ENABLE_GOOGLE_NEWS_RSS)
+        timeout = settings.REQUEST_TIMEOUT_SECONDS
+
+        # 1. Primary & Secondary search fallback list
+        primary_providers = [self.ddg_provider, self.bing_provider]
+        urls_found = []
+        selected_provider_name = ""
+
+        for provider in primary_providers:
+            p_name = provider.name()
+            if p_name in self.blocked_providers:
+                continue
+
+            logger_service.log(
+                level="INFO",
+                action="SEARCH_PROVIDER_USED",
+                message=f"Buscando query con {p_name}: {query}",
+                isbn=isbn,
+                detail=f"Provider: {p_name}",
+                sheet_id=sheet_id,
+                run_id=run_id
+            )
+
             try:
-                parsed = urlparse(href)
-                qs = parse_qs(parsed.query)
-                if "uddg" in qs:
-                    return unquote(qs["uddg"][0])
-            except Exception as e:
-                logger.debug(f"Failed to parse DDG redirect URL {href}: {e}")
-        
-        # If it is a relative url starting with //
-        if href.startswith("//"):
-            return "https:" + href
-            
-        # Absolute URL
-        if href.startswith("http://") or href.startswith("https://"):
-            return href
-            
-        return href
-
-    def search(self, query: str, max_pages: int = 1) -> List[str]:
-        """
-        Searches for a query on DuckDuckGo HTML and retrieves candidate URLs.
-        Follows pagination forms to retrieve up to max_pages of results.
-        """
-        urls = []
-        client = httpx.Client(timeout=settings.REQUEST_TIMEOUT_SECONDS)
-        
-        try:
-            # First Page is a GET request
-            params = {"q": query}
-            logger.info(f"Searching: {query} (GET page 1)")
-            response = client.get(self.base_url, params=params, headers=self.headers)
-            
-            if response.status_code != 200:
-                logger.error(f"DuckDuckGo search error {response.status_code} for query: {query}")
-                return []
-
-            page_num = 1
-            while True:
-                soup = BeautifulSoup(response.text, "html.parser")
+                urls_found = provider.search(query, max_pages=max_pages, timeout=timeout)
+                selected_provider_name = p_name
+                break
+            except SearchProviderRateLimitError as e:
+                self.provider_errors_count += 1
+                logger_service.log(
+                    level="WARNING",
+                    action="SEARCH_PROVIDER_ERROR",
+                    message=f"Rate limit en {p_name} para query: {query}",
+                    isbn=isbn,
+                    detail=f"provider={p_name} | status_code={e.status_code} | query={query} | message={e.message}",
+                    sheet_id=sheet_id,
+                    run_id=run_id
+                )
+                self.blocked_providers.add(p_name)
+                logger.warning(f"Temporarily blocking provider {p_name} due to rate limiting.")
                 
-                # Extract all results
-                results_found_on_page = 0
-                for a_tag in soup.find_all("a", class_="result__a"):
-                    href = a_tag.get("href")
-                    real_url = self._extract_real_url(href)
-                    if real_url and (real_url.startswith("http://") or real_url.startswith("https://")):
-                        # Avoid adding duckduckgo itself or system links
-                        if "duckduckgo.com" not in real_url:
-                            urls.append(real_url)
-                            results_found_on_page += 1
+                logger.info(f"Applying backoff delay of {backoff_seconds} seconds...")
+                time.sleep(backoff_seconds)
+            except SearchProviderError as e:
+                self.provider_errors_count += 1
+                logger_service.log(
+                    level="WARNING",
+                    action="SEARCH_PROVIDER_ERROR",
+                    message=f"Error en {p_name}: {e.message}",
+                    isbn=isbn,
+                    detail=f"provider={p_name} | status_code={e.status_code} | query={query} | message={e.message}",
+                    sheet_id=sheet_id,
+                    run_id=run_id
+                )
+                continue
 
-                logger.debug(f"Page {page_num}: Found {results_found_on_page} URLs")
+        # Add organic results
+        for url in urls_found:
+            results.append((url, selected_provider_name))
 
-                if page_num >= max_pages:
-                    break
+        # 2. Complementary search: Google News RSS (if enabled)
+        if enable_rss:
+            p_name = self.rss_provider.name()
+            if p_name not in self.blocked_providers:
+                try:
+                    rss_urls = self.rss_provider.search(query, max_pages=max_pages, timeout=timeout)
+                    for url in rss_urls:
+                        if not any(r[0] == url for r in results):
+                            results.append((url, p_name))
+                except SearchProviderRateLimitError as e:
+                    self.provider_errors_count += 1
+                    logger_service.log(
+                        level="WARNING",
+                        action="SEARCH_PROVIDER_ERROR",
+                        message=f"Rate limit en {p_name} para query: {query}",
+                        isbn=isbn,
+                        detail=f"provider={p_name} | status_code={e.status_code} | query={query} | message={e.message}",
+                        sheet_id=sheet_id,
+                        run_id=run_id
+                    )
+                    self.blocked_providers.add(p_name)
+                except Exception as e:
+                    logger.debug(f"Google News RSS complementary search failed for query '{query}': {e}")
 
-                # Look for the pagination form
-                # DuckDuckGo HTML uses a form with submit button 'Next' for pagination
-                form = soup.find("form", action="/html/")
-                if not form:
-                    # No more pages
-                    break
-
-                # Gather form input elements
-                form_data = {}
-                for input_tag in form.find_all("input"):
-                    name = input_tag.get("name")
-                    val = input_tag.get("value")
-                    if name:
-                        form_data[name] = val
-
-                # Submit POST for next page
-                page_num += 1
-                logger.info(f"Searching: {query} (POST page {page_num})")
-                time.sleep(1.0) # Polite delay
-                
-                post_url = urljoin(self.base_url, form.get("action", "/html/"))
-                response = client.post(post_url, data=form_data, headers=self.headers)
-                
-                if response.status_code != 200:
-                    logger.warning(f"Failed to fetch page {page_num} for query: {query}. Code: {response.status_code}")
-                    break
-
-        except Exception as e:
-            logger.error(f"Search exception for query '{query}': {e}", exc_info=True)
-        finally:
-            client.close()
-
-        # Deduplicate preserving order
-        seen = set()
-        unique_urls = []
-        for u in urls:
-            if u not in seen:
-                seen.add(u)
-                unique_urls.append(u)
-
-        return unique_urls
+        return results
 
 search_service = SearchService()

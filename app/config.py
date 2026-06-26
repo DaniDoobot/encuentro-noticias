@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     MAX_CANDIDATES_PER_BOOK: int = 50
     REQUEST_TIMEOUT_SECONDS: int = 20
     SCRAPER_USER_AGENT: str = "Mozilla/5.0 compatible encuentro-noticias"
+    SEARCH_DELAY_SECONDS: int = 3
+    SEARCH_BACKOFF_SECONDS: int = 30
+    MAX_QUERIES_PER_BOOK: int = 20
+    ENABLE_GOOGLE_NEWS_RSS: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",

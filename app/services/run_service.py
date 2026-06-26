@@ -1,6 +1,8 @@
 import uuid
 import datetime
-from typing import Dict, Any, List, Optional, Set
+import json
+import time
+from typing import Dict, Any, List, Optional, Set, Tuple
 import threading
 from urllib.parse import urlparse
 
@@ -34,7 +36,6 @@ class RunService:
             "logs": []
         }
         
-        # Start execution in a background thread
         thread = threading.Thread(
             target=self.execute_run,
             args=(run_id, limit_books, dry_run)
@@ -68,14 +69,10 @@ class RunService:
         return run_id
 
     def rebuild_dedupe_hashes(self, sheet_id: str) -> int:
-        """
-        Reads all rows from Reseñas, calculates their primary hashes,
-        and writes them back if they are empty or incorrect.
-        """
         reviews = sheets_service.get_all_reviews(sheet_id)
-        updates = [] # List of tuples: (row_index, hash)
+        updates = []
         
-        for idx, row in enumerate(reviews, start=2): # Header is row 1
+        for idx, row in enumerate(reviews, start=2):
             isbn = str(row.get("ISBN", "")).strip()
             url = str(row.get("URL", "")).strip()
             existing_hash = str(row.get("Hash deduplicación", "")).strip()
@@ -110,6 +107,7 @@ class RunService:
 
         try:
             current_runs[run_id]["status"] = "running"
+            search_service.reset_blocked_providers()
             
             # 1. Fetch configs from Google Sheets Config sheet
             run_config = sheets_service.get_config_dict(sheet_id)
@@ -166,6 +164,7 @@ class RunService:
                         existing_hashes=existing_hashes,
                         existing_secondary_keys=existing_secondary_keys,
                         review_domains=review_domains,
+                        run_config=run_config,
                         dry_run=dry_run
                     )
                     
@@ -214,6 +213,7 @@ class RunService:
 
         try:
             current_runs[run_id]["status"] = "running"
+            search_service.reset_blocked_providers()
             
             # Fetch config
             run_config = sheets_service.get_config_dict(sheet_id)
@@ -254,6 +254,7 @@ class RunService:
                     existing_hashes=existing_hashes,
                     existing_secondary_keys=existing_secondary_keys,
                     review_domains=review_domains,
+                    run_config=run_config,
                     dry_run=dry_run
                 )
                 
@@ -309,6 +310,7 @@ class RunService:
         existing_hashes: Set[str],
         existing_secondary_keys: Set[str],
         review_domains: List[str] = None,
+        run_config: Dict[str, Any] = None,
         dry_run: bool = False
     ) -> str:
         """
@@ -317,6 +319,11 @@ class RunService:
         log_prefix = "[PRUEBA] " if dry_run else ""
         logger_service.log("INFO", "BOOK_PROCESS_START", f"{log_prefix}Procesando libro: '{title}' por {author}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
         self._add_in_memory_log(run_id, "INFO", "BOOK_PROCESS_START", f"{log_prefix}Procesando: '{title}' por {author}", isbn=isbn)
+
+        # Load configs
+        config = run_config or {}
+        search_delay = float(config.get("SEARCH_DELAY_SECONDS", settings.SEARCH_DELAY_SECONDS))
+        max_queries = int(config.get("MAX_QUERIES_PER_BOOK", settings.MAX_QUERIES_PER_BOOK))
 
         # Mark as processing in sheets if not dry run
         if not dry_run:
@@ -333,32 +340,107 @@ class RunService:
                 logger_service.log("ERROR", "BOOK_STATUS_UPDATE_FAIL", f"No se pudo actualizar el estado del libro a procesando: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
                 self._add_in_memory_log(run_id, "ERROR", "BOOK_STATUS_UPDATE_FAIL", f"Fallo al marcar procesando: {e}", isbn=isbn)
 
-        # 1. Generate queries
-        queries = query_builder.build_queries(title, author, isbn, review_domains=review_domains)
-        self._add_in_memory_log(run_id, "INFO", "QUERIES_GENERATED", f"{log_prefix}Generadas {len(queries)} queries.", isbn=isbn)
+        # 1. Generate queries categorized into 3 levels
+        queries_dict = query_builder.build_queries(title, author, isbn, review_domains=review_domains)
+        prioritarias = queries_dict["prioritarias"]
+        apoyo = queries_dict["apoyo"]
+        dominios = queries_dict["dominios"]
+        
+        self._add_in_memory_log(
+            run_id, "INFO", "QUERIES_GENERATED", 
+            f"{log_prefix}Generadas queries por nivel: Prioritarias={len(prioritarias)}, Apoyo={len(apoyo)}, Dominios={len(dominios)}", 
+            isbn=isbn
+        )
 
-        # 2. Gather candidate URLs tracking their query origins
-        candidate_origin: Dict[str, str] = {}
-        for q in queries:
+        # 2. Gather candidate URLs executing queries level by level
+        candidate_origin: Dict[str, Tuple[str, str]] = {} # URL -> (query, provider_name)
+        queries_executed = 0
+
+        # Level 1: prioritarias (always run)
+        for q in prioritarias:
+            if queries_executed >= max_queries:
+                break
             if len(candidate_origin) >= max_candidates:
                 break
-            found_urls = search_service.search(q, max_pages=max_pages)
-            for url in found_urls:
-                if url not in candidate_origin:
-                    candidate_origin[url] = q
-                    if len(candidate_origin) >= max_candidates:
-                        break
+            
+            # Throttling delay
+            if queries_executed > 0:
+                time.sleep(search_delay)
+
+            found_tuples = search_service.search_with_fallback(
+                query=q,
+                max_pages=max_pages,
+                sheet_id=sheet_id,
+                run_id=run_id,
+                isbn=isbn,
+                config=config
+            )
+            queries_executed += 1
+
+            for url, provider in found_tuples:
+                if url not in candidate_origin and len(candidate_origin) < max_candidates:
+                    candidate_origin[url] = (q, provider)
+
+        # Level 2: apoyo (only if Nivel 1 found 0 candidates)
+        if len(candidate_origin) == 0:
+            for q in apoyo:
+                if queries_executed >= max_queries:
+                    break
+                if len(candidate_origin) >= max_candidates:
+                    break
+                
+                # Throttling delay
+                time.sleep(search_delay)
+
+                found_tuples = search_service.search_with_fallback(
+                    query=q,
+                    max_pages=max_pages,
+                    sheet_id=sheet_id,
+                    run_id=run_id,
+                    isbn=isbn,
+                    config=config
+                )
+                queries_executed += 1
+
+                for url, provider in found_tuples:
+                    if url not in candidate_origin and len(candidate_origin) < max_candidates:
+                        candidate_origin[url] = (q, provider)
+
+        # Level 3: dominios (only if total candidates are insufficient: < 5)
+        if len(candidate_origin) < 5:
+            for q in dominios:
+                if queries_executed >= max_queries:
+                    break
+                if len(candidate_origin) >= max_candidates:
+                    break
+                
+                # Throttling delay
+                time.sleep(search_delay)
+
+                found_tuples = search_service.search_with_fallback(
+                    query=q,
+                    max_pages=max_pages,
+                    sheet_id=sheet_id,
+                    run_id=run_id,
+                    isbn=isbn,
+                    config=config
+                )
+                queries_executed += 1
+
+                for url, provider in found_tuples:
+                    if url not in candidate_origin and len(candidate_origin) < max_candidates:
+                        candidate_origin[url] = (q, provider)
 
         candidate_urls = list(candidate_origin.keys())
 
-        # Log each candidate found with its originating query
-        for url, origin_query in candidate_origin.items():
+        # Log each candidate found with its originating query and provider
+        for url, (origin_query, provider_name) in candidate_origin.items():
             logger_service.log(
                 level="INFO",
                 action="CANDIDATE_FOUND",
-                message=f"{log_prefix}Candidato: {url}",
+                message=f"{log_prefix}Candidato de {provider_name}: {url}",
                 isbn=isbn,
-                detail=f"Query: {origin_query}",
+                detail=f"provider={provider_name} | query={origin_query} | url={url}",
                 sheet_id=sheet_id,
                 run_id=run_id
             )
@@ -366,13 +448,40 @@ class RunService:
                 run_id=run_id,
                 level="INFO",
                 action="CANDIDATE_FOUND",
-                message=f"{log_prefix}Candidato: {url}",
+                message=f"{log_prefix}Candidato de {provider_name}: {url}",
                 isbn=isbn,
-                detail=f"Query: {origin_query}"
+                detail=f"provider={provider_name} | query={origin_query}"
             )
 
-        self._add_in_memory_log(run_id, "INFO", "SEARCH_COMPLETED", f"{log_prefix}Búsqueda finalizada. Encontradas {len(candidate_urls)} URLs candidatas.", isbn=isbn)
-        logger_service.log("INFO", "SEARCH_COMPLETED", f"{log_prefix}Encontradas {len(candidate_urls)} URLs candidatas.", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+        # Compile and Log Search Summary
+        providers_used = list({val[1] for val in candidate_origin.values() if val[1]})
+        errors_count = search_service.get_and_reset_errors_count()
+        
+        search_summary = {
+            "queries_executed": queries_executed,
+            "providers_used": providers_used,
+            "provider_errors": errors_count,
+            "candidate_urls": len(candidate_urls)
+        }
+        
+        summary_msg = f"Resumen búsqueda: {queries_executed} queries ejecutadas, proveedores={providers_used}, errores={errors_count}, candidatos={len(candidate_urls)}"
+        logger_service.log(
+            level="INFO",
+            action="BOOK_SEARCH_SUMMARY",
+            message=f"{log_prefix}{summary_msg}",
+            isbn=isbn,
+            detail=json.dumps(search_summary),
+            sheet_id=sheet_id,
+            run_id=run_id
+        )
+        self._add_in_memory_log(
+            run_id=run_id,
+            level="INFO",
+            action="BOOK_SEARCH_SUMMARY",
+            message=f"{log_prefix}{summary_msg}",
+            isbn=isbn,
+            detail=json.dumps(search_summary)
+        )
 
         reviews_added = 0
         descartes_added = 0
@@ -381,14 +490,13 @@ class RunService:
 
         # 3. Process candidate URLs
         for url in candidate_urls:
-            origin_query = candidate_origin.get(url, "")
+            origin_query, provider_name = candidate_origin[url]
             
             # Check primary duplicate
             norm_url = deduplicator.normalize_url(url)
             prim_hash = deduplicator.get_primary_hash(isbn, url)
             
             if prim_hash in existing_hashes:
-                # Save to descartes
                 logger_service.log("DEBUG", "DEDUPLICATE_SKIP", f"{log_prefix}Saltando URL duplicada: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
                 if not dry_run:
                     sheets_service.add_descarte(sheet_id, [
@@ -416,7 +524,7 @@ class RunService:
                 failed_extractions += 1
                 continue
 
-            # Validate secondary key with actual article title
+            # Validate secondary key
             art_title = article_data.get("title") or ""
             art_domain = urlparse(url).netloc
             sec_key = deduplicator.get_secondary_key(isbn, art_domain, art_title)
@@ -503,7 +611,6 @@ class RunService:
                         prim_hash,
                         "pendiente"
                     ])
-                    # Add to existing hashes to prevent duplicates within the same run
                     existing_hashes.add(prim_hash)
                     existing_secondary_keys.add(sec_key)
                 

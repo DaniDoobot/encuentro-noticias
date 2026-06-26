@@ -88,7 +88,11 @@ class SheetsService:
             {"Clave": "MAX_CANDIDATES_PER_BOOK", "Valor": str(settings.MAX_CANDIDATES_PER_BOOK), "Descripción": "Cantidad máxima de URLs candidatas a evaluar por libro"},
             {"Clave": "MIN_MATCH_SCORE", "Valor": str(settings.MIN_MATCH_SCORE), "Descripción": "Score mínimo de validación de OpenAI para aceptar una reseña (0-100)"},
             {"Clave": "OPENAI_MODEL", "Valor": settings.OPENAI_MODEL, "Descripción": "Modelo de OpenAI a usar para análisis"},
-            {"Clave": "REVIEW_DOMAINS", "Valor": "revistadelibros.com,nueva-revista.net,aceprensa.com,elcultural.com,zendalibros.com,babelia.elpais.com", "Descripción": "Dominios culturales/literarios recomendados para búsquedas específicas (separados por coma)"}
+            {"Clave": "REVIEW_DOMAINS", "Valor": "revistadelibros.com,nueva-revista.net,aceprensa.com,elcultural.com,zendalibros.com,babelia.elpais.com", "Descripción": "Dominios culturales/literarios recomendados para búsquedas específicas (separados por coma)"},
+            {"Clave": "SEARCH_DELAY_SECONDS", "Valor": str(settings.SEARCH_DELAY_SECONDS), "Descripción": "Espera en segundos entre cada búsqueda para evitar bloqueos"},
+            {"Clave": "SEARCH_BACKOFF_SECONDS", "Valor": str(settings.SEARCH_BACKOFF_SECONDS), "Descripción": "Espera de enfriamiento en segundos si se detecta rate limit o error"},
+            {"Clave": "MAX_QUERIES_PER_BOOK", "Valor": str(settings.MAX_QUERIES_PER_BOOK), "Descripción": "Límite máximo de búsquedas por libro"},
+            {"Clave": "ENABLE_GOOGLE_NEWS_RSS", "Valor": str(settings.ENABLE_GOOGLE_NEWS_RSS).lower(), "Descripción": "Activar búsqueda complementaria mediante Google News RSS (true/false)"}
         ]
 
         for config in default_configs:
@@ -125,7 +129,11 @@ class SheetsService:
                 "MAX_CANDIDATES_PER_BOOK": int(config_dict.get("MAX_CANDIDATES_PER_BOOK", settings.MAX_CANDIDATES_PER_BOOK)),
                 "MIN_MATCH_SCORE": int(config_dict.get("MIN_MATCH_SCORE", settings.MIN_MATCH_SCORE)),
                 "OPENAI_MODEL": config_dict.get("OPENAI_MODEL", settings.OPENAI_MODEL),
-                "REVIEW_DOMAINS": config_dict.get("REVIEW_DOMAINS", "")
+                "REVIEW_DOMAINS": config_dict.get("REVIEW_DOMAINS", ""),
+                "SEARCH_DELAY_SECONDS": float(config_dict.get("SEARCH_DELAY_SECONDS", settings.SEARCH_DELAY_SECONDS)),
+                "SEARCH_BACKOFF_SECONDS": float(config_dict.get("SEARCH_BACKOFF_SECONDS", settings.SEARCH_BACKOFF_SECONDS)),
+                "MAX_QUERIES_PER_BOOK": int(config_dict.get("MAX_QUERIES_PER_BOOK", settings.MAX_QUERIES_PER_BOOK)),
+                "ENABLE_GOOGLE_NEWS_RSS": str(config_dict.get("ENABLE_GOOGLE_NEWS_RSS", settings.ENABLE_GOOGLE_NEWS_RSS)).lower() == "true"
             }
         except Exception:
             # Fallback to local configs if sheet configs fail to read
@@ -135,7 +143,11 @@ class SheetsService:
                 "MAX_CANDIDATES_PER_BOOK": settings.MAX_CANDIDATES_PER_BOOK,
                 "MIN_MATCH_SCORE": settings.MIN_MATCH_SCORE,
                 "OPENAI_MODEL": settings.OPENAI_MODEL,
-                "REVIEW_DOMAINS": ""
+                "REVIEW_DOMAINS": "",
+                "SEARCH_DELAY_SECONDS": settings.SEARCH_DELAY_SECONDS,
+                "SEARCH_BACKOFF_SECONDS": settings.SEARCH_BACKOFF_SECONDS,
+                "MAX_QUERIES_PER_BOOK": settings.MAX_QUERIES_PER_BOOK,
+                "ENABLE_GOOGLE_NEWS_RSS": settings.ENABLE_GOOGLE_NEWS_RSS
             }
 
     def get_pending_books(self, sheet_id: str, limit: int = 10) -> List[Dict[str, Any]]:
