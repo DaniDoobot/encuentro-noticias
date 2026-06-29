@@ -15,7 +15,13 @@ logger = logging.getLogger("encuentro-noticias")
 
 def is_row_real(row: dict) -> bool:
     # Check if any of the target fields has non-empty text
-    target_fields = ["URL", "URL normalizada", "Título del artículo", "Título del libro", "ISBN", "Hash deduplicación", "Título para Web", "Título del libro detectado por IA", "Resumen"]
+    target_fields = [
+        "URL", "URL normalizada", "Título del artículo", 
+        "Título del libro", "Autor del libro", "ISBN", 
+        "Resumen", "Hash deduplicación", 
+        "Título para Web", "Autor para Web",
+        "Título del libro detectado por IA", "Autor del libro detectado por IA"
+    ]
     for field in target_fields:
         if str(row.get(field, "")).strip():
             return True
@@ -331,3 +337,37 @@ def post_publish_test_draft(req: TestDraftRequest):
         wordpress_url=res.get("wordpress_url"),
         status=res.get("status")
     )
+
+class CleanupEmptyRowsResponse(BaseModel):
+    success: bool
+    message: str
+    cleaned_rows: int
+
+@router.post("/reviews/cleanup-empty-publication-rows", response_model=CleanupEmptyRowsResponse)
+def post_cleanup_empty_rows():
+    """
+    Cleans up empty/false rows in the 'Reseñas por publicar' tab of Google Sheets.
+    """
+    sheet_id = settings.GOOGLE_SHEET_ID
+    try:
+        cleaned_count = sheets_service.cleanup_empty_publication_rows(sheet_id)
+        
+        logger_service.log(
+            level="INFO",
+            action="REVIEWS_CLEANUP",
+            message=f"Limpieza de filas de publicación completada: {cleaned_count} filas limpiadas.",
+            sheet_id=sheet_id,
+            detail={"cleaned_rows": cleaned_count}
+        )
+        logger_service.flush_log_batch(sheet_id)
+        
+        return CleanupEmptyRowsResponse(
+            success=True,
+            message=f"Se limpiaron {cleaned_count} filas vacías de publicación en la pestaña 'Reseñas por publicar'.",
+            cleaned_rows=cleaned_count
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to cleanup empty publication rows: {str(e)}"
+        )

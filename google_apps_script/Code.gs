@@ -11,6 +11,8 @@ function onOpen() {
     .addItem('Consultar indexación', 'checkIndexStatus')
     .addSeparator()
     .addItem('Limpiar logs antiguos', 'cleanupLogs')
+    .addItem('Limpiar descartes antiguos', 'cleanupDescartes')
+    .addItem('Limpiar filas vacías de publicación', 'cleanupEmptyPublicationRows')
     .addToUi();
 }
 
@@ -488,6 +490,113 @@ function cleanupLogs() {
       SpreadsheetApp.getUi().alert("Limpieza de logs completada.\n" + msg + "\n\nDetalle:\n- Logs eliminados: " + deleted + "\n- Logs restantes: " + remaining);
     } else {
       SpreadsheetApp.getUi().alert("Error al limpiar logs (HTTP " + resCode + "):\n" + resText);
+    }
+  } catch (e) {
+    SpreadsheetApp.getUi().alert("Error de conexión:\n" + e.toString());
+  }
+}
+
+/**
+ * Limpia los descartes antiguos del Sheet manteniendo el límite seguro de filas / retención.
+ */
+function cleanupDescartes() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var panelSheet = ss.getSheetByName("Panel");
+  if (!panelSheet) {
+    SpreadsheetApp.getUi().alert("Error: No se encontró la pestaña 'Panel'.");
+    return;
+  }
+  
+  var backendUrl = getConfigValue("BACKEND_BASE_URL");
+  var adminToken = getConfigValue("ADMIN_TOKEN");
+  
+  if (!backendUrl) {
+    SpreadsheetApp.getUi().alert("Error: Configure 'BACKEND_BASE_URL' en la pestaña 'Config'.");
+    return;
+  }
+  
+  if (backendUrl.slice(-1) === "/") {
+    backendUrl = backendUrl.slice(0, -1);
+  }
+  
+  var headers = {};
+  if (adminToken) {
+    headers["X-Admin-Token"] = adminToken;
+  }
+  
+  var options = {
+    "method": "post",
+    "headers": headers,
+    "muteHttpExceptions": true
+  };
+  
+  try {
+    var response = UrlFetchApp.fetch(backendUrl + "/descartes/cleanup", options);
+    var resCode = response.getResponseCode();
+    var resText = response.getContentText();
+    
+    if (resCode >= 200 && resCode < 300) {
+      var data = JSON.parse(resText);
+      var msg = data.message || "Limpieza completada.";
+      var deleted = data.deleted_rows || 0;
+      var remaining = data.remaining_rows || 0;
+      
+      SpreadsheetApp.getUi().alert("Limpieza de descartes completada.\n" + msg + "\n\nDetalle:\n- Descartes eliminados: " + deleted + "\n- Descartes restantes: " + remaining);
+    } else {
+      SpreadsheetApp.getUi().alert("Error al limpiar descartes (HTTP " + resCode + "):\n" + resText);
+    }
+  } catch (e) {
+    SpreadsheetApp.getUi().alert("Error de conexión:\n" + e.toString());
+  }
+}
+
+/**
+ * Limpia las filas vacías de publicación (filas falsas) en Reseñas por publicar.
+ */
+function cleanupEmptyPublicationRows() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var panelSheet = ss.getSheetByName("Panel");
+  if (!panelSheet) {
+    SpreadsheetApp.getUi().alert("Error: No se encontró la pestaña 'Panel'.");
+    return;
+  }
+  
+  var backendUrl = getConfigValue("BACKEND_BASE_URL");
+  var adminToken = getConfigValue("ADMIN_TOKEN");
+  
+  if (!backendUrl) {
+    SpreadsheetApp.getUi().alert("Error: Configure 'BACKEND_BASE_URL' en la pestaña 'Config'.");
+    return;
+  }
+  
+  if (backendUrl.slice(-1) === "/") {
+    backendUrl = backendUrl.slice(0, -1);
+  }
+  
+  var headers = {};
+  if (adminToken) {
+    headers["X-Admin-Token"] = adminToken;
+  }
+  
+  var options = {
+    "method": "post",
+    "headers": headers,
+    "muteHttpExceptions": true
+  };
+  
+  try {
+    var response = UrlFetchApp.fetch(backendUrl + "/reviews/cleanup-empty-publication-rows", options);
+    var resCode = response.getResponseCode();
+    var resText = response.getContentText();
+    
+    if (resCode >= 200 && resCode < 300) {
+      var data = JSON.parse(resText);
+      var msg = data.message || "Limpieza completada.";
+      var cleaned = data.cleaned_rows || 0;
+      
+      SpreadsheetApp.getUi().alert("Limpieza de filas vacías completada.\n" + msg + "\n\nDetalle:\n- Filas limpiadas: " + cleaned);
+    } else {
+      SpreadsheetApp.getUi().alert("Error al limpiar filas vacías (HTTP " + resCode + "):\n" + resText);
     }
   } catch (e) {
     SpreadsheetApp.getUi().alert("Error de conexión:\n" + e.toString());

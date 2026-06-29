@@ -423,7 +423,9 @@ class SheetsService:
             {"Clave": "WORDPRESS_POST_TYPE", "Valor": settings.WORDPRESS_POST_TYPE, "Descripción": "Tipo de post en WordPress (posts, pages)"},
             {"Clave": "WORDPRESS_DEFAULT_CATEGORY_ID", "Valor": settings.WORDPRESS_DEFAULT_CATEGORY_ID or "", "Descripción": "ID de categoría de WordPress por defecto (opcional)"},
             {"Clave": "LOG_RETENTION_DAYS", "Valor": settings.LOG_RETENTION_DAYS, "Descripción": "Días de retención de logs en la pestaña Logs"},
-            {"Clave": "LOG_MAX_ROWS", "Valor": settings.LOG_MAX_ROWS, "Descripción": "Cantidad máxima de filas a mantener en la pestaña Logs"}
+            {"Clave": "LOG_MAX_ROWS", "Valor": settings.LOG_MAX_ROWS, "Descripción": "Cantidad máxima de filas a mantener en la pestaña Logs"},
+            {"Clave": "DESCARTES_RETENTION_DAYS", "Valor": getattr(settings, "DESCARTES_RETENTION_DAYS", 30), "Descripción": "Días de retención de descartes en la pestaña Descartes"},
+            {"Clave": "DESCARTES_MAX_ROWS", "Valor": getattr(settings, "DESCARTES_MAX_ROWS", 1000), "Descripción": "Cantidad máxima de descartes a mantener en la pestaña Descartes"}
         ]
 
         for config in default_configs:
@@ -448,6 +450,13 @@ class SheetsService:
             ]
             for row in default_sources:
                 fuentes_ws.append_row(row)
+
+        # Cleanup empty/false rows in Reseñas por publicar automatically on ensure_sheet
+        try:
+            self.cleanup_empty_publication_rows(sheet_id)
+        except Exception as e_clean:
+            import logging
+            logging.getLogger("encuentro-noticias").warning(f"Auto empty rows cleanup in ensure_sheet failed: {e_clean}")
 
         return {
             "success": True,
@@ -516,6 +525,8 @@ class SheetsService:
                 "ENABLE_CASCADE_SEARCH": parse_bool(config_dict.get("ENABLE_CASCADE_SEARCH"), getattr(settings, "ENABLE_CASCADE_SEARCH", True)),
                 "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS": parse_bool(config_dict.get("ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS"), getattr(settings, "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", True)),
                 "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH": parse_bool(config_dict.get("ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH"), getattr(settings, "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", True)),
+                "DESCARTES_RETENTION_DAYS": parse_int(config_dict.get("DESCARTES_RETENTION_DAYS"), getattr(settings, "DESCARTES_RETENTION_DAYS", 30)),
+                "DESCARTES_MAX_ROWS": parse_int(config_dict.get("DESCARTES_MAX_ROWS"), getattr(settings, "DESCARTES_MAX_ROWS", 1000)),
             }
         except Exception:
             # Fallback to local configs if sheet configs fail to read
@@ -562,6 +573,8 @@ class SheetsService:
                 "ENABLE_CASCADE_SEARCH": getattr(settings, "ENABLE_CASCADE_SEARCH", True),
                 "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS": getattr(settings, "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", True),
                 "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH": getattr(settings, "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", True),
+                "DESCARTES_RETENTION_DAYS": getattr(settings, "DESCARTES_RETENTION_DAYS", 30),
+                "DESCARTES_MAX_ROWS": getattr(settings, "DESCARTES_MAX_ROWS", 1000),
             }
 
     def get_pending_books(
@@ -718,7 +731,7 @@ class SheetsService:
 
     def add_review(self, sheet_id: str, review_data: List[Any]):
         """
-        Appends a row to Reseñas por publicar.
+        Appends a row to Reseñas por publicar, or overwrites the first empty/false row if found.
         Handles prepending control columns if the new layout is active.
         """
         client = self.get_client()
@@ -728,13 +741,23 @@ class SheetsService:
         # Check if the worksheet uses the new layout
         headers = worksheet.row_values(1)
         if headers and headers[0] == "¿Publicar?":
-            # Prepend 7 empty fields: ¿Publicar?, Estado publicación, Fecha intento publicación,
-            # Fecha publicación, WordPress ID, WordPress URL, Error publicación
+            # Prepend 7 empty fields: ¿Publicar? = FALSE, Estado publicación = "" (empty), ...
             full_row = ["FALSE", "", "", "", "", "", ""] + review_data
         else:
             full_row = review_data
             
-        worksheet.append_row(full_row)
+        # Read records to find the first non-real row index to overwrite
+        records = worksheet.get_all_records()
+        overwrite_row_index = None
+        for idx, row in enumerate(records):
+            if not self.is_row_real(row):
+                overwrite_row_index = idx + 2
+                break
+                
+        if overwrite_row_index:
+            worksheet.update(range_name=f"A{overwrite_row_index}", values=[full_row])
+        else:
+            worksheet.append_row(full_row)
 
     def add_descarte(self, sheet_id: str, descarte_data: List[Any]):
         """
@@ -917,6 +940,136 @@ class SheetsService:
             "deleted_count": deleted_count,
             "remaining_count": new_count,
             "message": f"Se eliminaron {deleted_count} logs antiguos. Quedan {new_count} logs."
+        }
+
+    @staticmethod
+    def is_row_real(row: dict) -> bool:
+        """
+        Determines if a row in Reseñas por publicar contains real review data.
+        """
+        target_fields = [
+            "URL", "URL normalizada", "Título del artículo", 
+            "Título del libro", "Autor del libro", "ISBN", 
+            "Resumen", "Hash deduplicación", 
+            "Título para Web", "Autor para Web",
+            "Título del libro detectado por IA", "Autor del libro detectado por IA"
+        ]
+        for field in target_fields:
+            if str(row.get(field, "")).strip():
+                return True
+        return False
+
+    def cleanup_empty_publication_rows(self, sheet_id: str) -> int:
+        """
+        Clears cells for rows in 'Reseñas por publicar' that do not contain real review data,
+        preserving the checkbox validation formats.
+        """
+        client = self.get_client()
+        spreadsheet = client.open_by_key(sheet_id)
+        worksheet = spreadsheet.worksheet("Reseñas por publicar")
+        records = worksheet.get_all_records()
+        if not records:
+            return 0
+
+        # Get header length
+        headers = worksheet.row_values(1)
+        num_cols = len(headers) if headers else 27
+
+        reqs = []
+        cleaned_count = 0
+        for idx, row in enumerate(records):
+            row_idx = idx + 2  # 1-indexed, headers is row 1
+            if not self.is_row_real(row):
+                # Only clear if it contains any non-empty cell value (to minimize API overhead)
+                has_any_val = any(str(v).strip() for v in row.values())
+                if has_any_val:
+                    reqs.append({
+                        "updateCells": {
+                            "range": {
+                                "sheetId": worksheet.id,
+                                "startRowIndex": row_idx - 1,
+                                "endRowIndex": row_idx,
+                                "startColumnIndex": 0,
+                                "endColumnIndex": num_cols
+                            },
+                            "fields": "userEnteredValue"
+                        }
+                    })
+                    cleaned_count += 1
+
+        if reqs:
+            spreadsheet.batch_update({"requests": reqs})
+
+        return cleaned_count
+
+    def cleanup_descartes(self, sheet_id: str, max_rows: int = 1000, retention_days: int = 30) -> Dict[str, Any]:
+        """
+        Cleans up old descartes in the 'Descartes' worksheet based on retention days and max row limit.
+        """
+        client = self.get_client()
+        spreadsheet = client.open_by_key(sheet_id)
+        worksheet = spreadsheet.worksheet("Descartes")
+        records = worksheet.get_all_records()
+        if not records:
+            return {"deleted_count": 0, "remaining_count": 0, "message": "La hoja de Descartes está vacía."}
+            
+        now = datetime.datetime.now()
+        cutoff_date = now - datetime.timedelta(days=retention_days)
+        
+        rows_to_delete = []
+        
+        # Parse date column: "Fecha de extracción" is the date column in Descartes
+        for idx, record in enumerate(records):
+            row_idx = idx + 2
+            date_str = str(record.get("Fecha de extracción", "")).strip()
+            
+            # Check if older than retention_days
+            try:
+                if " " in date_str:
+                    log_date = datetime.datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+                else:
+                    log_date = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+                if log_date < cutoff_date:
+                    rows_to_delete.append(row_idx)
+                    continue
+            except Exception:
+                pass
+                
+        # Limit rows among the non-deleted records
+        remaining_records_count = len(records) - len(rows_to_delete)
+        if remaining_records_count > max_rows:
+            extra_to_delete = remaining_records_count - max_rows
+            already_deleted_set = set(rows_to_delete)
+            added = 0
+            for idx in range(len(records)):
+                row_idx = idx + 2
+                if row_idx not in already_deleted_set:
+                    rows_to_delete.append(row_idx)
+                    added += 1
+                    if added >= extra_to_delete:
+                        break
+                        
+        deleted_count = len(rows_to_delete)
+        if rows_to_delete:
+            reqs = []
+            for r_idx in sorted(rows_to_delete, reverse=True):
+                reqs.append({
+                    "deleteDimension": {
+                        "range": {
+                            "sheetId": worksheet.id,
+                            "dimension": "ROWS",
+                            "startIndex": r_idx - 1,
+                            "endIndex": r_idx
+                        }
+                    }
+                })
+            spreadsheet.batch_update({"requests": reqs})
+                
+        new_count = len(worksheet.get_all_records())
+        return {
+            "deleted_count": deleted_count,
+            "remaining_count": new_count,
+            "message": f"Se eliminaron {deleted_count} filas antiguas de Descartes. Quedan {new_count} filas."
         }
 
 sheets_service = SheetsService()

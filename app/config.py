@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     WORDPRESS_DEFAULT_CATEGORY_ID: Optional[int] = None
     LOG_RETENTION_DAYS: int = 30
     LOG_MAX_ROWS: int = 1000
+    DESCARTES_RETENTION_DAYS: int = 30
+    DESCARTES_MAX_ROWS: int = 1000
 
 
 
