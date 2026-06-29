@@ -34,6 +34,9 @@ def update_job_status(job_id: str, **kwargs):
 
 
 def run_indexing_background(job_id: str, limit_domains: int, force_refresh: bool, sheet_id: str):
+    execute_indexing_job(job_id, limit_domains, force_refresh, sheet_id)
+
+def execute_indexing_job(job_id: str, limit_domains: int, force_refresh: bool, sheet_id: str) -> Dict[str, Any]:
     try:
         config = sheets_service.get_config_dict(sheet_id)
         sources = sheets_service.get_active_sources(sheet_id)
@@ -42,7 +45,6 @@ def run_indexing_background(job_id: str, limit_domains: int, force_refresh: bool
         if limit_domains > 0:
             sources = sources[:limit_domains]
             
-        # Update domains_total based on actual active sources we will process
         update_job_status(job_id, domains_total=len(sources))
 
         def log_fn(msg: str):
@@ -93,32 +95,61 @@ def run_indexing_background(job_id: str, limit_domains: int, force_refresh: bool
             on_progress=on_progress
         )
         
-        # Update stats in the sheet for each domain we attempted to index
+        # Map results to diagnostic format
+        mapped_results = []
+        domains_indexed = 0
+        domains_failed = 0
+        domains_skipped = 0
+        domains_processed = 0
+
         for res in results:
-            if res.get("skipped", False):
-                continue
             domain = res.get("domain")
             if not domain:
                 continue
                 
-            # Get stats from DB to know the total URLs
-            db_stats = cache_service.get_domain_stats(domain)
-            urls_count = db_stats.get("urls", 0)
-            
-            # Format errors: join list of error codes
+            skipped = res.get("skipped", False)
             errs_list = res.get("errors", [])
-            errs_str = ", ".join(errs_list) if errs_list else ""
             
-            last_idx = res.get("last_indexed", datetime.datetime.utcnow().isoformat())
+            # Get stats from DB to know the total URLs
+            try:
+                db_stats = cache_service.get_domain_stats(domain)
+                urls_count = db_stats.get("urls", 0)
+            except Exception:
+                urls_count = res.get("urls_found", 0)
             
-            sheets_service.update_source_stats(
-                sheet_id=sheet_id,
-                domain=domain,
-                last_indexed=last_idx,
-                urls_indexed=urls_count,
-                errors=errs_str
-            )
-            
+            if skipped:
+                domains_skipped += 1
+                status_str = "skipped"
+            elif errs_list:
+                domains_failed += 1
+                domains_processed += 1
+                status_str = "error"
+            else:
+                domains_indexed += 1
+                domains_processed += 1
+                status_str = "ok"
+
+            mapped_results.append({
+                "domain": domain,
+                "processed": not skipped,
+                "urls_indexed": urls_count,
+                "status": status_str,
+                "errors": errs_list
+            })
+
+            # Update Sheets if not skipped
+            if not skipped:
+                errs_str = ", ".join(errs_list) if errs_list else ""
+                last_idx = res.get("last_indexed", datetime.datetime.utcnow().isoformat())
+                
+                sheets_service.update_source_stats(
+                    sheet_id=sheet_id,
+                    domain=domain,
+                    last_indexed=last_idx,
+                    urls_indexed=urls_count,
+                    errors=errs_str
+                )
+
         logger_service.log(
             level="INFO",
             action="DOMAIN_INDEX_COMPLETED",
@@ -127,10 +158,27 @@ def run_indexing_background(job_id: str, limit_domains: int, force_refresh: bool
             run_id=job_id
         )
         logger_service.flush_log_batch(sheet_id, job_id)
-        update_job_status(job_id, status="completed", finished_at=datetime.datetime.utcnow().isoformat())
+        
+        final_state = {
+            "success": True,
+            "status": "completed",
+            "finished_at": datetime.datetime.utcnow().isoformat(),
+            "domains_total": len(sources),
+            "domains_processed": domains_processed,
+            "domains_indexed": domains_indexed,
+            "domains_failed": domains_failed,
+            "domains_skipped": domains_skipped,
+            "results": mapped_results
+        }
+        
+        with job_registry_lock:
+            if job_id in job_registry:
+                job_registry[job_id].update(final_state)
+                
+        return final_state
         
     except Exception as e:
-        logger.error(f"Error in background indexing task: {e}")
+        logger.error(f"Error in indexing task: {e}")
         logger_service.log(
             level="ERROR",
             action="DOMAIN_INDEX_FAILED",
@@ -139,18 +187,35 @@ def run_indexing_background(job_id: str, limit_domains: int, force_refresh: bool
             run_id=job_id
         )
         logger_service.flush_log_batch(sheet_id, job_id)
-        update_job_status(job_id, status="failed", finished_at=datetime.datetime.utcnow().isoformat(), errors=[str(e)])
+        
+        err_state = {
+            "success": False,
+            "status": "failed",
+            "finished_at": datetime.datetime.utcnow().isoformat(),
+            "domains_total": 0,
+            "domains_processed": 0,
+            "domains_indexed": 0,
+            "domains_failed": 0,
+            "domains_skipped": 0,
+            "results": [],
+            "errors": [str(e)]
+        }
+        with job_registry_lock:
+            if job_id in job_registry:
+                job_registry[job_id].update(err_state)
+        return err_state
 
-@router.post("/sources/index", response_model=IndexSourcesResponse)
+@router.post("/sources/index")
 def post_sources_index(req: IndexSourcesRequest):
     """
-    Launches a background domain index task for active sources in Google Sheets.
+    Launches or runs a domain index task for active sources in Google Sheets.
     """
     job_id = f"idx_{uuid.uuid4().hex[:8]}"
     limit = req.limit_domains if req.limit_domains is not None else 10
     force = req.force_refresh if req.force_refresh is not None else False
+    background = req.background if req.background is not None else False
     
-    # Check if google credentials are valid before launching background thread
+    # Check if google credentials are valid
     try:
         sheets_service.get_client()
     except Exception as e:
@@ -175,18 +240,24 @@ def post_sources_index(req: IndexSourcesRequest):
             "errors": []
         }
         
-    thread = threading.Thread(
-        target=run_indexing_background,
-        args=(job_id, limit, force, settings.GOOGLE_SHEET_ID)
-    )
-    thread.daemon = True
-    thread.start()
-    
-    return IndexSourcesResponse(
-        job_id=job_id,
-        domains_queued=limit,
-        message=f"Indexación iniciada en segundo plano con ID {job_id}."
-    )
+    if background:
+        thread = threading.Thread(
+            target=run_indexing_background,
+            args=(job_id, limit, force, settings.GOOGLE_SHEET_ID)
+        )
+        thread.daemon = True
+        thread.start()
+        
+        return {
+            "success": True,
+            "job_id": job_id,
+            "status": "running",
+            "message": f"Indexación iniciada en segundo plano con ID {job_id}."
+        }
+    else:
+        # Run synchronously
+        res = execute_indexing_job(job_id, limit, force, settings.GOOGLE_SHEET_ID)
+        return res
 
 
 @router.get("/sources/index/status")

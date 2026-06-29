@@ -672,6 +672,9 @@ class DomainIndexer:
         )
 
         # Store domain status in SQLite domain_status table
+        if len(unique_items) == 0 and not errors:
+            errors.append("no_urls_found")
+
         try:
             cache_service.upsert_domain_status(
                 domain=domain,

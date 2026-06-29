@@ -9,11 +9,22 @@ logger = logging.getLogger("encuentro-noticias")
 
 def is_row_real(row: dict) -> bool:
     # Check if any of the target fields has non-empty text
-    target_fields = ["URL", "URL normalizada", "Título del artículo", "Título del libro", "ISBN", "Hash deduplicación", "Título para Web", "Título del libro detectado por IA"]
+    target_fields = ["URL", "URL normalizada", "Título del artículo", "Título del libro", "ISBN", "Hash deduplicación", "Título para Web", "Título del libro detectado por IA", "Resumen"]
     for field in target_fields:
         if str(row.get(field, "")).strip():
             return True
     return False
+
+def clean_domain_string(domain: str) -> str:
+    s = str(domain).strip().lower()
+    if s.startswith("http://"):
+        s = s[7:]
+    elif s.startswith("https://"):
+        s = s[8:]
+    if "/" in s:
+        s = s.split("/")[0]
+    return s.strip()
+
 def normalize_config_val(val: Any) -> str:
     if val is None:
         return ""
@@ -734,10 +745,13 @@ class SheetsService:
 
         sources = []
         for i, row in enumerate(records, start=2):
-            domain = str(row.get("Dominio", "")).strip()
-            active_val = str(row.get("Activo", "true")).strip().lower()
+            domain_raw = str(row.get("Dominio", "")).strip()
+            if not domain_raw:
+                continue
+            domain = clean_domain_string(domain_raw)
             if not domain:
                 continue
+            active_val = str(row.get("Activo", "true")).strip().lower()
             if active_val not in ("true", "1", "yes", "sí", "si"):
                 continue
             sources.append({
@@ -768,7 +782,8 @@ class SheetsService:
             worksheet = spreadsheet.worksheet("Fuentes")
             records = worksheet.get_all_records()
             for i, row in enumerate(records, start=2):
-                if str(row.get("Dominio", "")).strip() == domain:
+                row_dom_raw = str(row.get("Dominio", "")).strip()
+                if clean_domain_string(row_dom_raw) == clean_domain_string(domain):
                     worksheet.update(f"H{i}:J{i}", [[last_indexed, urls_indexed, errors]])
                     break
         except Exception as e:

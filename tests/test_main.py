@@ -695,3 +695,15 @@ def test_config_parser_normalization():
     # 5. parse_str
     assert parse_str("'hello", "default") == "hello"
 
+
+def test_clean_domain_string_normalization():
+    """
+    Tests clean_domain_string helper and Fuentes normalization rules.
+    """
+    from app.services.sheets_service import clean_domain_string
+    
+    assert clean_domain_string("wmagazin.com") == "wmagazin.com"
+    assert clean_domain_string("https://wmagazin.com") == "wmagazin.com"
+    assert clean_domain_string("https://wmagazin.com/") == "wmagazin.com"
+    assert clean_domain_string("http://wmagazin.com/subpath") == "wmagazin.com"
+
