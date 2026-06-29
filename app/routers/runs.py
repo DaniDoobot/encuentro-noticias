@@ -1,3 +1,4 @@
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from app.schemas import (
     RunConfig, BookRunConfig, RunResponse, RunStatusResponse, 
