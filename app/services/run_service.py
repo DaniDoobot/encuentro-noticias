@@ -580,55 +580,64 @@ class RunService:
                         google_news_candidates += 1
             google_news_candidates_count = google_news_candidates
 
-            # PHASE 3 — Internal Domain Search si hay pocos candidatos
+            # PHASE 3 — Internal Domain Search
+            _always_internal_default = getattr(settings, "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", True)
             _min_cand_default = getattr(settings, "MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH", 5)
             _enable_deep_default = getattr(settings, "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", True)
+            always_run_internal = is_true(config.get("ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", _always_internal_default))
             min_candidates_internal = int(config.get("MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH", _min_cand_default))
             enable_deep_search = is_true(config.get("ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", _enable_deep_default))
             enable_internal_search = is_true(config.get("ENABLE_INTERNAL_DOMAIN_SEARCH", getattr(settings, "ENABLE_INTERNAL_DOMAIN_SEARCH", True)))
 
             total_before_internal = len(candidate_origin)
-            
-            if total_before_internal >= min_candidates_internal or not enable_internal_search or not enable_deep_search:
-                # Skip internal search
-                logger_service.log(
-                    level="INFO",
-                    action="INTERNAL_SEARCH_SKIPPED_ENOUGH_CANDIDATES",
-                    message=f"{log_prefix}Búsqueda interna omitida (candidatos actuales: {total_before_internal} >= {min_candidates_internal})",
-                    isbn=isbn,
-                    sheet_id=sheet_id,
-                    run_id=run_id
-                )
-                self._add_in_memory_log(
-                    run_id, "INFO", "INTERNAL_SEARCH_SKIPPED_ENOUGH_CANDIDATES",
-                    f"{log_prefix}Búsqueda interna omitida: candidatos={total_before_internal} >= {min_candidates_internal}",
-                    isbn=isbn
-                )
+            internal_search_was_forced = False
+            internal_search_skip_reason = ""
+
+            # Decide whether to run internal search
+            should_run_internal = False
+            if not enable_internal_search:
+                internal_search_skip_reason = "ENABLE_INTERNAL_DOMAIN_SEARCH=false"
+            elif always_run_internal:
+                should_run_internal = True
+                internal_search_was_forced = True
+            elif enable_deep_search and total_before_internal < min_candidates_internal:
+                should_run_internal = True
             else:
-                # Execute Internal Domain Search
+                internal_search_skip_reason = f"enough_candidates ({total_before_internal} >= {min_candidates_internal})"
+
+            if not should_run_internal:
+                skip_msg = f"{log_prefix}Búsqueda interna omitida: {internal_search_skip_reason}"
                 logger_service.log(
                     level="INFO",
-                    action="INTERNAL_SEARCH_STARTED_LOW_CANDIDATES",
-                    message=f"{log_prefix}Iniciando búsqueda interna dedicada (candidatos actuales: {total_before_internal} < {min_candidates_internal})",
+                    action="INTERNAL_SEARCH_SKIPPED",
+                    message=skip_msg,
                     isbn=isbn,
                     sheet_id=sheet_id,
                     run_id=run_id
                 )
-                self._add_in_memory_log(
-                    run_id, "INFO", "INTERNAL_SEARCH_STARTED_LOW_CANDIDATES",
-                    f"{log_prefix}Iniciando búsqueda interna: candidatos={total_before_internal} < {min_candidates_internal}",
-                    isbn=isbn
+                self._add_in_memory_log(run_id, "INFO", "INTERNAL_SEARCH_SKIPPED", skip_msg, isbn=isbn)
+            else:
+                force_label = " (forzada)" if internal_search_was_forced else f" (pocos candidatos: {total_before_internal} < {min_candidates_internal})"
+                start_msg = f"{log_prefix}Iniciando búsqueda interna{force_label}"
+                logger_service.log(
+                    level="INFO",
+                    action="INTERNAL_SEARCH_STARTED",
+                    message=start_msg,
+                    isbn=isbn,
+                    sheet_id=sheet_id,
+                    run_id=run_id
                 )
-                
+                self._add_in_memory_log(run_id, "INFO", "INTERNAL_SEARCH_STARTED", start_msg, isbn=isbn)
+
                 from app.services.internal_search_provider import internal_search_provider
                 from app.services.domain_indexer import _enrich_page_metadata
-                
+
                 # Fetch active sources
                 try:
                     sources = sheets_service.get_active_sources(sheet_id)
                 except Exception:
                     sources = []
-                    
+
                 domains_limit = int(config.get("INTERNAL_SEARCH_DOMAINS_LIMIT", settings.INTERNAL_SEARCH_DOMAINS_LIMIT))
                 domains = [s["domain"] for s in sources if s.get("active", True) and s.get("domain")]
                 domains = domains[:domains_limit]
@@ -648,7 +657,7 @@ class RunService:
                                 url = item["url"]
                                 title_found = item.get("title") or ""
                                 snippet_found = item.get("snippet") or ""
-                                
+
                                 # Store basic record in SQLite
                                 cache_service.upsert_url(
                                     domain=domain,
@@ -658,11 +667,9 @@ class RunService:
                                     snippet=snippet_found,
                                     source_type="internal_search"
                                 )
-                                
+
                                 # Enrich page metadata if enabled
-                                enrich_enabled_val = config.get("ENRICH_INDEXED_URLS", settings.ENRICH_INDEXED_URLS)
-                                enrich_enabled = is_true(enrich_enabled_val)
-                                
+                                enrich_enabled = is_true(config.get("ENRICH_INDEXED_URLS", settings.ENRICH_INDEXED_URLS))
                                 if enrich_enabled:
                                     enrich_timeout = int(config.get("DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS", settings.DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS))
                                     meta = _enrich_page_metadata(url, timeout=enrich_timeout)
@@ -685,8 +692,8 @@ class RunService:
                                 sheet_id=sheet_id,
                                 run_id=run_id
                             )
-                            
-                    # Re-run SourceDiscovery to retrieve new candidates
+
+                    # Re-run SourceDiscovery to retrieve new candidates (no max_candidates cap here yet)
                     if new_urls_found > 0:
                         local_matches = source_discovery.find_candidates(
                             title=title,
@@ -697,41 +704,73 @@ class RunService:
                         internal_candidates = 0
                         for match in local_matches:
                             url = match["url"]
-                            if url not in candidate_origin and len(candidate_origin) < max_candidates:
+                            if url not in candidate_origin:
                                 candidate_origin[url] = {
                                     "query": "local_index",
-                                    "provider": "DomainIndex",
+                                    "provider": "InternalSearch",
                                     "title": match.get("title") or "",
                                     "snippet": match.get("snippet") or "",
                                     "position": match.get("score"),
-                                    "pub_date": match.get("pub_date")
+                                    "pub_date": match.get("pub_date"),
+                                    "score": match.get("score", 0),
+                                    "matched_fields": match.get("matched_fields", [])
                                 }
                                 internal_candidates += 1
                                 logger_service.log(
                                     level="INFO",
                                     action="DOMAIN_SEARCH_MATCH",
-                                    message=f"{log_prefix}Match local (score={match['score']}): {url}",
+                                    message=f"{log_prefix}Match interno (score={match['score']}): {url}",
                                     isbn=isbn,
                                     detail=f"domain={match.get('domain')} | matched={match.get('matched_fields')} | title={match.get('title','')[:80]}",
                                     sheet_id=sheet_id,
                                     run_id=run_id
                                 )
                         internal_search_candidates_count = internal_candidates
-                
+
                 logger_service.log(
                     level="INFO",
                     action="INTERNAL_SEARCH_COMPLETED",
-                    message=f"{log_prefix}Búsqueda interna finalizada. Candidatas extraídas: {internal_search_candidates_count}",
+                    message=f"{log_prefix}Búsqueda interna finalizada. Nuevos candidatos: {internal_search_candidates_count}",
                     isbn=isbn,
                     sheet_id=sheet_id,
                     run_id=run_id
                 )
                 self._add_in_memory_log(
                     run_id, "INFO", "INTERNAL_SEARCH_COMPLETED",
-                    f"{log_prefix}Búsqueda interna finalizada: candidatos={internal_search_candidates_count}",
+                    f"{log_prefix}Búsqueda interna finalizada: nuevos_candidatos={internal_search_candidates_count}",
                     isbn=isbn
                 )
-            
+
+            # --- Prioritize and cap candidates ---
+            # Sort by quality: exact title+author match > InternalSearch > DomainIndex score > GoogleNews
+            title_lower = title.strip().lower()
+            author_lower = author.strip().lower() if author else ""
+
+            def candidate_priority(item_kv):
+                url_k, meta = item_kv
+                cand_title = (meta.get("title") or "").lower()
+                provider = (meta.get("provider") or "").lower()
+                score = meta.get("score") or meta.get("position") or 0
+                if isinstance(score, str):
+                    try: score = float(score)
+                    except: score = 0
+
+                exact_match = (title_lower in cand_title) or (cand_title in title_lower and len(cand_title) > 5)
+                author_match = author_lower and author_lower in cand_title
+                is_internal = "internalsearch" in provider or "domainindex" in provider
+                return (
+                    -(2 if (exact_match and author_match) else 1 if exact_match else 0),  # exact match priority
+                    -(1 if is_internal else 0),                                            # internal/index over news
+                    -float(score)                                                           # higher score first
+                )
+
+            all_candidates = list(candidate_origin.items())
+            all_candidates.sort(key=candidate_priority)
+
+            # Apply max_candidates cap after prioritization
+            candidates_discarded_by_limit = max(0, len(all_candidates) - max_candidates)
+            all_candidates = all_candidates[:max_candidates]
+            candidate_origin = dict(all_candidates)
             candidate_urls = list(candidate_origin.keys())
 
         else:
@@ -790,6 +829,9 @@ class RunService:
                             }
                 internal_search_candidates_count = len(candidate_origin) - google_news_candidates_count
 
+            candidates_discarded_by_limit = 0
+            internal_search_was_forced = False
+            internal_search_skip_reason = ""
             candidate_urls = list(candidate_origin.keys())
 
         # Log each candidate found with its originating query and provider
@@ -799,7 +841,7 @@ class RunService:
             title = item.get("title") or ""
             snippet = item.get("snippet") or ""
             pos = item.get("position") or ""
-            
+
             logger_service.log(
                 level="INFO",
                 action="CANDIDATE_FOUND",
@@ -821,7 +863,7 @@ class RunService:
         # Compile and Log Search Summary
         providers_used = search_service.get_providers_used()
         errors_count = search_service.get_and_reset_errors_count()
-        
+
         search_summary = {
             "queries_executed": queries_executed,
             "providers_used": providers_used,
@@ -831,13 +873,18 @@ class RunService:
             "google_news_candidates_count": google_news_candidates_count,
             "internal_search_candidates_count": internal_search_candidates_count,
             "total_candidates_before_dedup": domain_index_candidates_count + google_news_candidates_count + internal_search_candidates_count,
-            "total_candidates_after_dedup": len(candidate_urls)
+            "total_candidates_after_dedup": len(candidate_urls),
+            "candidates_discarded_by_limit": candidates_discarded_by_limit,
+            "candidates_sent_to_openai": len(candidate_urls),
+            "internal_search_was_forced": internal_search_was_forced,
+            "internal_search_skip_reason": internal_search_skip_reason
         }
-        
+
         summary_msg = (
             f"Resumen búsqueda: {queries_executed} queries, proveedores={providers_used}, "
             f"errores={errors_count}, candidatos={len(candidate_urls)} (Index={domain_index_candidates_count}, "
-            f"News={google_news_candidates_count}, Interna={internal_search_candidates_count})"
+            f"News={google_news_candidates_count}, Interna={internal_search_candidates_count}, "
+            f"descartados_por_límite={candidates_discarded_by_limit})"
         )
         logger_service.log(
             level="INFO",
@@ -863,6 +910,8 @@ class RunService:
         extracted_ok_count = 0
         openai_accepted_count = 0
         openai_rejected_count = 0
+
+
         observation = ""
 
         # 3. Process candidate URLs

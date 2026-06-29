@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     INTERNAL_SEARCH_DOMAINS_LIMIT: int = 10
     DEFAULT_INCLUDE_UNKNOWN_DATES: bool = True
     DEFAULT_DATE_MIN: Optional[str] = None
+    MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH: int = 5
+    MIN_CANDIDATES_BEFORE_AI: int = 1
+    ENABLE_CASCADE_SEARCH: bool = True
+    ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS: bool = True
+    ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH: bool = True
     DEFAULT_DATE_MAX: Optional[str] = None
     WORDPRESS_BASE_URL: Optional[str] = None
     WORDPRESS_USERNAME: Optional[str] = None

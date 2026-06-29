@@ -414,6 +414,7 @@ class SheetsService:
             {"Clave": "MIN_CANDIDATES_BEFORE_AI", "Valor": getattr(settings, "MIN_CANDIDATES_BEFORE_AI", 1), "Descripción": "Mínimo de candidatos requeridos para ejecutar el análisis IA de OpenAI"},
             {"Clave": "ENABLE_CASCADE_SEARCH", "Valor": getattr(settings, "ENABLE_CASCADE_SEARCH", True), "Descripción": "Activar búsqueda en cascada (Domain Index -> RSS -> Búsqueda Interna)"},
             {"Clave": "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", "Valor": getattr(settings, "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", True), "Descripción": "Activar búsqueda interna si el total de candidatos es bajo"},
+            {"Clave": "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", "Valor": getattr(settings, "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", True), "Descripción": "Ejecutar siempre búsqueda interna en dominios activos (true=siempre, false=solo si pocos candidatos)"},
             {"Clave": "BACKEND_BASE_URL", "Valor": "http://127.0.0.1:8000", "Descripción": "URL base del backend para Apps Script"},
             {"Clave": "ADMIN_TOKEN", "Valor": settings.ADMIN_TOKEN or "secret_admin_token", "Descripción": "Token de administración secreto para Apps Script (cabecera X-Admin-Token)"},
             {"Clave": "WORDPRESS_BASE_URL", "Valor": settings.WORDPRESS_BASE_URL or "", "Descripción": "URL base de WordPress (ej. https://miweb.com)"},
@@ -514,6 +515,7 @@ class SheetsService:
                 "MIN_CANDIDATES_BEFORE_AI": parse_int(config_dict.get("MIN_CANDIDATES_BEFORE_AI"), getattr(settings, "MIN_CANDIDATES_BEFORE_AI", 1)),
                 "ENABLE_CASCADE_SEARCH": parse_bool(config_dict.get("ENABLE_CASCADE_SEARCH"), getattr(settings, "ENABLE_CASCADE_SEARCH", True)),
                 "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS": parse_bool(config_dict.get("ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS"), getattr(settings, "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", True)),
+                "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH": parse_bool(config_dict.get("ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH"), getattr(settings, "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", True)),
             }
         except Exception:
             # Fallback to local configs if sheet configs fail to read
@@ -559,6 +561,7 @@ class SheetsService:
                 "MIN_CANDIDATES_BEFORE_AI": getattr(settings, "MIN_CANDIDATES_BEFORE_AI", 1),
                 "ENABLE_CASCADE_SEARCH": getattr(settings, "ENABLE_CASCADE_SEARCH", True),
                 "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS": getattr(settings, "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", True),
+                "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH": getattr(settings, "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", True),
             }
 
     def get_pending_books(
@@ -567,25 +570,30 @@ class SheetsService:
         limit: int = 10
     ) -> Dict[str, Any]:
         """
-        Reads Libros tab. A row is pending if it has a non-empty title
-        and its status is empty or 'pendiente'. ISBN and author are optional.
+        Reads Libros tab. A row is eligible to process if it has a non-empty title.
+        ISBN and author are optional. Previous status (sin_resultados, completado, error)
+        does NOT block reprocessing - every run is independent.
+
+        Only explicitly excluded statuses (e.g. 'no buscar') would block a row.
 
         Returns a dict with:
-          - 'books': list of pending book dicts
-          - 'books_rows_read': total rows read
-          - 'books_pending_detected': rows accepted as pending
+          - 'books': list of eligible book dicts
+          - 'books_rows_read': total non-empty rows read
+          - 'books_pending_detected': rows accepted for processing
           - 'books_skipped_missing_title': rows skipped due to missing title
-          - 'books_skipped_non_pending_status': rows skipped because status ≠ pendiente
+          - 'books_skipped_non_pending_status': always 0 (kept for API compatibility)
         """
         client = self.get_client()
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.worksheet("Libros")
         records = worksheet.get_all_records()
 
-        pending_books = []
+        books = []
         rows_read = 0
         skipped_missing_title = 0
-        skipped_non_pending = 0
+
+        # Statuses that explicitly block processing (reserved for future use)
+        BLOCKED_STATUSES = {"no buscar"}
 
         for index, row in enumerate(records, start=2):  # Headers are row 1
             isbn = str(row.get("ISBN", "")).strip()
@@ -603,27 +611,27 @@ class SheetsService:
                 skipped_missing_title += 1
                 continue
 
-            if status not in ("", "pendiente", "none"):
-                skipped_non_pending += 1
+            # Skip only explicitly blocked statuses
+            if status in BLOCKED_STATUSES:
                 continue
 
-            pending_books.append({
+            books.append({
                 "row_index": index,
                 "isbn": isbn,
                 "title": title,
                 "author": author,
-                "status": "pendiente"
+                "previous_status": status or "sin_estado"
             })
 
-            if len(pending_books) >= limit:
+            if len(books) >= limit:
                 break
 
         return {
-            "books": pending_books,
+            "books": books,
             "books_rows_read": rows_read,
-            "books_pending_detected": len(pending_books),
+            "books_pending_detected": len(books),
             "books_skipped_missing_title": skipped_missing_title,
-            "books_skipped_non_pending_status": skipped_non_pending
+            "books_skipped_non_pending_status": 0  # kept for API compat
         }
 
     def get_book_by_isbn(self, sheet_id: str, isbn: str) -> Optional[Dict[str, Any]]:
