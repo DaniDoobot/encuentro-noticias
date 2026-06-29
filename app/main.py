@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routers import health, setup, runs, books
+from app.routers import health, setup, runs, books, sources, publish, logs
 from app.config import settings
 
 app = FastAPI(
@@ -23,3 +23,8 @@ app.include_router(health.router)
 app.include_router(setup.router)
 app.include_router(runs.router)
 app.include_router(books.router)
+app.include_router(sources.router)
+app.include_router(publish.router)
+app.include_router(logs.router)
+
+

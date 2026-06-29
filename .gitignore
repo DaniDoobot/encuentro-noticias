@@ -140,3 +140,8 @@ cython_debug/
 # OS specific files
 .DS_Store
 Thumbs.db
+
+# Local database and scratch files
+*.sqlite
+data/
+scratch/

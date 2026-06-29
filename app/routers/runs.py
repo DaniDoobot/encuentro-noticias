@@ -1,17 +1,56 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from app.schemas import RunConfig, BookRunConfig, RunResponse, RunStatusResponse, DedupeRebuildResponse
+from app.schemas import (
+    RunConfig, BookRunConfig, RunResponse, RunStatusResponse, 
+    DedupeRebuildResponse, DebugSearchRequest, DebugSearchResponse, 
+    ProviderDebugResult
+)
 from app.services.run_service import run_service
 from app.config import settings
 from app.dependencies import verify_admin_token
+from app.services.search_providers import (
+    DuckDuckGoSearchProvider,
+    BingHtmlSearchProvider,
+    GoogleNewsRssSearchProvider,
+    SerpApiSearchProvider,
+    DataForSeoSearchProvider
+)
+from app.services.sheets_service import sheets_service
 
 router = APIRouter(dependencies=[Depends(verify_admin_token)])
+
+import datetime
+
+def validate_iso_date(date_str: Optional[str], name: str) -> Optional[datetime.date]:
+    if not date_str:
+        return None
+    try:
+        return datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Parameter {name} must be in YYYY-MM-DD format."
+        )
 
 @router.post("/runs", response_model=RunResponse)
 def post_runs(config: RunConfig):
     """
     Launches a background scraping and validation run for pending books in Google Sheets.
     """
-    run_id = run_service.trigger_run(limit_books=config.limit_books, dry_run=config.dry_run)
+    d_min = validate_iso_date(config.date_min, "date_min")
+    d_max = validate_iso_date(config.date_max, "date_max")
+    if d_min and d_max and d_min > d_max:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="date_min cannot be greater than date_max."
+        )
+        
+    run_id = run_service.trigger_run(
+        limit_books=config.limit_books, 
+        dry_run=config.dry_run,
+        date_min=config.date_min,
+        date_max=config.date_max,
+        include_unknown_dates=config.include_unknown_dates
+    )
     return RunResponse(
         run_id=run_id,
         message="Background scraping run started successfully."
@@ -22,7 +61,21 @@ def post_run_book(isbn: str, config: BookRunConfig):
     """
     Launches a background scraping and validation run for a single book by ISBN.
     """
-    run_id = run_service.trigger_single_book_run(isbn=isbn, dry_run=config.dry_run)
+    d_min = validate_iso_date(config.date_min, "date_min")
+    d_max = validate_iso_date(config.date_max, "date_max")
+    if d_min and d_max and d_min > d_max:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="date_min cannot be greater than date_max."
+        )
+        
+    run_id = run_service.trigger_single_book_run(
+        isbn=isbn, 
+        dry_run=config.dry_run,
+        date_min=config.date_min,
+        date_max=config.date_max,
+        include_unknown_dates=config.include_unknown_dates
+    )
     return RunResponse(
         run_id=run_id,
         message=f"Background scraping run started successfully for ISBN {isbn}."
@@ -68,3 +121,75 @@ def rebuild_dedupe():
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to rebuild dedupe hashes: {str(e)}"
         )
+
+@router.post("/debug/search", response_model=DebugSearchResponse)
+def debug_search(req: DebugSearchRequest):
+    """
+    Manual search provider testing endpoint. Does not write to Google Sheets or call OpenAI.
+    """
+    results = []
+    
+    # Load config credentials
+    try:
+        config = sheets_service.get_config_dict(settings.GOOGLE_SHEET_ID)
+    except Exception:
+        config = {}
+
+    api_key = config.get("SERPAPI_API_KEY", settings.SERPAPI_API_KEY)
+    login = config.get("DATAFORSEO_LOGIN", settings.DATAFORSEO_LOGIN)
+    password = config.get("DATAFORSEO_PASSWORD", settings.DATAFORSEO_PASSWORD)
+
+    ddg = DuckDuckGoSearchProvider()
+    bing = BingHtmlSearchProvider()
+    rss = GoogleNewsRssSearchProvider()
+    serpapi = SerpApiSearchProvider()
+    dataforseo = DataForSeoSearchProvider()
+    
+    provider_map = {
+        "duckduckgo": ddg,
+        "binghtml": bing,
+        "googlenewsrss": rss,
+        "serpapi": serpapi,
+        "dataforseo": dataforseo
+    }
+    
+    for p_name in req.providers:
+        p_key = p_name.lower().strip()
+        provider = provider_map.get(p_key)
+        if not provider:
+            results.append(ProviderDebugResult(
+                provider=p_name,
+                status="error",
+                status_code=400,
+                urls=[],
+                debug={"error": f"Provider {p_name} is not supported or not found."}
+            ))
+            continue
+            
+        kwargs = {"max_pages": 1, "timeout": settings.REQUEST_TIMEOUT_SECONDS}
+        if p_key == "serpapi":
+            kwargs["api_key"] = api_key
+        elif p_key == "dataforseo":
+            kwargs["login"] = login
+            kwargs["password"] = password
+            
+        try:
+            res = provider.search(req.query, **kwargs)
+            results.append(ProviderDebugResult(
+                provider=res.provider,
+                status=res.status,
+                status_code=res.status_code,
+                urls=res.urls,
+                debug=res.debug
+            ))
+        except Exception as e:
+            results.append(ProviderDebugResult(
+                provider=provider.name(),
+                status="error",
+                status_code=None,
+                urls=[],
+                debug={"error": str(e)}
+            ))
+            
+    return DebugSearchResponse(query=req.query, results=results)
+

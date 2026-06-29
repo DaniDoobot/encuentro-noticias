@@ -116,11 +116,43 @@ class ArticleExtractor:
                     if meta_author:
                         extracted_data["author"] = meta_author.get("content", "").strip()
 
-                # Date search in meta tags
+                # Date search in meta, time tags, and JSON-LD
                 if not extracted_data["date"]:
-                    meta_date = soup.find("meta", attrs={"property": "article:published_time"}) or soup.find("meta", attrs={"name": "pubdate"})
+                    meta_date = (
+                        soup.find("meta", attrs={"property": "article:published_time"}) or
+                        soup.find("meta", attrs={"name": "pubdate"}) or
+                        soup.find("meta", attrs={"property": "datePublished"}) or
+                        soup.find("meta", attrs={"name": "date"}) or
+                        soup.find("meta", attrs={"itemprop": "datePublished"})
+                    )
                     if meta_date:
                         extracted_data["date"] = meta_date.get("content", "").strip()
+
+                if not extracted_data["date"]:
+                    time_tag = soup.find("time", attrs={"datetime": True})
+                    if time_tag:
+                        extracted_data["date"] = time_tag.get("datetime", "").strip()
+
+                if not extracted_data["date"]:
+                    import json
+                    for script in soup.find_all("script", type="application/ld+json"):
+                        try:
+                            if script.string:
+                                ld = json.loads(script.string)
+                                items = ld if isinstance(ld, list) else [ld]
+                                for item in items:
+                                    if not isinstance(item, dict):
+                                        continue
+                                    for f in ["datePublished", "dateCreated", "uploadDate"]:
+                                        if f in item and item[f]:
+                                            extracted_data["date"] = str(item[f]).strip()
+                                            break
+                                    if extracted_data["date"]:
+                                        break
+                                if extracted_data["date"]:
+                                    break
+                        except Exception:
+                            pass
                         
             except Exception as e:
                 logger.error(f"BS4 fallback extraction failed for {url}: {e}")

@@ -100,7 +100,7 @@ def test_query_builder_tiers():
 
 def test_search_rate_limit_detection():
     """
-    Verifies that search providers correctly identify and raise rate-limiting exceptions.
+    Verifies that search providers correctly identify and return rate-limiting status.
     """
     provider = DuckDuckGoSearchProvider()
     
@@ -108,12 +108,36 @@ def test_search_rate_limit_detection():
     mock_response.status_code = 202
     
     with patch("httpx.Client.get", return_value=mock_response):
-        with pytest.raises(SearchProviderRateLimitError):
-            provider.search("Ficciones Borges", timeout=5)
+        res = provider.search("Ficciones Borges", timeout=5)
+        assert res.status == "rate_limited"
+        assert res.status_code == 202
+        assert len(res.urls) == 0
 
-def test_bing_parser():
+from app.services.search_service import search_service, is_true
+from app.services.search_providers import GoogleNewsRssSearchProvider, SerpApiSearchProvider, DataForSeoSearchProvider, SearchProviderResult
+
+def test_is_true_helper():
     """
-    Verifies that BingHtmlSearchProvider extracts organic result links and discards internal Bing ones.
+    Tests boolean parsing helper is_true.
+    """
+    assert is_true(True) is True
+    assert is_true("True") is True
+    assert is_true("TRUE") is True
+    assert is_true("1") is True
+    assert is_true(1) is True
+    assert is_true("yes") is True
+    assert is_true("sí") is True
+    assert is_true("si") is True
+    assert is_true("on") is True
+    assert is_true(False) is False
+    assert is_true("False") is False
+    assert is_true("0") is False
+    assert is_true(None) is False
+    assert is_true("no") is False
+
+def test_bing_parser_li_b_algo():
+    """
+    Verifies that BingHtmlSearchProvider extracts organic result links from li.b_algo and discards internal Bing ones.
     """
     provider = BingHtmlSearchProvider()
     
@@ -140,9 +164,483 @@ def test_bing_parser():
     mock_response.text = mock_html
     
     with patch("httpx.Client.get", return_value=mock_response):
-        urls = provider.search("Borges", timeout=5)
+        res = provider.search("Borges", timeout=5)
+        assert res.status == "ok"
+        urls = res.urls
         assert len(urls) == 2
         assert "https://revistadelibros.com/review1" in urls
         assert "https://www.aceprensa.com/critica" in urls
         assert "https://www.bing.com/search?q=something" not in urls
+
+def test_bing_parser_fallback_h2_a():
+    """
+    Verifies that BingHtmlSearchProvider falls back to any h2 a when no li.b_algo is present.
+    """
+    provider = BingHtmlSearchProvider()
+    mock_html = """
+    <html>
+    <body>
+        <h2><a href="https://example.com/fallback_h2">H2 Link</a></h2>
+        <h2><a href="https://microsoft.com/bad">Microsoft</a></h2>
+    </body>
+    </html>
+    """
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.text = mock_html
+    
+    with patch("httpx.Client.get", return_value=mock_response):
+        res = provider.search("test", timeout=5)
+        assert res.status == "ok"
+        urls = res.urls
+        assert len(urls) == 1
+        assert urls[0] == "https://example.com/fallback_h2"
+
+def test_bing_parser_mixed_links_and_decoding():
+    """
+    Verifies decoding of Bing redirect URLs and that we do not filter e-commerce/external sites.
+    """
+    provider = BingHtmlSearchProvider()
+    mock_html = """
+    <html>
+    <body>
+        <li class="b_algo">
+            <h2><a href="https://www.bing.com/ck/a?!&&p=abc&u=a1aHR0cHM6Ly93d3cuYW1hem9uLmVzL2xpYnJv&ntb=1">Amazon redirect</a></h2>
+        </li>
+        <li class="b_algo">
+            <h2><a href="https://go.microsoft.com/ref">Microsoft</a></h2>
+        </li>
+        <li class="b_algo">
+            <h2><a href="https://login.live.com/login">Live</a></h2>
+        </li>
+        <li class="b_algo">
+            <h2><a href="https://casadellibro.com/libro">Casa del Libro</a></h2>
+        </li>
+    </body>
+    </html>
+    """
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.text = mock_html
+    
+    with patch("httpx.Client.get", return_value=mock_response):
+        res = provider.search("test", timeout=5)
+        assert res.status == "ok"
+        urls = res.urls
+        assert len(urls) == 2
+        assert "https://www.amazon.es/libro" in urls
+        assert "https://casadellibro.com/libro" in urls
+
+def test_providers_used_filled_on_zero_results():
+    """
+    Verifies that providers_used_count tracks queried providers even if they yield 0 URLs.
+    """
+    search_service.reset_blocked_providers()
+    
+    mock_ddg = MagicMock()
+    mock_ddg.search.return_value = SearchProviderResult(
+        provider="DuckDuckGo",
+        query="test query",
+        status="ok",
+        status_code=200,
+        urls=[],
+        debug={"organic_results_parsed": []}
+    )
+    mock_ddg.name.return_value = "DuckDuckGo"
+    
+    original_ddg = search_service.ddg_provider
+    search_service.ddg_provider = mock_ddg
+    try:
+        res = search_service.search_with_fallback(
+            query="test query",
+            max_pages=1,
+            sheet_id="dummy",
+            run_id="dummy_run",
+            isbn="12345",
+            config={"SEARCH_PROVIDER_MODE": "free_only", "ENABLE_GOOGLE_NEWS_RSS": False, "SEARCH_BACKOFF_SECONDS": 1}
+        )
+        assert len(res) == 0
+        assert "DuckDuckGo" in search_service.get_providers_used()
+    finally:
+        search_service.ddg_provider = original_ddg
+
+def test_debug_search_endpoint():
+    """
+    Verifies that POST /debug/search endpoint calls providers correctly and returns debug telemetry.
+    """
+    with patch("app.services.search_providers.DuckDuckGoSearchProvider.search") as mock_ddg, \
+         patch("app.services.search_providers.BingHtmlSearchProvider.search") as mock_bing, \
+         patch("app.services.search_providers.GoogleNewsRssSearchProvider.search") as mock_rss:
+         
+         mock_ddg.return_value = SearchProviderResult(
+             provider="DuckDuckGo",
+             query="test query",
+             status="ok",
+             status_code=200,
+             urls=["https://ddg.com/1"],
+             debug={"organic_results_parsed": [{"url": "https://ddg.com/1"}]}
+         )
+         mock_bing.return_value = SearchProviderResult(
+             provider="BingHtml",
+             query="test query",
+             status="ok",
+             status_code=200,
+             urls=["https://bing.com/2"],
+             debug={"organic_results_parsed": [{"url": "https://bing.com/2"}]}
+         )
+         mock_rss.return_value = SearchProviderResult(
+             provider="GoogleNewsRss",
+             query="test query",
+             status="ok",
+             status_code=200,
+             urls=[],
+             debug={"organic_results_parsed": []}
+         )
+         
+         response = client.post(
+             "/debug/search",
+             json={
+                 "query": "test query",
+                 "providers": ["DuckDuckGo", "BingHtml", "GoogleNewsRss"]
+             }
+         )
+         assert response.status_code == 200
+         data = response.json()
+         assert data["query"] == "test query"
+         assert len(data["results"]) == 3
+         
+         ddg_res = next(r for r in data["results"] if r["provider"] == "DuckDuckGo")
+         assert ddg_res["status"] == "ok"
+         assert ddg_res["status_code"] == 200
+         assert ddg_res["urls"] == ["https://ddg.com/1"]
+
+def test_debug_search_endpoint_unauthorized():
+    """
+    Verifies authentication on POST /debug/search if ADMIN_TOKEN is set.
+    """
+    with patch("app.config.settings.ADMIN_TOKEN", "super-secret"):
+        response = client.post(
+            "/debug/search",
+            json={"query": "test", "providers": ["DuckDuckGo"]},
+            headers={"X-Admin-Token": "wrong-token"}
+        )
+        assert response.status_code == 401
+
+def test_serpapi_parsing():
+    """
+    Verifies SerpApiSearchProvider parsing of organic Google search results.
+    """
+    provider = SerpApiSearchProvider()
+    mock_data = {
+        "organic_results": [
+            {
+                "position": 1,
+                "title": "Reseña de Sapiens",
+                "link": "https://example.com/sapiens-review",
+                "snippet": "Una gran obra sobre la historia de la humanidad."
+            }
+        ]
+    }
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = mock_data
+    
+    with patch("httpx.Client.get", return_value=mock_response):
+        res = provider.search("Sapiens", api_key="dummy_key")
+        assert res.status == "ok"
+        assert res.urls == ["https://example.com/sapiens-review"]
+        parsed = res.debug["organic_results_parsed"]
+        assert len(parsed) == 1
+        assert parsed[0]["title"] == "Reseña de Sapiens"
+        assert parsed[0]["snippet"] == "Una gran obra sobre la historia de la humanidad."
+        assert parsed[0]["position"] == 1
+
+def test_dataforseo_parsing():
+    """
+    Verifies DataForSeoSearchProvider parsing of Google organic results.
+    """
+    provider = DataForSeoSearchProvider()
+    mock_data = {
+        "tasks": [
+            {
+                "result": [
+                    {
+                        "items": [
+                            {
+                                "type": "organic",
+                                "rank_group": 1,
+                                "title": "Crítica del infinito en un junco",
+                                "url": "https://example.com/infinito-junco",
+                                "description": "Excelente ensayo de Irene Vallejo."
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = mock_data
+    
+    with patch("httpx.Client.post", return_value=mock_response):
+        res = provider.search("El infinito en un junco", login="usr", password="pwd")
+        assert res.status == "ok"
+        assert res.urls == ["https://example.com/infinito-junco"]
+        parsed = res.debug["organic_results_parsed"]
+        assert len(parsed) == 1
+        assert parsed[0]["title"] == "Crítica del infinito en un junco"
+        assert parsed[0]["snippet"] == "Excelente ensayo de Irene Vallejo."
+        assert parsed[0]["position"] == 1
+
+def test_search_service_routing_modes():
+    """
+    Verifies that search_service routes searches appropriately according to the configured mode.
+    """
+    # 1. Mode free_only: should call ddg (mocked, returns results) and NOT call SerpAPI/DataForSEO.
+    # Bing is NOT called because DDG succeeds and the provider loop breaks early.
+    with patch("app.services.search_providers.DuckDuckGoSearchProvider.search") as mock_ddg, \
+         patch("app.services.search_providers.BingHtmlSearchProvider.search") as mock_bing, \
+         patch("app.services.search_providers.SerpApiSearchProvider.search") as mock_serpapi:
+         
+         mock_ddg.return_value = SearchProviderResult(
+             provider="DuckDuckGo", query="q", status="ok", urls=["https://ddg.com"],
+             debug={"organic_results_parsed": [{"url": "https://ddg.com"}]}
+         )
+         mock_bing.return_value = SearchProviderResult(provider="BingHtml", query="q", status="ok", urls=[])
+         
+         search_service.reset_blocked_providers()
+         res = search_service.search_with_fallback(
+             query="test query",
+             max_pages=1,
+             sheet_id="dummy",
+             run_id="run_1",
+             isbn="12345",
+             config={"SEARCH_PROVIDER_MODE": "free_only", "ENABLE_GOOGLE_NEWS_RSS": False}
+         )
+         assert len(res) == 1
+         assert res[0]["url"] == "https://ddg.com"
+         mock_ddg.assert_called_once()
+         # Bing is not called because DDG returned results and the loop breaks
+         mock_bing.assert_not_called()
+         mock_serpapi.assert_not_called()
+
+    # 2. Mode serpapi: should call serpapi (mocked) and NOT call free providers
+    with patch("app.services.search_providers.DuckDuckGoSearchProvider.search") as mock_ddg, \
+         patch("app.services.search_providers.SerpApiSearchProvider.search") as mock_serpapi:
+         
+         mock_serpapi.return_value = SearchProviderResult(
+             provider="SerpAPI", query="q", status="ok", urls=["https://serp.com"],
+             debug={"organic_results_parsed": [{"url": "https://serp.com", "title": "Serp title"}]}
+         )
+         
+         search_service.reset_blocked_providers()
+         res = search_service.search_with_fallback(
+             query="test query",
+             max_pages=1,
+             sheet_id="dummy",
+             run_id="run_1",
+             isbn="12345",
+             config={"SEARCH_PROVIDER_MODE": "serpapi", "ENABLE_SERPAPI": True, "SERPAPI_API_KEY": "somekey"}
+         )
+         assert len(res) == 1
+         assert res[0]["url"] == "https://serp.com"
+         mock_serpapi.assert_called_once()
+         mock_ddg.assert_not_called()
+
+def test_block_provider_reset():
+    """
+    Verifies that run_service clears blocked search providers at the start of processing a book
+    if BLOCK_PROVIDER_FOR_FULL_RUN is set to false.
+    """
+    from app.services.run_service import run_service
+    
+    # Pre-populate blocked providers
+    search_service.blocked_providers.add("DuckDuckGo")
+    search_service.blocked_providers.add("BingHtml")
+    
+    # Process a book in dry_run with BLOCK_PROVIDER_FOR_FULL_RUN = False
+    # Mock Sheets service to prevent network hits
+    with patch("app.services.sheets_service.sheets_service.update_book_status") as mock_status, \
+         patch("app.services.sheets_service.sheets_service.get_all_reviews", return_value=[]), \
+         patch("app.services.search_service.search_service.search_with_fallback", return_value=[]):
+         
+         run_service._process_book(
+             run_id="run_test",
+             sheet_id="sheet_id",
+             row_index=2,
+             isbn="123",
+             title="Title",
+             author="Author",
+             max_pages=1,
+             max_candidates=5,
+             min_score=70,
+             openai_model="gpt-4o",
+             existing_hashes=set(),
+             existing_secondary_keys=set(),
+             run_config={"BLOCK_PROVIDER_FOR_FULL_RUN": "false"},
+             dry_run=True
+         )
+         
+         # The blocked providers set should be cleared!
+         assert "DuckDuckGo" not in search_service.blocked_providers
+         assert "BingHtml" not in search_service.blocked_providers
+
+
+def test_cache_service_upsert_and_search(tmp_path):
+    """
+    Tests CacheService database initialization, upserting URLs, searching by text,
+    and getting statistics.
+    """
+    from app.services.cache_service import cache_service
+    db_file = str(tmp_path / "test_reviews_index.sqlite")
+    cache_service.init_db(db_file)
+    
+    # New insertion
+    is_new = cache_service.upsert_url(
+        domain="example.com",
+        url="https://example.com/libro/reseña-1",
+        url_normalized="https://example.com/libro/resena-1",
+        title="Reseña del infinito en un junco",
+        snippet="Un libro maravilloso sobre los libros por Irene Vallejo.",
+        pub_date="2026-06-26",
+        source_type="sitemap"
+    )
+    assert is_new is True
+    
+    # Update insertion (same URL)
+    is_new_update = cache_service.upsert_url(
+        domain="example.com",
+        url="https://example.com/libro/reseña-1",
+        url_normalized="https://example.com/libro/resena-1",
+        title="Reseña del infinito en un junco (actualizado)",
+        snippet="Un libro maravilloso sobre los libros por Irene Vallejo.",
+        pub_date="2026-06-26",
+        source_type="sitemap"
+    )
+    assert is_new_update is False
+    
+    # Check count
+    assert cache_service.get_total_urls() == 1
+    
+    # Search term matching
+    matches = cache_service.search_by_text(terms=["infinito", "Vallejo"])
+    assert len(matches) == 1
+    assert "actualizado" in matches[0]["title"]
+    
+    # Test refresh check
+    assert cache_service.needs_refresh("example.com", 7) is False
+    assert cache_service.needs_refresh("example.com", 0) is True
+
+
+def test_source_discovery_scoring(tmp_path):
+    """
+    Tests scoring heuristic in SourceDiscovery.
+    """
+    from app.services.cache_service import cache_service
+    from app.services.source_discovery import source_discovery
+    db_file = str(tmp_path / "test_discovery.sqlite")
+    cache_service.init_db(db_file)
+    
+    cache_service.upsert_url(
+        domain="example.com",
+        url="https://example.com/reseña-infinito",
+        title="Reseña de El infinito en un junco de Irene Vallejo",
+        snippet="Una reseña literaria espectacular de Irene Vallejo.",
+        pub_date="2026-06-26"
+    )
+    
+    cache_service.upsert_url(
+        domain="example.com",
+        url="https://example.com/isbn-search",
+        title="Crítica del libro",
+        snippet="Libro con ISBN 978-84-7490-104-7 sobre los símbolos.",
+        pub_date="2026-06-26"
+    )
+    
+    # Search by title and author
+    candidates = source_discovery.find_candidates(
+        title="El infinito en un junco",
+        author="Irene Vallejo",
+        isbn="",
+        config={"DOMAIN_INDEX_MIN_SCORE": 50, "DOMAIN_INDEX_DB_PATH": db_file}
+    )
+    assert len(candidates) == 1
+    assert candidates[0]["url"] == "https://example.com/reseña-infinito"
+    assert candidates[0]["score"] >= 70
+    
+    # Search by ISBN
+    candidates_isbn = source_discovery.find_candidates(
+        title="Introducción a los símbolos",
+        author="Gérard de Champeaux",
+        isbn="978-84-7490-104-7",
+        config={"DOMAIN_INDEX_MIN_SCORE": 70, "DOMAIN_INDEX_DB_PATH": db_file}
+    )
+    assert len(candidates_isbn) == 1
+    assert candidates_isbn[0]["url"] == "https://example.com/isbn-search"
+
+
+def test_domain_indexer_cultural_filter():
+    """
+    Tests cultural URL path filtering logic.
+    """
+    from app.services.domain_indexer import _is_cultural_url
+    assert _is_cultural_url("https://example.com/libros/resena-infinito") is True
+    assert _is_cultural_url("https://example.com/critica/el-infinito-en-un-junco") is True
+    assert _is_cultural_url("https://example.com/wp-admin/post.php") is False
+    assert _is_cultural_url("https://example.com/shop/checkout") is False
+    assert _is_cultural_url("https://example.com/contacto") is False
+
+
+def test_domain_search_endpoint(tmp_path):
+    """
+    Tests POST /debug/domain-search endpoint authentication and matching logic.
+    """
+    from app.services.cache_service import cache_service
+    db_file = str(tmp_path / "test_endpoint.sqlite")
+    cache_service.init_db(db_file)
+    cache_service.upsert_url(
+        domain="revistadelibros.com",
+        url="https://revistadelibros.com/resena-infinito",
+        title="Reseña de El infinito en un junco de Irene Vallejo",
+        snippet="Reseña cultural.",
+        pub_date="2026"
+    )
+    
+    with patch("app.config.settings.DOMAIN_INDEX_DB_PATH", db_file), \
+         patch("app.config.settings.ADMIN_TOKEN", "test-token"), \
+         patch("app.services.sheets_service.sheets_service.get_config_dict", return_value={"DOMAIN_INDEX_DB_PATH": db_file, "DOMAIN_INDEX_MIN_SCORE": 70}):
+         
+         
+        # Unauthorized check
+        response = client.post(
+            "/debug/domain-search",
+            json={"title": "El infinito en un junco", "author": "Irene Vallejo", "isbn": ""},
+            headers={"X-Admin-Token": "bad-token"}
+        )
+        assert response.status_code == 401
+        
+        # Authorized check
+        response = client.post(
+            "/debug/domain-search",
+            json={"title": "El infinito en un junco", "author": "Irene Vallejo", "isbn": ""},
+            headers={"X-Admin-Token": "test-token"}
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_matches"] == 1
+        assert data["matches"][0]["url"] == "https://revistadelibros.com/resena-infinito"
+        assert data["matches"][0]["score"] >= 70
+
+
+def test_metadata_enrichment_and_slug_scoring(tmp_path):
+    """
+    Tests slug fallback title generation and slug extraction helpers.
+    """
+    from app.services.domain_indexer import _title_from_slug
+    assert _title_from_slug("https://example.com/cultura/leonardo-genio-y-trabajador-paciente/") == "Leonardo genio y trabajador paciente"
+    assert _title_from_slug("https://example.com/sobre-las-representaciones-de-tematica-sexual/") == "Sobre las representaciones de tematica sexual"
+
+    from app.services.source_discovery import source_discovery, _get_slug_text
+    assert _get_slug_text("https://example.com/cultura/leonardo-genio-y-trabajador-paciente/") == "leonardo genio y trabajador paciente"
 

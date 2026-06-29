@@ -3,6 +3,9 @@ from google.oauth2.service_account import Credentials
 from app.config import settings
 from typing import List, Dict, Any, Optional, Tuple
 import datetime
+import logging
+
+logger = logging.getLogger("encuentro-noticias")
 
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
@@ -33,23 +36,47 @@ class SheetsService:
         except gspread.exceptions.SpreadsheetNotFound:
             raise ValueError(f"Google Sheet with ID {sheet_id} was not found or is not shared with the service account.")
 
+        # Rename old "Reseñas" worksheet to "Reseñas por publicar" if it exists
+        try:
+            old_ws = spreadsheet.worksheet("Reseñas")
+            try:
+                spreadsheet.worksheet("Reseñas por publicar")
+            except gspread.exceptions.WorksheetNotFound:
+                old_ws.update_title("Reseñas por publicar")
+        except gspread.exceptions.WorksheetNotFound:
+            pass
+
         # Tab schemas definition
         tabs = {
             "Libros": [
                 "ISBN", "Título del libro", "Autor del libro", 
                 "Estado", "Última ejecución", "Reseñas encontradas", "Observaciones"
             ],
-            "Reseñas": [
-                "ISBN", "Título del libro", "Autor del libro", "Query", "URL", 
-                "URL normalizada", "Título del artículo", "Título del libro detectado por IA", 
-                "Autor del libro detectado por IA", "Medio de publicación", "Autor de la publicación", 
-                "Fecha de publicación", "Idioma original", "Categoría", "Resumen", 
-                "Score de coincidencia", "Tipo de contenido", "Fecha de extracción", 
-                "Hash deduplicación", "Estado"
+            "Reseñas por publicar": [
+                "¿Publicar?", "Estado publicación", "Fecha intento publicación", "Fecha publicación",
+                "WordPress ID", "WordPress URL", "Error publicación", "ISBN", "Título del libro",
+                "Autor del libro", "Query", "URL", "URL normalizada", "Título del artículo",
+                "Título del libro detectado por IA", "Autor del libro detectado por IA",
+                "Medio de publicación", "Autor de la publicación", "Fecha de publicación",
+                "Idioma original", "Categoría", "Resumen", "Score de coincidencia",
+                "Tipo de contenido", "Fecha de extracción", "Hash deduplicación", "Estado"
+            ],
+            "Reseñas publicadas": [
+                "¿Publicar?", "Estado publicación", "Fecha intento publicación", "Fecha publicación",
+                "WordPress ID", "WordPress URL", "Error publicación", "ISBN", "Título del libro",
+                "Autor del libro", "Query", "URL", "URL normalizada", "Título del artículo",
+                "Título del libro detectado por IA", "Autor del libro detectado por IA",
+                "Medio de publicación", "Autor de la publicación", "Fecha de publicación",
+                "Idioma original", "Categoría", "Resumen", "Score de coincidencia",
+                "Tipo de contenido", "Fecha de extracción", "Hash deduplicación", "Estado"
             ],
             "Descartes": [
                 "ISBN", "Título del libro", "Autor del libro", "Query", "URL", 
                 "Título detectado", "Motivo de descarte", "Score de coincidencia", "Fecha de extracción"
+            ],
+            "Fuentes": [
+                "Dominio", "Activo", "Tipo", "Sitemap URL", "RSS URL",
+                "Buscador interno", "Notas", "Última indexación", "URLs indexadas", "Errores"
             ],
             "Logs": [
                 "Run ID", "Fecha", "Nivel", "ISBN", "Acción", "Mensaje", "Detalle"
@@ -60,22 +87,214 @@ class SheetsService:
         }
 
         created_tabs = []
+        existing_sheets = {ws.title: ws for ws in spreadsheet.worksheets()}
         for tab_name, headers in tabs.items():
-            try:
-                worksheet = spreadsheet.worksheet(tab_name)
-            except gspread.exceptions.WorksheetNotFound:
+            if tab_name in existing_sheets:
+                worksheet = existing_sheets[tab_name]
+            else:
                 worksheet = spreadsheet.add_worksheet(title=tab_name, rows="1000", cols=str(len(headers) + 5))
                 created_tabs.append(tab_name)
-
-            # Ensure headers are correct
-            existing_headers = worksheet.row_values(1)
-            if not existing_headers or len(existing_headers) < len(headers):
                 worksheet.insert_row(headers, index=1)
-            else:
-                # Fill missing headers if any
-                for i, header in enumerate(headers):
-                    if i >= len(existing_headers) or existing_headers[i] != header:
-                        worksheet.update_cell(1, i + 1, header)
+                continue
+
+            # Ensure headers are correct and run safe migrator if order/columns mismatch for Reseñas tabs
+            if tab_name in ("Reseñas por publicar", "Reseñas publicadas"):
+                try:
+                    existing_headers = worksheet.row_values(1)
+                    if existing_headers and existing_headers != headers:
+                        logger.info(f"Reorganizing columns for '{tab_name}' safely...")
+                        all_rows = worksheet.get_all_values()
+                        data_rows = all_rows[1:] if len(all_rows) > 1 else []
+                        
+                        new_rows = []
+                        for row in data_rows:
+                            row_dict = {}
+                            for i, val in enumerate(row):
+                                if i < len(existing_headers):
+                                    row_dict[existing_headers[i]] = val
+                                    
+                            new_row = []
+                            for h in headers:
+                                if h not in row_dict:
+                                    if h == "¿Publicar?":
+                                        new_row.append("FALSE")
+                                    else:
+                                        new_row.append("")
+                                else:
+                                    new_row.append(row_dict[h])
+                            new_rows.append(new_row)
+                            
+                        # Overwrite sheet with new schema and reordered values
+                        worksheet.clear()
+                        # Make sure we have enough columns for headers list
+                        if worksheet.col_count < len(headers):
+                            worksheet.resize(rows=max(1000, len(new_rows) + 50), cols=len(headers) + 5)
+                        worksheet.update("A1", [headers] + new_rows)
+                        logger.info(f"Worksheet '{tab_name}' successfully migrated with {len(new_rows)} rows.")
+                except Exception as e_hdr:
+                    logger.error(f"Could not migrate headers/rows for {tab_name}: {e_hdr}")
+            elif worksheet.col_count < len(headers):
+                try:
+                    existing_headers = worksheet.row_values(1)
+                    for i, header in enumerate(headers):
+                        if i >= len(existing_headers) or existing_headers[i] != header:
+                            worksheet.update_cell(1, i + 1, header)
+                except Exception as e_hdr:
+                    logger.warning(f"Could not verify headers for {tab_name}: {e_hdr}")
+
+        # Ensure Panel worksheet exists and has the correct layout
+        if "Panel" in existing_sheets:
+            panel_ws = existing_sheets["Panel"]
+        else:
+            panel_ws = spreadsheet.add_worksheet(title="Panel", rows="30", cols="10")
+            created_tabs.append("Panel")
+
+        panel_vals = panel_ws.get_all_values()
+        if not panel_vals or len(panel_vals) < 11:
+            panel_structure = [
+                ["Encuentro Noticias — Panel de control", ""],
+                ["", ""],
+                ["Fecha mínima", "2024-01-01"],
+                ["Fecha máxima", "2026-12-31"],
+                ["Máximo de libros", "5"],
+                ["Modo prueba", "TRUE"],
+                ["Incluir artículos sin fecha", "TRUE"],
+                ["Estado última búsqueda", "no iniciado"],
+                ["Última búsqueda_id", ""],
+                ["Última ejecución", ""],
+                ["Mensaje", ""],
+                ["", ""],
+                ["Instrucciones:", ""],
+                ["Use el botón 'Lanzar búsqueda' desde el menú 'Encuentro Noticias' para iniciar una búsqueda.", ""],
+                ["Use 'Consultar estado' para refrescar el estado de la última búsqueda.", ""]
+            ]
+            panel_ws.clear()
+            panel_ws.update(range_name="A1", values=panel_structure)
+            
+        # Apply date, number validations and boolean checkboxes always
+        try:
+            ws_to_pub = spreadsheet.worksheet("Reseñas por publicar")
+            ws_pub = spreadsheet.worksheet("Reseñas publicadas")
+            
+            val_requests = [
+                # Date validation for B3:B4
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": panel_ws.id,
+                            "startRowIndex": 2,
+                            "endRowIndex": 4,
+                            "startColumnIndex": 1,
+                            "endColumnIndex": 2
+                        },
+                        "rule": {
+                            "condition": {
+                                "type": "DATE_IS_VALID"
+                            },
+                            "showCustomUi": True,
+                            "strict": True
+                        }
+                    }
+                },
+                # Date format (yyyy-mm-dd) for B3:B4
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": panel_ws.id,
+                            "startRowIndex": 2,
+                            "endRowIndex": 4,
+                            "startColumnIndex": 1,
+                            "endColumnIndex": 2
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "numberFormat": {
+                                    "type": "DATE",
+                                    "pattern": "yyyy-mm-dd"
+                                }
+                            }
+                        },
+                        "fields": "userEnteredFormat.numberFormat"
+                    }
+                },
+                # Checkbox validation for B6:B7
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": panel_ws.id,
+                            "startRowIndex": 5,
+                            "endRowIndex": 7,
+                            "startColumnIndex": 1,
+                            "endColumnIndex": 2
+                        },
+                        "rule": {
+                            "condition": {
+                                "type": "BOOLEAN"
+                            },
+                            "showCustomUi": True
+                        }
+                    }
+                },
+                # Positive integer validation for B5 (allows invalid/empty)
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": panel_ws.id,
+                            "startRowIndex": 4,
+                            "endRowIndex": 5,
+                            "startColumnIndex": 1,
+                            "endColumnIndex": 2
+                        },
+                        "rule": {
+                            "condition": {
+                                "type": "NUMBER_GREATER",
+                                "values": [{"userEnteredValue": "0"}]
+                            },
+                            "showCustomUi": True
+                        }
+                    }
+                },
+                # Checkbox validation for Reseñas por publicar Column A (index 0)
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": ws_to_pub.id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 1000,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 1
+                        },
+                        "rule": {
+                            "condition": {
+                                "type": "BOOLEAN"
+                            },
+                            "showCustomUi": True
+                        }
+                    }
+                },
+                # Checkbox validation for Reseñas publicadas Column A (index 0)
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": ws_pub.id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 1000,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 1
+                        },
+                        "rule": {
+                            "condition": {
+                                "type": "BOOLEAN"
+                            },
+                            "showCustomUi": True
+                        }
+                    }
+                }
+            ]
+            spreadsheet.batch_update({"requests": val_requests})
+        except Exception as e_val:
+            logger.error(f"Error applying Panel validation format: {e_val}")
+            raise e_val
 
         # Initialize Config defaults if empty
         config_ws = spreadsheet.worksheet("Config")
@@ -92,12 +311,67 @@ class SheetsService:
             {"Clave": "SEARCH_DELAY_SECONDS", "Valor": str(settings.SEARCH_DELAY_SECONDS), "Descripción": "Espera en segundos entre cada búsqueda para evitar bloqueos"},
             {"Clave": "SEARCH_BACKOFF_SECONDS", "Valor": str(settings.SEARCH_BACKOFF_SECONDS), "Descripción": "Espera de enfriamiento en segundos si se detecta rate limit o error"},
             {"Clave": "MAX_QUERIES_PER_BOOK", "Valor": str(settings.MAX_QUERIES_PER_BOOK), "Descripción": "Límite máximo de búsquedas por libro"},
-            {"Clave": "ENABLE_GOOGLE_NEWS_RSS", "Valor": str(settings.ENABLE_GOOGLE_NEWS_RSS).lower(), "Descripción": "Activar búsqueda complementaria mediante Google News RSS (true/false)"}
+            {"Clave": "ENABLE_GOOGLE_NEWS_RSS", "Valor": str(settings.ENABLE_GOOGLE_NEWS_RSS).lower(), "Descripción": "Activar búsqueda complementaria mediante Google News RSS (true/false)"},
+            {"Clave": "SEARCH_PROVIDER_MODE", "Valor": settings.SEARCH_PROVIDER_MODE, "Descripción": "Modo de proveedor de búsqueda: auto, free_only, google_news_only, serpapi, dataforseo"},
+            {"Clave": "ENABLE_SERPAPI", "Valor": str(settings.ENABLE_SERPAPI).lower(), "Descripción": "Activar proveedor SerpAPI (true/false)"},
+            {"Clave": "SERPAPI_API_KEY", "Valor": settings.SERPAPI_API_KEY or "", "Descripción": "API Key de SerpAPI"},
+            {"Clave": "ENABLE_DATAFORSEO", "Valor": str(settings.ENABLE_DATAFORSEO).lower(), "Descripción": "Activar proveedor DataForSEO (true/false)"},
+            {"Clave": "DATAFORSEO_LOGIN", "Valor": settings.DATAFORSEO_LOGIN or "", "Descripción": "Login (username/email) de DataForSEO"},
+            {"Clave": "DATAFORSEO_PASSWORD", "Valor": settings.DATAFORSEO_PASSWORD or "", "Descripción": "Password de DataForSEO"},
+            {"Clave": "ENABLE_DOMAIN_INDEX", "Valor": str(settings.ENABLE_DOMAIN_INDEX).lower(), "Descripción": "Activar indexación de dominios culturales (true/false)"},
+            {"Clave": "DOMAIN_INDEX_MAX_URLS_PER_DOMAIN", "Valor": str(settings.DOMAIN_INDEX_MAX_URLS_PER_DOMAIN), "Descripción": "Máximo de URLs a indexar por dominio"},
+            {"Clave": "DOMAIN_INDEX_REFRESH_DAYS", "Valor": str(settings.DOMAIN_INDEX_REFRESH_DAYS), "Descripción": "Días entre reindexaciones de un mismo dominio"},
+            {"Clave": "DOMAIN_INDEX_MIN_SCORE", "Valor": str(settings.DOMAIN_INDEX_MIN_SCORE), "Descripción": "Score mínimo para considerar un URL candidato (0-100)"},
+            {"Clave": "DOMAIN_INDEX_DB_PATH", "Valor": settings.DOMAIN_INDEX_DB_PATH, "Descripción": "Ruta al fichero SQLite del índice local"},
+            {"Clave": "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", "Valor": str(settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES), "Descripción": "Queries máximas de GoogleNewsRss como complemento en modo domain_index_plus_news"},
+            {"Clave": "BLOCK_PROVIDER_FOR_FULL_RUN", "Valor": str(settings.BLOCK_PROVIDER_FOR_FULL_RUN).lower(), "Descripción": "Bloquear proveedores permanentemente durante todo el run (true/false)"},
+            {"Clave": "ENRICH_INDEXED_URLS", "Valor": str(settings.ENRICH_INDEXED_URLS).lower(), "Descripción": "Activar descarga de páginas para enriquecer metadatos (true/false)"},
+            {"Clave": "DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN", "Valor": str(settings.DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN), "Descripción": "Cantidad máxima de URLs a enriquecer por dominio"},
+            {"Clave": "DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS", "Valor": str(settings.DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS), "Descripción": "Timeout en segundos para la descarga de páginas"},
+            {"Clave": "DISCOVER_INTERNAL_ARTICLE_LINKS", "Valor": str(settings.DISCOVER_INTERNAL_ARTICLE_LINKS).lower(), "Descripción": "Descubrir enlaces a artículos dentro de páginas índice (true/false)"},
+            {"Clave": "DOMAIN_INDEX_INTERNAL_LINK_DEPTH", "Valor": str(settings.DOMAIN_INDEX_INTERNAL_LINK_DEPTH), "Descripción": "Profundidad de rastreo de enlaces internos"},
+            {"Clave": "DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE", "Valor": str(settings.DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE), "Descripción": "Cantidad máxima de enlaces internos a descubrir por página índice"},
+            {"Clave": "ENABLE_INTERNAL_DOMAIN_SEARCH", "Valor": str(settings.ENABLE_INTERNAL_DOMAIN_SEARCH).lower(), "Descripción": "Activar búsqueda interna en dominios de fuentes culturales (true/false)"},
+            {"Clave": "INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK", "Valor": str(settings.INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK), "Descripción": "Cantidad máxima de consultas de búsqueda interna por libro"},
+            {"Clave": "INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN", "Valor": str(settings.INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN), "Descripción": "Resultados máximos a extraer por dominio en búsqueda interna"},
+            {"Clave": "INTERNAL_SEARCH_TIMEOUT_SECONDS", "Valor": str(settings.INTERNAL_SEARCH_TIMEOUT_SECONDS), "Descripción": "Timeout en segundos para la búsqueda interna"},
+            {"Clave": "INTERNAL_SEARCH_DOMAINS_LIMIT", "Valor": str(settings.INTERNAL_SEARCH_DOMAINS_LIMIT), "Descripción": "Límite máximo de dominios a consultar en búsqueda interna"},
+            {"Clave": "DEFAULT_INCLUDE_UNKNOWN_DATES", "Valor": str(settings.DEFAULT_INCLUDE_UNKNOWN_DATES).lower(), "Descripción": "Incluir artículos sin fecha de publicación detectada por defecto (true/false)"},
+            {"Clave": "DEFAULT_DATE_MIN", "Valor": settings.DEFAULT_DATE_MIN or "", "Descripción": "Fecha de publicación mínima por defecto (YYYY-MM-DD)"},
+            {"Clave": "DEFAULT_DATE_MAX", "Valor": settings.DEFAULT_DATE_MAX or "", "Descripción": "Fecha de publicación máxima por defecto (YYYY-MM-DD)"},
+            {"Clave": "BACKEND_BASE_URL", "Valor": "http://127.0.0.1:8000", "Descripción": "URL base del backend para Apps Script"},
+            {"Clave": "ADMIN_TOKEN", "Valor": settings.ADMIN_TOKEN or "secret_admin_token", "Descripción": "Token de administración secreto para Apps Script (cabecera X-Admin-Token)"},
+            {"Clave": "WORDPRESS_BASE_URL", "Valor": settings.WORDPRESS_BASE_URL or "", "Descripción": "URL base de WordPress (ej. https://miweb.com)"},
+            {"Clave": "WORDPRESS_USERNAME", "Valor": settings.WORDPRESS_USERNAME or "", "Descripción": "Usuario administrador/editor de WordPress"},
+            {"Clave": "WORDPRESS_POST_STATUS", "Valor": settings.WORDPRESS_POST_STATUS, "Descripción": "Estado por defecto para posts creados (draft, publish)"},
+            {"Clave": "WORDPRESS_POST_TYPE", "Valor": settings.WORDPRESS_POST_TYPE, "Descripción": "Tipo de post en WordPress (posts, pages)"},
+            {"Clave": "WORDPRESS_DEFAULT_CATEGORY_ID", "Valor": str(settings.WORDPRESS_DEFAULT_CATEGORY_ID or ""), "Descripción": "ID de categoría de WordPress por defecto (opcional)"},
+            {"Clave": "LOG_RETENTION_DAYS", "Valor": str(settings.LOG_RETENTION_DAYS), "Descripción": "Días de retención de logs en la pestaña Logs"},
+            {"Clave": "LOG_MAX_ROWS", "Valor": str(settings.LOG_MAX_ROWS), "Descripción": "Cantidad máxima de filas a mantener en la pestaña Logs"}
         ]
 
         for config in default_configs:
             if config["Clave"] not in existing_keys:
                 config_ws.append_row([config["Clave"], config["Valor"], config["Descripción"]])
+
+        # Initialise Fuentes tab with default domains if empty
+        fuentes_ws = spreadsheet.worksheet("Fuentes")
+        fuentes_rows = fuentes_ws.get_all_records()
+        if not fuentes_rows:
+            default_sources = [
+                ["revistadelibros.com",  "true", "cultural", "", "", "", "Revista de libros", "", "", ""],
+                ["nueva-revista.net",    "true", "cultural", "", "", "", "Nueva Revista",      "", "", ""],
+                ["aceprensa.com",        "true", "cultural", "", "", "", "Aceprensa",           "", "", ""],
+                ["elcultural.com",       "true", "cultural", "", "", "", "El Cultural",         "", "", ""],
+                ["zendalibros.com",      "true", "cultural", "", "", "", "Zenda Libros",        "", "", ""],
+                ["babelia.elpais.com",   "true", "cultural", "", "", "", "Babelia/El País",     "", "", ""],
+                ["wmagazin.com",         "true", "cultural", "", "", "", "WMagazín",            "", "", ""],
+                ["theobjective.com",     "true", "cultural", "", "", "", "The Objective",       "", "", ""],
+                ["ethic.es",             "true", "cultural", "", "", "", "Ethic",               "", "", ""],
+                ["eldebate.com",         "true", "cultural", "", "", "", "El Debate",           "", "", ""],
+            ]
+            for row in default_sources:
+                fuentes_ws.append_row(row)
 
         return {
             "success": True,
@@ -133,7 +407,31 @@ class SheetsService:
                 "SEARCH_DELAY_SECONDS": float(config_dict.get("SEARCH_DELAY_SECONDS", settings.SEARCH_DELAY_SECONDS)),
                 "SEARCH_BACKOFF_SECONDS": float(config_dict.get("SEARCH_BACKOFF_SECONDS", settings.SEARCH_BACKOFF_SECONDS)),
                 "MAX_QUERIES_PER_BOOK": int(config_dict.get("MAX_QUERIES_PER_BOOK", settings.MAX_QUERIES_PER_BOOK)),
-                "ENABLE_GOOGLE_NEWS_RSS": str(config_dict.get("ENABLE_GOOGLE_NEWS_RSS", settings.ENABLE_GOOGLE_NEWS_RSS)).lower() == "true"
+                "ENABLE_GOOGLE_NEWS_RSS": str(config_dict.get("ENABLE_GOOGLE_NEWS_RSS", settings.ENABLE_GOOGLE_NEWS_RSS)).lower() == "true",
+                "SEARCH_PROVIDER_MODE": config_dict.get("SEARCH_PROVIDER_MODE", settings.SEARCH_PROVIDER_MODE),
+                "ENABLE_SERPAPI": str(config_dict.get("ENABLE_SERPAPI", settings.ENABLE_SERPAPI)).lower() == "true",
+                "SERPAPI_API_KEY": config_dict.get("SERPAPI_API_KEY", settings.SERPAPI_API_KEY),
+                "ENABLE_DATAFORSEO": str(config_dict.get("ENABLE_DATAFORSEO", settings.ENABLE_DATAFORSEO)).lower() == "true",
+                "DATAFORSEO_LOGIN": config_dict.get("DATAFORSEO_LOGIN", settings.DATAFORSEO_LOGIN),
+                "DATAFORSEO_PASSWORD": config_dict.get("DATAFORSEO_PASSWORD", settings.DATAFORSEO_PASSWORD),
+                "BLOCK_PROVIDER_FOR_FULL_RUN": str(config_dict.get("BLOCK_PROVIDER_FOR_FULL_RUN", settings.BLOCK_PROVIDER_FOR_FULL_RUN)).lower() == "true",
+                "ENABLE_DOMAIN_INDEX": str(config_dict.get("ENABLE_DOMAIN_INDEX", settings.ENABLE_DOMAIN_INDEX)).lower() == "true",
+                "DOMAIN_INDEX_MAX_URLS_PER_DOMAIN": int(config_dict.get("DOMAIN_INDEX_MAX_URLS_PER_DOMAIN", settings.DOMAIN_INDEX_MAX_URLS_PER_DOMAIN)),
+                "DOMAIN_INDEX_REFRESH_DAYS": int(config_dict.get("DOMAIN_INDEX_REFRESH_DAYS", settings.DOMAIN_INDEX_REFRESH_DAYS)),
+                "DOMAIN_INDEX_MIN_SCORE": int(config_dict.get("DOMAIN_INDEX_MIN_SCORE", settings.DOMAIN_INDEX_MIN_SCORE)),
+                "DOMAIN_INDEX_DB_PATH": config_dict.get("DOMAIN_INDEX_DB_PATH", settings.DOMAIN_INDEX_DB_PATH),
+                "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES": int(config_dict.get("DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES)),
+                "ENRICH_INDEXED_URLS": str(config_dict.get("ENRICH_INDEXED_URLS", settings.ENRICH_INDEXED_URLS)).lower() == "true",
+                "DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN": int(config_dict.get("DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN", settings.DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN)),
+                "DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS": int(config_dict.get("DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS", settings.DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS)),
+                "DISCOVER_INTERNAL_ARTICLE_LINKS": str(config_dict.get("DISCOVER_INTERNAL_ARTICLE_LINKS", settings.DISCOVER_INTERNAL_ARTICLE_LINKS)).lower() == "true",
+                "DOMAIN_INDEX_INTERNAL_LINK_DEPTH": int(config_dict.get("DOMAIN_INDEX_INTERNAL_LINK_DEPTH", settings.DOMAIN_INDEX_INTERNAL_LINK_DEPTH)),
+                "DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE": int(config_dict.get("DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE", settings.DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE)),
+                "ENABLE_INTERNAL_DOMAIN_SEARCH": str(config_dict.get("ENABLE_INTERNAL_DOMAIN_SEARCH", settings.ENABLE_INTERNAL_DOMAIN_SEARCH)).lower() == "true",
+                "INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK": int(config_dict.get("INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK", settings.INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK)),
+                "INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN": int(config_dict.get("INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN", settings.INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN)),
+                "INTERNAL_SEARCH_TIMEOUT_SECONDS": int(config_dict.get("INTERNAL_SEARCH_TIMEOUT_SECONDS", settings.INTERNAL_SEARCH_TIMEOUT_SECONDS)),
+                "INTERNAL_SEARCH_DOMAINS_LIMIT": int(config_dict.get("INTERNAL_SEARCH_DOMAINS_LIMIT", settings.INTERNAL_SEARCH_DOMAINS_LIMIT)),
             }
         except Exception:
             # Fallback to local configs if sheet configs fail to read
@@ -147,7 +445,31 @@ class SheetsService:
                 "SEARCH_DELAY_SECONDS": settings.SEARCH_DELAY_SECONDS,
                 "SEARCH_BACKOFF_SECONDS": settings.SEARCH_BACKOFF_SECONDS,
                 "MAX_QUERIES_PER_BOOK": settings.MAX_QUERIES_PER_BOOK,
-                "ENABLE_GOOGLE_NEWS_RSS": settings.ENABLE_GOOGLE_NEWS_RSS
+                "ENABLE_GOOGLE_NEWS_RSS": settings.ENABLE_GOOGLE_NEWS_RSS,
+                "SEARCH_PROVIDER_MODE": settings.SEARCH_PROVIDER_MODE,
+                "ENABLE_SERPAPI": settings.ENABLE_SERPAPI,
+                "SERPAPI_API_KEY": settings.SERPAPI_API_KEY,
+                "ENABLE_DATAFORSEO": settings.ENABLE_DATAFORSEO,
+                "DATAFORSEO_LOGIN": settings.DATAFORSEO_LOGIN,
+                "DATAFORSEO_PASSWORD": settings.DATAFORSEO_PASSWORD,
+                "BLOCK_PROVIDER_FOR_FULL_RUN": settings.BLOCK_PROVIDER_FOR_FULL_RUN,
+                "ENABLE_DOMAIN_INDEX": settings.ENABLE_DOMAIN_INDEX,
+                "DOMAIN_INDEX_MAX_URLS_PER_DOMAIN": settings.DOMAIN_INDEX_MAX_URLS_PER_DOMAIN,
+                "DOMAIN_INDEX_REFRESH_DAYS": settings.DOMAIN_INDEX_REFRESH_DAYS,
+                "DOMAIN_INDEX_MIN_SCORE": settings.DOMAIN_INDEX_MIN_SCORE,
+                "DOMAIN_INDEX_DB_PATH": settings.DOMAIN_INDEX_DB_PATH,
+                "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES": settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES,
+                "ENRICH_INDEXED_URLS": settings.ENRICH_INDEXED_URLS,
+                "DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN": settings.DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN,
+                "DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS": settings.DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS,
+                "DISCOVER_INTERNAL_ARTICLE_LINKS": settings.DISCOVER_INTERNAL_ARTICLE_LINKS,
+                "DOMAIN_INDEX_INTERNAL_LINK_DEPTH": settings.DOMAIN_INDEX_INTERNAL_LINK_DEPTH,
+                "DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE": settings.DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE,
+                "ENABLE_INTERNAL_DOMAIN_SEARCH": settings.ENABLE_INTERNAL_DOMAIN_SEARCH,
+                "INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK": settings.INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK,
+                "INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN": settings.INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN,
+                "INTERNAL_SEARCH_TIMEOUT_SECONDS": settings.INTERNAL_SEARCH_TIMEOUT_SECONDS,
+                "INTERNAL_SEARCH_DOMAINS_LIMIT": settings.INTERNAL_SEARCH_DOMAINS_LIMIT,
             }
 
     def get_pending_books(self, sheet_id: str, limit: int = 10) -> List[Dict[str, Any]]:
@@ -259,7 +581,7 @@ class SheetsService:
         """
         client = self.get_client()
         spreadsheet = client.open_by_key(sheet_id)
-        worksheet = spreadsheet.worksheet("Reseñas")
+        worksheet = spreadsheet.worksheet("Reseñas por publicar")
         return worksheet.get_all_records()
 
     def add_review(self, sheet_id: str, review_data: List[Any]):
@@ -268,7 +590,7 @@ class SheetsService:
         """
         client = self.get_client()
         spreadsheet = client.open_by_key(sheet_id)
-        worksheet = spreadsheet.worksheet("Reseñas")
+        worksheet = spreadsheet.worksheet("Reseñas por publicar")
         worksheet.append_row(review_data)
 
     def add_descarte(self, sheet_id: str, descarte_data: List[Any]):
@@ -282,24 +604,172 @@ class SheetsService:
 
     def add_log(self, sheet_id: str, log_data: List[Any]):
         """
-        Appends a row to Logs.
+        Appends a single row to Logs. Use add_log_batch for multiple rows.
         """
         client = self.get_client()
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.worksheet("Logs")
         worksheet.append_row(log_data)
 
+    def add_log_batch(self, sheet_id: str, log_rows: List[List[Any]]):
+        """
+        Appends multiple rows to Logs in a single API call (reduces quota usage).
+        """
+        if not log_rows:
+            return
+        client = self.get_client()
+        spreadsheet = client.open_by_key(sheet_id)
+        worksheet = spreadsheet.worksheet("Logs")
+        worksheet.append_rows(log_rows, value_input_option="RAW")
+
     def update_reviews_hashes(self, sheet_id: str, updates: List[Tuple[int, str]]):
         """
         Updates the deduplication hash for multiple rows.
         updates: list of (row_index, hash_value)
-        We write these row-by-row or using range if they are contiguous, but row-by-row for sparse updates.
         Col S (19) is the 'Hash deduplicación' column.
         """
         client = self.get_client()
         spreadsheet = client.open_by_key(sheet_id)
-        worksheet = spreadsheet.worksheet("Reseñas")
+        worksheet = spreadsheet.worksheet("Reseñas por publicar")
+        
+        # Get headers to find "Hash deduplicación" column index dynamically
+        headers = worksheet.row_values(1)
+        col_idx = 26  # default fallback if not found
+        if "Hash deduplicación" in headers:
+            col_idx = headers.index("Hash deduplicación") + 1
+            
         for row_idx, hash_val in updates:
-            worksheet.update_cell(row_idx, 19, hash_val)
+            worksheet.update_cell(row_idx, col_idx, hash_val)
+
+    def get_active_sources(self, sheet_id: str) -> List[Dict[str, Any]]:
+        """
+        Reads the Fuentes tab and returns active domain configs.
+        """
+        try:
+            client = self.get_client()
+            spreadsheet = client.open_by_key(sheet_id)
+            worksheet = spreadsheet.worksheet("Fuentes")
+            records = worksheet.get_all_records()
+        except Exception as e:
+            import logging
+            logging.getLogger("encuentro-noticias").warning(f"get_active_sources error: {e}")
+            return []
+
+        sources = []
+        for i, row in enumerate(records, start=2):
+            domain = str(row.get("Dominio", "")).strip()
+            active_val = str(row.get("Activo", "true")).strip().lower()
+            if not domain:
+                continue
+            if active_val not in ("true", "1", "yes", "sí", "si"):
+                continue
+            sources.append({
+                "domain": domain,
+                "active": True,
+                "tipo": str(row.get("Tipo", "cultural")).strip(),
+                "sitemap_url": str(row.get("Sitemap URL", "")).strip(),
+                "rss_url": str(row.get("RSS URL", "")).strip(),
+                "row_index": i,
+            })
+        return sources
+
+    def update_source_stats(
+        self,
+        sheet_id: str,
+        domain: str,
+        last_indexed: str,
+        urls_indexed: int,
+        errors: str,
+    ):
+        """
+        Updates Última indexación, URLs indexadas, Errores columns for a domain in Fuentes tab.
+        Columns: H=Última indexación, I=URLs indexadas, J=Errores
+        """
+        try:
+            client = self.get_client()
+            spreadsheet = client.open_by_key(sheet_id)
+            worksheet = spreadsheet.worksheet("Fuentes")
+            records = worksheet.get_all_records()
+            for i, row in enumerate(records, start=2):
+                if str(row.get("Dominio", "")).strip() == domain:
+                    worksheet.update(f"H{i}:J{i}", [[last_indexed, urls_indexed, errors]])
+                    break
+        except Exception as e:
+            import logging
+            logging.getLogger("encuentro-noticias").warning(f"update_source_stats error: {e}")
+
+    def cleanup_logs(self, sheet_id: str, max_rows: int = 1000, retention_days: int = 30) -> Dict[str, Any]:
+        """
+        Cleans up old logs based on retention days and a maximum row limit.
+        """
+        client = self.get_client()
+        spreadsheet = client.open_by_key(sheet_id)
+        worksheet = spreadsheet.worksheet("Logs")
+        records = worksheet.get_all_records()
+        if not records:
+            return {"deleted_count": 0, "remaining_count": 0, "message": "La hoja de Logs está vacía."}
+            
+        now = datetime.datetime.now()
+        cutoff_date = now - datetime.timedelta(days=retention_days)
+        
+        rows_to_delete = []
+        
+        # Parse date column: "Fecha" is column index 1 in records
+        for idx, record in enumerate(records):
+            row_idx = idx + 2
+            date_str = str(record.get("Fecha", "")).strip()
+            
+            # Check if older than retention_days
+            try:
+                # Try parsing "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD"
+                if " " in date_str:
+                    log_date = datetime.datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+                else:
+                    log_date = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+                if log_date < cutoff_date:
+                    rows_to_delete.append(row_idx)
+                    continue
+            except Exception:
+                pass
+                
+        # Now check max rows limit among the non-deleted records
+        remaining_records_count = len(records) - len(rows_to_delete)
+        if remaining_records_count > max_rows:
+            extra_to_delete = remaining_records_count - max_rows
+            # Find records that are NOT already in rows_to_delete
+            already_deleted_set = set(rows_to_delete)
+            added = 0
+            for idx in range(len(records)):
+                row_idx = idx + 2
+                if row_idx not in already_deleted_set:
+                    rows_to_delete.append(row_idx)
+                    added += 1
+                    if added >= extra_to_delete:
+                        break
+                        
+        # Delete rows. Use batch_update to run all deletions in a single write call.
+        deleted_count = len(rows_to_delete)
+        if rows_to_delete:
+            reqs = []
+            for r_idx in sorted(rows_to_delete, reverse=True):
+                reqs.append({
+                    "deleteDimension": {
+                        "range": {
+                            "sheetId": worksheet.id,
+                            "dimension": "ROWS",
+                            "startIndex": r_idx - 1,
+                            "endIndex": r_idx
+                        }
+                    }
+                })
+            spreadsheet.batch_update({"requests": reqs})
+                
+        # Get new count
+        new_count = len(worksheet.get_all_records())
+        return {
+            "deleted_count": deleted_count,
+            "remaining_count": new_count,
+            "message": f"Se eliminaron {deleted_count} logs antiguos. Quedan {new_count} logs."
+        }
 
 sheets_service = SheetsService()

@@ -21,6 +21,45 @@ class Settings(BaseSettings):
     SEARCH_BACKOFF_SECONDS: int = 30
     MAX_QUERIES_PER_BOOK: int = 20
     ENABLE_GOOGLE_NEWS_RSS: bool = True
+    SEARCH_PROVIDER_MODE: str = "auto"
+    ENABLE_SERPAPI: bool = False
+    SERPAPI_API_KEY: Optional[str] = None
+    ENABLE_DATAFORSEO: bool = False
+    DATAFORSEO_LOGIN: Optional[str] = None
+    DATAFORSEO_PASSWORD: Optional[str] = None
+    BLOCK_PROVIDER_FOR_FULL_RUN: bool = False
+    # Domain indexer
+    ENABLE_DOMAIN_INDEX: bool = True
+    DOMAIN_INDEX_MAX_URLS_PER_DOMAIN: int = 500
+    DOMAIN_INDEX_REFRESH_DAYS: int = 7
+    DOMAIN_INDEX_MIN_SCORE: int = 70
+    DOMAIN_INDEX_DB_PATH: str = "data/reviews_index.sqlite"
+    DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES: int = 3
+    ENRICH_INDEXED_URLS: bool = True
+    DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN: int = 200
+    DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS: int = 10
+    DISCOVER_INTERNAL_ARTICLE_LINKS: bool = True
+    DOMAIN_INDEX_INTERNAL_LINK_DEPTH: int = 1
+    DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE: int = 50
+    ENABLE_INTERNAL_DOMAIN_SEARCH: bool = True
+    INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK: int = 4
+    INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN: int = 10
+    INTERNAL_SEARCH_TIMEOUT_SECONDS: int = 5
+    INTERNAL_SEARCH_DOMAINS_LIMIT: int = 10
+    DEFAULT_INCLUDE_UNKNOWN_DATES: bool = True
+    DEFAULT_DATE_MIN: Optional[str] = None
+    DEFAULT_DATE_MAX: Optional[str] = None
+    WORDPRESS_BASE_URL: Optional[str] = None
+    WORDPRESS_USERNAME: Optional[str] = None
+    WORDPRESS_APPLICATION_PASSWORD: Optional[str] = None
+    WORDPRESS_POST_STATUS: str = "draft"
+    WORDPRESS_POST_TYPE: str = "posts"
+    WORDPRESS_DEFAULT_CATEGORY_ID: Optional[int] = None
+    LOG_RETENTION_DAYS: int = 30
+    LOG_MAX_ROWS: int = 1000
+
+
+
 
     model_config = SettingsConfigDict(
         env_file=".env",

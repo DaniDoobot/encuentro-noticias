@@ -1,13 +1,15 @@
 import logging
 import datetime
+import threading
+from typing import List, Any, Optional
 from app.services.sheets_service import sheets_service
+
 
 class LoggerService:
     def __init__(self):
         self.logger = logging.getLogger("encuentro-noticias")
         self.logger.setLevel(logging.INFO)
-        
-        # Verify if handlers are already set to prevent duplicate logs in Uvicorn environment
+
         if not self.logger.handlers:
             handler = logging.StreamHandler()
             handler.setLevel(logging.INFO)
@@ -15,9 +17,25 @@ class LoggerService:
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
 
-    def log(self, level: str, action: str, message: str, isbn: str = "", detail: str = "", sheet_id: str = "", run_id: str = ""):
+        # Batching state: keyed by (sheet_id, run_id)
+        self._batch: List[List[Any]] = []
+        self._batch_key: Optional[str] = None
+        self._batch_lock = threading.Lock()
+        self._batch_size = 15  # flush every N rows
+
+    def log(
+        self,
+        level: str,
+        action: str,
+        message: str,
+        isbn: str = "",
+        detail: str = "",
+        sheet_id: str = "",
+        run_id: str = "",
+    ):
         """
-        Logs a message to the console and to the Google Sheets 'Logs' tab if sheet_id and run_id are set.
+        Logs to console + batches rows for Google Sheets.
+        Call flush_log_batch(sheet_id, run_id) at the end of each book to drain the buffer.
         """
         level_upper = level.upper()
         log_text = f"[{action}]"
@@ -27,7 +45,7 @@ class LoggerService:
         if detail:
             log_text += f" (Detail: {detail})"
 
-        # Output to terminal/file
+        # Console output
         if level_upper == "ERROR":
             self.logger.error(log_text)
         elif level_upper == "WARNING":
@@ -37,14 +55,39 @@ class LoggerService:
         else:
             self.logger.info(log_text)
 
-        # Write to Google Sheet 'Logs' tab
+        # Batch for Sheets
         if sheet_id and run_id:
-            try:
-                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                # Format: Run ID, Fecha, Nivel, ISBN, Acción, Mensaje, Detalle
-                log_row = [run_id, timestamp, level_upper, isbn, action, message, detail]
-                sheets_service.add_log(sheet_id, log_row)
-            except Exception as e:
-                self.logger.error(f"Failed to append log row to Google Sheets: {e}")
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_row = [run_id, timestamp, level_upper, isbn, action, message, detail]
+            batch_key = f"{sheet_id}:{run_id}"
+            with self._batch_lock:
+                if self._batch_key != batch_key:
+                    # Flush previous batch if context switched
+                    self._flush_locked(self._batch_key)
+                    self._batch_key = batch_key
+                    self._batch = []
+                self._batch.append(log_row)
+                if len(self._batch) >= self._batch_size:
+                    self._flush_locked(batch_key)
+
+    def flush_log_batch(self, sheet_id: str, run_id: str = ""):
+        """Flush any remaining buffered log rows for this sheet/run to Google Sheets."""
+        batch_key = f"{sheet_id}:{run_id}"
+        with self._batch_lock:
+            self._flush_locked(batch_key)
+
+    def _flush_locked(self, batch_key: Optional[str]):
+        """Must be called while holding self._batch_lock."""
+        if not batch_key or not self._batch or self._batch_key != batch_key:
+            return
+        rows = list(self._batch)
+        self._batch = []
+        try:
+            # Parse sheet_id from key
+            sheet_id = batch_key.split(":", 1)[0]
+            sheets_service.add_log_batch(sheet_id, rows)
+        except Exception as e:
+            self.logger.error(f"Failed to batch-write log rows to Google Sheets: {e}")
+
 
 logger_service = LoggerService()
