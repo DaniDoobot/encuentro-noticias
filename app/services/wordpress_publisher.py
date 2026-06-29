@@ -43,6 +43,135 @@ class WordPressPublisher:
                 "message": f"Error de conexión con WordPress: {str(e)}"
             }
 
+    def diagnose_connection(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Runs a series of tests to diagnose WordPress integration issues.
+        Returns a diagnostic dictionary.
+        """
+        url = config.get("WORDPRESS_BASE_URL") or settings.WORDPRESS_BASE_URL or ""
+        username = config.get("WORDPRESS_USERNAME") or settings.WORDPRESS_USERNAME or ""
+        app_password = settings.WORDPRESS_APPLICATION_PASSWORD or "" # Only read from env/settings
+        
+        # Clean URL
+        url_clean = url.rstrip("/")
+        
+        # Obscure username
+        masked_user = ""
+        if username:
+            if len(username) <= 2:
+                masked_user = username[0] + "*"
+            else:
+                masked_user = username[:2] + "***"
+
+        warnings = []
+        # Path validation
+        from urllib.parse import urlparse
+        if url:
+            parsed = urlparse(url)
+            path = parsed.path.lower()
+            if path and path not in ("", "/", "/wp-json", "/wp-json/"):
+                warnings.append(f"La URL base contiene una ruta de subdirectorio '{parsed.path}'. Lo correcto suele ser configurar solo el dominio raíz (ej. https://miweb.com).")
+            
+            for keyword in ("/wp-admin", "/mi-cuenta", "/my-account", "/wp-login"):
+                if keyword in url.lower():
+                    warnings.append(f"La URL base contiene '{keyword}', que es un path de administración o usuario. Debe ser la URL base del sitio.")
+        else:
+            warnings.append("WORDPRESS_BASE_URL no está configurada.")
+
+        if not username:
+            warnings.append("WORDPRESS_USERNAME no está configurado.")
+        if not app_password:
+            warnings.append("WORDPRESS_APPLICATION_PASSWORD no está configurado en las variables de entorno.")
+
+        checks = []
+        checks_dict = {}
+
+        def perform_check(name, check_url, use_auth=False):
+            auth = httpx.BasicAuth(username, app_password) if use_auth and username and app_password else None
+            check_res = {
+                "name": name,
+                "url": check_url,
+                "status_code": None,
+                "content_type": "",
+                "ok": False,
+                "body_preview": ""
+            }
+            if not url_clean:
+                check_res["body_preview"] = "No se puede realizar: WORDPRESS_BASE_URL vacía."
+                return check_res
+                
+            try:
+                with httpx.Client(timeout=10.0) as client:
+                    res = client.get(check_url, auth=auth)
+                    check_res["status_code"] = res.status_code
+                    check_res["content_type"] = res.headers.get("content-type", "")
+                    check_res["ok"] = (200 <= res.status_code < 300)
+                    
+                    text = res.text
+                    if len(text) > 200:
+                        check_res["body_preview"] = text[:200] + "..."
+                    else:
+                        check_res["body_preview"] = text
+            except Exception as e:
+                check_res["body_preview"] = f"Error de conexión: {str(e)}"
+            return check_res
+
+        # 1. GET {WORDPRESS_BASE_URL}/wp-json/ (Public REST API)
+        c1 = perform_check("public_rest_api", f"{url_clean}/wp-json/", use_auth=False)
+        checks.append(c1)
+        checks_dict[c1["name"]] = c1
+
+        # 2. GET {WORDPRESS_BASE_URL}/wp-json/wp/v2/posts?per_page=1 (Public posts listing)
+        c2 = perform_check("public_posts", f"{url_clean}/wp-json/wp/v2/posts?per_page=1", use_auth=False)
+        checks.append(c2)
+        checks_dict[c2["name"]] = c2
+
+        # 3. GET {WORDPRESS_BASE_URL}/wp-json/wp/v2/users/me (Authenticated user)
+        c3 = perform_check("authenticated_user", f"{url_clean}/wp-json/wp/v2/users/me", use_auth=True)
+        checks.append(c3)
+        checks_dict[c3["name"]] = c3
+
+        # 4. GET {WORDPRESS_BASE_URL}/wp-json/wp/v2/types (Authenticated types check)
+        c4 = perform_check("authenticated_types", f"{url_clean}/wp-json/wp/v2/types", use_auth=True)
+        checks.append(c4)
+        checks_dict[c4["name"]] = c4
+
+        # Deduce status
+        authenticated = checks_dict.get("authenticated_user", {}).get("ok", False)
+        can_publish = authenticated and checks_dict.get("authenticated_types", {}).get("ok", False)
+
+        likely_problem = "none"
+        if not url:
+            likely_problem = "wrong_base_url"
+        else:
+            status_codes = [c.get("status_code") for c in checks]
+            # If all checks failed to connect or returned 404
+            if all(sc is None or sc == 404 for sc in status_codes):
+                likely_problem = "wrong_base_url"
+            # If REST API is blocked or returned WAF/403
+            elif not checks_dict.get("public_rest_api", {}).get("ok", False) and any(sc in (403, 401, 503) for sc in status_codes[:2]):
+                likely_problem = "rest_api_blocked_or_waf"
+            # If REST API is working but credentials fail
+            elif not authenticated:
+                likely_problem = "invalid_credentials"
+            # If authenticated but permissions fail
+            elif not can_publish:
+                likely_problem = "insufficient_permissions"
+
+        # If there are subpath warnings, suggest "wrong_base_url"
+        if warnings and likely_problem == "none":
+            likely_problem = "wrong_base_url"
+
+        return {
+            "wordpress_base_url": url,
+            "wordpress_username_masked": masked_user,
+            "checks": checks,
+            "authenticated": authenticated,
+            "can_publish": can_publish,
+            "likely_problem": likely_problem,
+            "warnings": warnings
+        }
+
     def build_post_payload(self, review: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
         """
         Builds the REST API payload for a WordPress post from the review data.

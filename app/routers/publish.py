@@ -212,7 +212,7 @@ def post_publish_reviews(req: PublishReviewsRequest):
 @router.post("/publish/test-wordpress")
 def post_publish_test_wordpress():
     """
-    Tests connection credentials and permissions of WordPress.
+    Tests connection credentials and permissions of WordPress, returning a detailed diagnostic report.
     """
     sheet_id = settings.GOOGLE_SHEET_ID
     try:
@@ -220,10 +220,5 @@ def post_publish_test_wordpress():
     except Exception:
         config = {}
         
-    res = wordpress_publisher.test_connection(config)
-    if not res.get("success"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=res.get("message", "Error de conexión con WordPress.")
-        )
+    res = wordpress_publisher.diagnose_connection(config)
     return res
