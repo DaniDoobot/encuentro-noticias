@@ -288,4 +288,49 @@ class WordPressPublisher:
                 "error": f"Error de conexión con WordPress: {str(e)}"
             }
 
+    def publish_draft_post(self, title: str, content: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Publishes a draft post to WordPress using configured endpoints.
+        """
+        url = config.get("WORDPRESS_BASE_URL") or settings.WORDPRESS_BASE_URL
+        username = config.get("WORDPRESS_USERNAME") or settings.WORDPRESS_USERNAME
+        app_password = settings.WORDPRESS_APPLICATION_PASSWORD
+        post_type = config.get("WORDPRESS_POST_TYPE") or settings.WORDPRESS_POST_TYPE or "posts"
+        
+        if not url or not username or not app_password:
+            return {
+                "success": False,
+                "error": "Faltan credenciales de WordPress en variables de entorno o Config."
+            }
+            
+        url = url.rstrip("/")
+        payload = {
+            "title": title,
+            "content": content,
+            "status": "draft"
+        }
+        
+        try:
+            auth = httpx.BasicAuth(username, app_password)
+            with httpx.Client(timeout=20.0) as client:
+                res = client.post(f"{url}/wp-json/wp/v2/{post_type}", json=payload, auth=auth)
+                if res.status_code in (200, 201):
+                    res_data = res.json()
+                    return {
+                        "success": True,
+                        "wordpress_id": res_data.get("id"),
+                        "wordpress_url": res_data.get("link"),
+                        "status": res_data.get("status")
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "error": f"Fallo al publicar borrador (HTTP {res.status_code}): {res.text}"
+                    }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Error de conexión con WordPress: {str(e)}"
+            }
+
 wordpress_publisher = WordPressPublisher()
