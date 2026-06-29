@@ -659,3 +659,39 @@ def test_metadata_enrichment_and_slug_scoring(tmp_path):
     from app.services.source_discovery import source_discovery, _get_slug_text
     assert _get_slug_text("https://example.com/cultura/leonardo-genio-y-trabajador-paciente/") == "leonardo genio y trabajador paciente"
 
+
+def test_config_parser_normalization():
+    """
+    Tests normalization and robust parsing of Google Sheets config values.
+    """
+    from app.services.sheets_service import normalize_config_val, parse_bool, parse_int, parse_float, parse_str
+    
+    # 1. normalize_config_val
+    assert normalize_config_val("'false") == "false"
+    assert normalize_config_val("'5") == "5"
+    assert normalize_config_val("'https://encuentro-backend.doobot.ai") == "https://encuentro-backend.doobot.ai"
+    assert normalize_config_val("  'true  ") == "true"
+    assert normalize_config_val(None) == ""
+    
+    # 2. parse_bool
+    assert parse_bool("'false", True) is False
+    assert parse_bool("FALSE", True) is False
+    assert parse_bool("'true", False) is True
+    assert parse_bool("TRUE", False) is True
+    assert parse_bool("sí", False) is True
+    assert parse_bool("si", False) is True
+    assert parse_bool("no", True) is False
+    assert parse_bool("0", True) is False
+    assert parse_bool("1", False) is True
+    
+    # 3. parse_int
+    assert parse_int("'5", 10) == 5
+    assert parse_int("invalid", 10) == 10
+    
+    # 4. parse_float
+    assert parse_float("'2.5", 1.0) == 2.5
+    assert parse_float("invalid", 1.0) == 1.0
+    
+    # 5. parse_str
+    assert parse_str("'hello", "default") == "hello"
+

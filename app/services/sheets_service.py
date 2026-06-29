@@ -14,6 +14,47 @@ def is_row_real(row: dict) -> bool:
         if str(row.get(field, "")).strip():
             return True
     return False
+def normalize_config_val(val: Any) -> str:
+    if val is None:
+        return ""
+    # Convert to string and strip
+    s_val = str(val).strip()
+    # Remove leading single quote if present
+    if s_val.startswith("'"):
+        s_val = s_val[1:]
+    return s_val.strip()
+
+def parse_bool(val: Any, default: bool) -> bool:
+    s_val = normalize_config_val(val).lower()
+    if not s_val:
+        return default
+    if s_val in ("true", "1", "yes", "sí", "si"):
+        return True
+    if s_val in ("false", "0", "no"):
+        return False
+    return default
+
+def parse_int(val: Any, default: int) -> int:
+    s_val = normalize_config_val(val)
+    if not s_val:
+        return default
+    try:
+        return int(s_val)
+    except ValueError:
+        return default
+
+def parse_float(val: Any, default: float) -> float:
+    s_val = normalize_config_val(val)
+    if not s_val:
+        return default
+    try:
+        return float(s_val)
+    except ValueError:
+        return default
+
+def parse_str(val: Any, default: str) -> str:
+    s_val = normalize_config_val(val)
+    return s_val if s_val else default
 
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
@@ -321,41 +362,41 @@ class SheetsService:
         existing_keys = {row["Clave"] for row in config_rows if "Clave" in row}
         
         default_configs = [
-            {"Clave": "MAX_BOOKS_PER_RUN", "Valor": str(settings.MAX_BOOKS_PER_RUN), "Descripción": "Cantidad máxima de libros a procesar por ejecución"},
-            {"Clave": "MAX_SEARCH_PAGES_PER_QUERY", "Valor": str(settings.MAX_SEARCH_PAGES_PER_QUERY), "Descripción": "Páginas máximas del buscador a escanear por query"},
-            {"Clave": "MAX_CANDIDATES_PER_BOOK", "Valor": str(settings.MAX_CANDIDATES_PER_BOOK), "Descripción": "Cantidad máxima de URLs candidatas a evaluar por libro"},
-            {"Clave": "MIN_MATCH_SCORE", "Valor": str(settings.MIN_MATCH_SCORE), "Descripción": "Score mínimo de validación de OpenAI para aceptar una reseña (0-100)"},
+            {"Clave": "MAX_BOOKS_PER_RUN", "Valor": settings.MAX_BOOKS_PER_RUN, "Descripción": "Cantidad máxima de libros a procesar por ejecución"},
+            {"Clave": "MAX_SEARCH_PAGES_PER_QUERY", "Valor": settings.MAX_SEARCH_PAGES_PER_QUERY, "Descripción": "Páginas máximas del buscador a escanear por query"},
+            {"Clave": "MAX_CANDIDATES_PER_BOOK", "Valor": settings.MAX_CANDIDATES_PER_BOOK, "Descripción": "Cantidad máxima de URLs candidatas a evaluar por libro"},
+            {"Clave": "MIN_MATCH_SCORE", "Valor": settings.MIN_MATCH_SCORE, "Descripción": "Score mínimo de validación de OpenAI para aceptar una reseña (0-100)"},
             {"Clave": "OPENAI_MODEL", "Valor": settings.OPENAI_MODEL, "Descripción": "Modelo de OpenAI a usar para análisis"},
             {"Clave": "REVIEW_DOMAINS", "Valor": "revistadelibros.com,nueva-revista.net,aceprensa.com,elcultural.com,zendalibros.com,babelia.elpais.com", "Descripción": "Dominios culturales/literarios recomendados para búsquedas específicas (separados por coma)"},
-            {"Clave": "SEARCH_DELAY_SECONDS", "Valor": str(settings.SEARCH_DELAY_SECONDS), "Descripción": "Espera en segundos entre cada búsqueda para evitar bloqueos"},
-            {"Clave": "SEARCH_BACKOFF_SECONDS", "Valor": str(settings.SEARCH_BACKOFF_SECONDS), "Descripción": "Espera de enfriamiento en segundos si se detecta rate limit o error"},
-            {"Clave": "MAX_QUERIES_PER_BOOK", "Valor": str(settings.MAX_QUERIES_PER_BOOK), "Descripción": "Límite máximo de búsquedas por libro"},
-            {"Clave": "ENABLE_GOOGLE_NEWS_RSS", "Valor": str(settings.ENABLE_GOOGLE_NEWS_RSS).lower(), "Descripción": "Activar búsqueda complementaria mediante Google News RSS (true/false)"},
+            {"Clave": "SEARCH_DELAY_SECONDS", "Valor": settings.SEARCH_DELAY_SECONDS, "Descripción": "Espera en segundos entre cada búsqueda para evitar bloqueos"},
+            {"Clave": "SEARCH_BACKOFF_SECONDS", "Valor": settings.SEARCH_BACKOFF_SECONDS, "Descripción": "Espera de enfriamiento en segundos si se detecta rate limit o error"},
+            {"Clave": "MAX_QUERIES_PER_BOOK", "Valor": settings.MAX_QUERIES_PER_BOOK, "Descripción": "Límite máximo de búsquedas por libro"},
+            {"Clave": "ENABLE_GOOGLE_NEWS_RSS", "Valor": settings.ENABLE_GOOGLE_NEWS_RSS, "Descripción": "Activar búsqueda complementaria mediante Google News RSS (true/false)"},
             {"Clave": "SEARCH_PROVIDER_MODE", "Valor": settings.SEARCH_PROVIDER_MODE, "Descripción": "Modo de proveedor de búsqueda: auto, free_only, google_news_only, serpapi, dataforseo"},
-            {"Clave": "ENABLE_SERPAPI", "Valor": str(settings.ENABLE_SERPAPI).lower(), "Descripción": "Activar proveedor SerpAPI (true/false)"},
+            {"Clave": "ENABLE_SERPAPI", "Valor": settings.ENABLE_SERPAPI, "Descripción": "Activar proveedor SerpAPI (true/false)"},
             {"Clave": "SERPAPI_API_KEY", "Valor": settings.SERPAPI_API_KEY or "", "Descripción": "API Key de SerpAPI"},
-            {"Clave": "ENABLE_DATAFORSEO", "Valor": str(settings.ENABLE_DATAFORSEO).lower(), "Descripción": "Activar proveedor DataForSEO (true/false)"},
+            {"Clave": "ENABLE_DATAFORSEO", "Valor": settings.ENABLE_DATAFORSEO, "Descripción": "Activar proveedor DataForSEO (true/false)"},
             {"Clave": "DATAFORSEO_LOGIN", "Valor": settings.DATAFORSEO_LOGIN or "", "Descripción": "Login (username/email) de DataForSEO"},
             {"Clave": "DATAFORSEO_PASSWORD", "Valor": settings.DATAFORSEO_PASSWORD or "", "Descripción": "Password de DataForSEO"},
-            {"Clave": "ENABLE_DOMAIN_INDEX", "Valor": str(settings.ENABLE_DOMAIN_INDEX).lower(), "Descripción": "Activar indexación de dominios culturales (true/false)"},
-            {"Clave": "DOMAIN_INDEX_MAX_URLS_PER_DOMAIN", "Valor": str(settings.DOMAIN_INDEX_MAX_URLS_PER_DOMAIN), "Descripción": "Máximo de URLs a indexar por dominio"},
-            {"Clave": "DOMAIN_INDEX_REFRESH_DAYS", "Valor": str(settings.DOMAIN_INDEX_REFRESH_DAYS), "Descripción": "Días entre reindexaciones de un mismo dominio"},
-            {"Clave": "DOMAIN_INDEX_MIN_SCORE", "Valor": str(settings.DOMAIN_INDEX_MIN_SCORE), "Descripción": "Score mínimo para considerar un URL candidato (0-100)"},
+            {"Clave": "ENABLE_DOMAIN_INDEX", "Valor": settings.ENABLE_DOMAIN_INDEX, "Descripción": "Activar indexación de dominios culturales (true/false)"},
+            {"Clave": "DOMAIN_INDEX_MAX_URLS_PER_DOMAIN", "Valor": settings.DOMAIN_INDEX_MAX_URLS_PER_DOMAIN, "Descripción": "Máximo de URLs a indexar por dominio"},
+            {"Clave": "DOMAIN_INDEX_REFRESH_DAYS", "Valor": settings.DOMAIN_INDEX_REFRESH_DAYS, "Descripción": "Días entre reindexaciones de un mismo dominio"},
+            {"Clave": "DOMAIN_INDEX_MIN_SCORE", "Valor": settings.DOMAIN_INDEX_MIN_SCORE, "Descripción": "Score mínimo para considerar un URL candidato (0-100)"},
             {"Clave": "DOMAIN_INDEX_DB_PATH", "Valor": settings.DOMAIN_INDEX_DB_PATH, "Descripción": "Ruta al fichero SQLite del índice local"},
-            {"Clave": "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", "Valor": str(settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES), "Descripción": "Queries máximas de GoogleNewsRss como complemento en modo domain_index_plus_news"},
-            {"Clave": "BLOCK_PROVIDER_FOR_FULL_RUN", "Valor": str(settings.BLOCK_PROVIDER_FOR_FULL_RUN).lower(), "Descripción": "Bloquear proveedores permanentemente durante todo el run (true/false)"},
-            {"Clave": "ENRICH_INDEXED_URLS", "Valor": str(settings.ENRICH_INDEXED_URLS).lower(), "Descripción": "Activar descarga de páginas para enriquecer metadatos (true/false)"},
-            {"Clave": "DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN", "Valor": str(settings.DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN), "Descripción": "Cantidad máxima de URLs a enriquecer por dominio"},
-            {"Clave": "DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS", "Valor": str(settings.DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS), "Descripción": "Timeout en segundos para la descarga de páginas"},
-            {"Clave": "DISCOVER_INTERNAL_ARTICLE_LINKS", "Valor": str(settings.DISCOVER_INTERNAL_ARTICLE_LINKS).lower(), "Descripción": "Descubrir enlaces a artículos dentro de páginas índice (true/false)"},
-            {"Clave": "DOMAIN_INDEX_INTERNAL_LINK_DEPTH", "Valor": str(settings.DOMAIN_INDEX_INTERNAL_LINK_DEPTH), "Descripción": "Profundidad de rastreo de enlaces internos"},
-            {"Clave": "DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE", "Valor": str(settings.DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE), "Descripción": "Cantidad máxima de enlaces internos a descubrir por página índice"},
-            {"Clave": "ENABLE_INTERNAL_DOMAIN_SEARCH", "Valor": str(settings.ENABLE_INTERNAL_DOMAIN_SEARCH).lower(), "Descripción": "Activar búsqueda interna en dominios de fuentes culturales (true/false)"},
-            {"Clave": "INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK", "Valor": str(settings.INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK), "Descripción": "Cantidad máxima de consultas de búsqueda interna por libro"},
-            {"Clave": "INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN", "Valor": str(settings.INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN), "Descripción": "Resultados máximos a extraer por dominio en búsqueda interna"},
-            {"Clave": "INTERNAL_SEARCH_TIMEOUT_SECONDS", "Valor": str(settings.INTERNAL_SEARCH_TIMEOUT_SECONDS), "Descripción": "Timeout en segundos para la búsqueda interna"},
-            {"Clave": "INTERNAL_SEARCH_DOMAINS_LIMIT", "Valor": str(settings.INTERNAL_SEARCH_DOMAINS_LIMIT), "Descripción": "Límite máximo de dominios a consultar en búsqueda interna"},
-            {"Clave": "DEFAULT_INCLUDE_UNKNOWN_DATES", "Valor": str(settings.DEFAULT_INCLUDE_UNKNOWN_DATES).lower(), "Descripción": "Incluir artículos sin fecha de publicación detectada por defecto (true/false)"},
+            {"Clave": "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", "Valor": settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES, "Descripción": "Queries máximas de GoogleNewsRss como complemento en modo domain_index_plus_news"},
+            {"Clave": "BLOCK_PROVIDER_FOR_FULL_RUN", "Valor": settings.BLOCK_PROVIDER_FOR_FULL_RUN, "Descripción": "Bloquear proveedores permanentemente durante todo el run (true/false)"},
+            {"Clave": "ENRICH_INDEXED_URLS", "Valor": settings.ENRICH_INDEXED_URLS, "Descripción": "Activar descarga de páginas para enriquecer metadatos (true/false)"},
+            {"Clave": "DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN", "Valor": settings.DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN, "Descripción": "Cantidad máxima de URLs a enriquecer por dominio"},
+            {"Clave": "DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS", "Valor": settings.DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS, "Descripción": "Timeout en segundos para la descarga de páginas"},
+            {"Clave": "DISCOVER_INTERNAL_ARTICLE_LINKS", "Valor": settings.DISCOVER_INTERNAL_ARTICLE_LINKS, "Descripción": "Descubrir enlaces a artículos dentro de páginas índice (true/false)"},
+            {"Clave": "DOMAIN_INDEX_INTERNAL_LINK_DEPTH", "Valor": settings.DOMAIN_INDEX_INTERNAL_LINK_DEPTH, "Descripción": "Profundidad de rastreo de enlaces internos"},
+            {"Clave": "DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE", "Valor": settings.DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE, "Descripción": "Cantidad máxima de enlaces internos a descubrir por página índice"},
+            {"Clave": "ENABLE_INTERNAL_DOMAIN_SEARCH", "Valor": settings.ENABLE_INTERNAL_DOMAIN_SEARCH, "Descripción": "Activar búsqueda interna en dominios de fuentes culturales (true/false)"},
+            {"Clave": "INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK", "Valor": settings.INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK, "Descripción": "Cantidad máxima de consultas de búsqueda interna por libro"},
+            {"Clave": "INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN", "Valor": settings.INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN, "Descripción": "Resultados máximos a extraer por dominio en búsqueda interna"},
+            {"Clave": "INTERNAL_SEARCH_TIMEOUT_SECONDS", "Valor": settings.INTERNAL_SEARCH_TIMEOUT_SECONDS, "Descripción": "Timeout en segundos para la búsqueda interna"},
+            {"Clave": "INTERNAL_SEARCH_DOMAINS_LIMIT", "Valor": settings.INTERNAL_SEARCH_DOMAINS_LIMIT, "Descripción": "Límite máximo de dominios a consultar en búsqueda interna"},
+            {"Clave": "DEFAULT_INCLUDE_UNKNOWN_DATES", "Valor": settings.DEFAULT_INCLUDE_UNKNOWN_DATES, "Descripción": "Incluir artículos sin fecha de publicación detectada por defecto (true/false)"},
             {"Clave": "DEFAULT_DATE_MIN", "Valor": settings.DEFAULT_DATE_MIN or "", "Descripción": "Fecha de publicación mínima por defecto (YYYY-MM-DD)"},
             {"Clave": "DEFAULT_DATE_MAX", "Valor": settings.DEFAULT_DATE_MAX or "", "Descripción": "Fecha de publicación máxima por defecto (YYYY-MM-DD)"},
             {"Clave": "BACKEND_BASE_URL", "Valor": "http://127.0.0.1:8000", "Descripción": "URL base del backend para Apps Script"},
@@ -364,14 +405,14 @@ class SheetsService:
             {"Clave": "WORDPRESS_USERNAME", "Valor": settings.WORDPRESS_USERNAME or "", "Descripción": "Usuario administrador/editor de WordPress"},
             {"Clave": "WORDPRESS_POST_STATUS", "Valor": settings.WORDPRESS_POST_STATUS, "Descripción": "Estado por defecto para posts creados (draft, publish)"},
             {"Clave": "WORDPRESS_POST_TYPE", "Valor": settings.WORDPRESS_POST_TYPE, "Descripción": "Tipo de post en WordPress (posts, pages)"},
-            {"Clave": "WORDPRESS_DEFAULT_CATEGORY_ID", "Valor": str(settings.WORDPRESS_DEFAULT_CATEGORY_ID or ""), "Descripción": "ID de categoría de WordPress por defecto (opcional)"},
-            {"Clave": "LOG_RETENTION_DAYS", "Valor": str(settings.LOG_RETENTION_DAYS), "Descripción": "Días de retención de logs en la pestaña Logs"},
-            {"Clave": "LOG_MAX_ROWS", "Valor": str(settings.LOG_MAX_ROWS), "Descripción": "Cantidad máxima de filas a mantener en la pestaña Logs"}
+            {"Clave": "WORDPRESS_DEFAULT_CATEGORY_ID", "Valor": settings.WORDPRESS_DEFAULT_CATEGORY_ID or "", "Descripción": "ID de categoría de WordPress por defecto (opcional)"},
+            {"Clave": "LOG_RETENTION_DAYS", "Valor": settings.LOG_RETENTION_DAYS, "Descripción": "Días de retención de logs en la pestaña Logs"},
+            {"Clave": "LOG_MAX_ROWS", "Valor": settings.LOG_MAX_ROWS, "Descripción": "Cantidad máxima de filas a mantener en la pestaña Logs"}
         ]
 
         for config in default_configs:
             if config["Clave"] not in existing_keys:
-                config_ws.append_row([config["Clave"], config["Valor"], config["Descripción"]])
+                config_ws.append_row([config["Clave"], config["Valor"], config["Descripción"]], value_input_option="USER_ENTERED")
 
         # Initialise Fuentes tab with default domains if empty
         fuentes_ws = spreadsheet.worksheet("Fuentes")
@@ -417,40 +458,43 @@ class SheetsService:
                     config_dict[key] = val
 
             return {
-                "MAX_BOOKS_PER_RUN": int(config_dict.get("MAX_BOOKS_PER_RUN", settings.MAX_BOOKS_PER_RUN)),
-                "MAX_SEARCH_PAGES_PER_QUERY": int(config_dict.get("MAX_SEARCH_PAGES_PER_QUERY", settings.MAX_SEARCH_PAGES_PER_QUERY)),
-                "MAX_CANDIDATES_PER_BOOK": int(config_dict.get("MAX_CANDIDATES_PER_BOOK", settings.MAX_CANDIDATES_PER_BOOK)),
-                "MIN_MATCH_SCORE": int(config_dict.get("MIN_MATCH_SCORE", settings.MIN_MATCH_SCORE)),
-                "OPENAI_MODEL": config_dict.get("OPENAI_MODEL", settings.OPENAI_MODEL),
-                "REVIEW_DOMAINS": config_dict.get("REVIEW_DOMAINS", ""),
-                "SEARCH_DELAY_SECONDS": float(config_dict.get("SEARCH_DELAY_SECONDS", settings.SEARCH_DELAY_SECONDS)),
-                "SEARCH_BACKOFF_SECONDS": float(config_dict.get("SEARCH_BACKOFF_SECONDS", settings.SEARCH_BACKOFF_SECONDS)),
-                "MAX_QUERIES_PER_BOOK": int(config_dict.get("MAX_QUERIES_PER_BOOK", settings.MAX_QUERIES_PER_BOOK)),
-                "ENABLE_GOOGLE_NEWS_RSS": str(config_dict.get("ENABLE_GOOGLE_NEWS_RSS", settings.ENABLE_GOOGLE_NEWS_RSS)).lower() == "true",
-                "SEARCH_PROVIDER_MODE": config_dict.get("SEARCH_PROVIDER_MODE", settings.SEARCH_PROVIDER_MODE),
-                "ENABLE_SERPAPI": str(config_dict.get("ENABLE_SERPAPI", settings.ENABLE_SERPAPI)).lower() == "true",
-                "SERPAPI_API_KEY": config_dict.get("SERPAPI_API_KEY", settings.SERPAPI_API_KEY),
-                "ENABLE_DATAFORSEO": str(config_dict.get("ENABLE_DATAFORSEO", settings.ENABLE_DATAFORSEO)).lower() == "true",
-                "DATAFORSEO_LOGIN": config_dict.get("DATAFORSEO_LOGIN", settings.DATAFORSEO_LOGIN),
-                "DATAFORSEO_PASSWORD": config_dict.get("DATAFORSEO_PASSWORD", settings.DATAFORSEO_PASSWORD),
-                "BLOCK_PROVIDER_FOR_FULL_RUN": str(config_dict.get("BLOCK_PROVIDER_FOR_FULL_RUN", settings.BLOCK_PROVIDER_FOR_FULL_RUN)).lower() == "true",
-                "ENABLE_DOMAIN_INDEX": str(config_dict.get("ENABLE_DOMAIN_INDEX", settings.ENABLE_DOMAIN_INDEX)).lower() == "true",
-                "DOMAIN_INDEX_MAX_URLS_PER_DOMAIN": int(config_dict.get("DOMAIN_INDEX_MAX_URLS_PER_DOMAIN", settings.DOMAIN_INDEX_MAX_URLS_PER_DOMAIN)),
-                "DOMAIN_INDEX_REFRESH_DAYS": int(config_dict.get("DOMAIN_INDEX_REFRESH_DAYS", settings.DOMAIN_INDEX_REFRESH_DAYS)),
-                "DOMAIN_INDEX_MIN_SCORE": int(config_dict.get("DOMAIN_INDEX_MIN_SCORE", settings.DOMAIN_INDEX_MIN_SCORE)),
-                "DOMAIN_INDEX_DB_PATH": config_dict.get("DOMAIN_INDEX_DB_PATH", settings.DOMAIN_INDEX_DB_PATH),
-                "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES": int(config_dict.get("DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES)),
-                "ENRICH_INDEXED_URLS": str(config_dict.get("ENRICH_INDEXED_URLS", settings.ENRICH_INDEXED_URLS)).lower() == "true",
-                "DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN": int(config_dict.get("DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN", settings.DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN)),
-                "DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS": int(config_dict.get("DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS", settings.DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS)),
-                "DISCOVER_INTERNAL_ARTICLE_LINKS": str(config_dict.get("DISCOVER_INTERNAL_ARTICLE_LINKS", settings.DISCOVER_INTERNAL_ARTICLE_LINKS)).lower() == "true",
-                "DOMAIN_INDEX_INTERNAL_LINK_DEPTH": int(config_dict.get("DOMAIN_INDEX_INTERNAL_LINK_DEPTH", settings.DOMAIN_INDEX_INTERNAL_LINK_DEPTH)),
-                "DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE": int(config_dict.get("DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE", settings.DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE)),
-                "ENABLE_INTERNAL_DOMAIN_SEARCH": str(config_dict.get("ENABLE_INTERNAL_DOMAIN_SEARCH", settings.ENABLE_INTERNAL_DOMAIN_SEARCH)).lower() == "true",
-                "INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK": int(config_dict.get("INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK", settings.INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK)),
-                "INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN": int(config_dict.get("INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN", settings.INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN)),
-                "INTERNAL_SEARCH_TIMEOUT_SECONDS": int(config_dict.get("INTERNAL_SEARCH_TIMEOUT_SECONDS", settings.INTERNAL_SEARCH_TIMEOUT_SECONDS)),
-                "INTERNAL_SEARCH_DOMAINS_LIMIT": int(config_dict.get("INTERNAL_SEARCH_DOMAINS_LIMIT", settings.INTERNAL_SEARCH_DOMAINS_LIMIT)),
+                "MAX_BOOKS_PER_RUN": parse_int(config_dict.get("MAX_BOOKS_PER_RUN"), settings.MAX_BOOKS_PER_RUN),
+                "MAX_SEARCH_PAGES_PER_QUERY": parse_int(config_dict.get("MAX_SEARCH_PAGES_PER_QUERY"), settings.MAX_SEARCH_PAGES_PER_QUERY),
+                "MAX_CANDIDATES_PER_BOOK": parse_int(config_dict.get("MAX_CANDIDATES_PER_BOOK"), settings.MAX_CANDIDATES_PER_BOOK),
+                "MIN_MATCH_SCORE": parse_int(config_dict.get("MIN_MATCH_SCORE"), settings.MIN_MATCH_SCORE),
+                "OPENAI_MODEL": parse_str(config_dict.get("OPENAI_MODEL"), settings.OPENAI_MODEL),
+                "REVIEW_DOMAINS": parse_str(config_dict.get("REVIEW_DOMAINS"), ""),
+                "SEARCH_DELAY_SECONDS": parse_float(config_dict.get("SEARCH_DELAY_SECONDS"), settings.SEARCH_DELAY_SECONDS),
+                "SEARCH_BACKOFF_SECONDS": parse_float(config_dict.get("SEARCH_BACKOFF_SECONDS"), settings.SEARCH_BACKOFF_SECONDS),
+                "MAX_QUERIES_PER_BOOK": parse_int(config_dict.get("MAX_QUERIES_PER_BOOK"), settings.MAX_QUERIES_PER_BOOK),
+                "ENABLE_GOOGLE_NEWS_RSS": parse_bool(config_dict.get("ENABLE_GOOGLE_NEWS_RSS"), settings.ENABLE_GOOGLE_NEWS_RSS),
+                "SEARCH_PROVIDER_MODE": parse_str(config_dict.get("SEARCH_PROVIDER_MODE"), settings.SEARCH_PROVIDER_MODE),
+                "ENABLE_SERPAPI": parse_bool(config_dict.get("ENABLE_SERPAPI"), settings.ENABLE_SERPAPI),
+                "SERPAPI_API_KEY": parse_str(config_dict.get("SERPAPI_API_KEY"), settings.SERPAPI_API_KEY),
+                "ENABLE_DATAFORSEO": parse_bool(config_dict.get("ENABLE_DATAFORSEO"), settings.DATAFORSEO),
+                "DATAFORSEO_LOGIN": parse_str(config_dict.get("DATAFORSEO_LOGIN"), settings.DATAFORSEO_LOGIN),
+                "DATAFORSEO_PASSWORD": parse_str(config_dict.get("DATAFORSEO_PASSWORD"), settings.DATAFORSEO_PASSWORD),
+                "BLOCK_PROVIDER_FOR_FULL_RUN": parse_bool(config_dict.get("BLOCK_PROVIDER_FOR_FULL_RUN"), settings.BLOCK_PROVIDER_FOR_FULL_RUN),
+                "ENABLE_DOMAIN_INDEX": parse_bool(config_dict.get("ENABLE_DOMAIN_INDEX"), settings.ENABLE_DOMAIN_INDEX),
+                "DOMAIN_INDEX_MAX_URLS_PER_DOMAIN": parse_int(config_dict.get("DOMAIN_INDEX_MAX_URLS_PER_DOMAIN"), settings.DOMAIN_INDEX_MAX_URLS_PER_DOMAIN),
+                "DOMAIN_INDEX_REFRESH_DAYS": parse_int(config_dict.get("DOMAIN_INDEX_REFRESH_DAYS"), settings.DOMAIN_INDEX_REFRESH_DAYS),
+                "DOMAIN_INDEX_MIN_SCORE": parse_int(config_dict.get("DOMAIN_INDEX_MIN_SCORE"), settings.DOMAIN_INDEX_MIN_SCORE),
+                "DOMAIN_INDEX_DB_PATH": parse_str(config_dict.get("DOMAIN_INDEX_DB_PATH"), settings.DOMAIN_INDEX_DB_PATH),
+                "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES": parse_int(config_dict.get("DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES"), settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES),
+                "ENRICH_INDEXED_URLS": parse_bool(config_dict.get("ENRICH_INDEXED_URLS"), settings.ENRICH_INDEXED_URLS),
+                "DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN": parse_int(config_dict.get("DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN"), settings.DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN),
+                "DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS": parse_int(config_dict.get("DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS"), settings.DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS),
+                "DISCOVER_INTERNAL_ARTICLE_LINKS": parse_bool(config_dict.get("DISCOVER_INTERNAL_ARTICLE_LINKS"), settings.DISCOVER_INTERNAL_ARTICLE_LINKS),
+                "DOMAIN_INDEX_INTERNAL_LINK_DEPTH": parse_int(config_dict.get("DOMAIN_INDEX_INTERNAL_LINK_DEPTH"), settings.DOMAIN_INDEX_INTERNAL_LINK_DEPTH),
+                "DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE": parse_int(config_dict.get("DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE"), settings.DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE),
+                "ENABLE_INTERNAL_DOMAIN_SEARCH": parse_bool(config_dict.get("ENABLE_INTERNAL_DOMAIN_SEARCH"), settings.ENABLE_INTERNAL_DOMAIN_SEARCH),
+                "INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK": parse_int(config_dict.get("INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK"), settings.INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK),
+                "INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN": parse_int(config_dict.get("INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN"), settings.INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN),
+                "INTERNAL_SEARCH_TIMEOUT_SECONDS": parse_int(config_dict.get("INTERNAL_SEARCH_TIMEOUT_SECONDS"), settings.INTERNAL_SEARCH_TIMEOUT_SECONDS),
+                "INTERNAL_SEARCH_DOMAINS_LIMIT": parse_int(config_dict.get("INTERNAL_SEARCH_DOMAINS_LIMIT"), settings.INTERNAL_SEARCH_DOMAINS_LIMIT),
+                "DEFAULT_INCLUDE_UNKNOWN_DATES": parse_bool(config_dict.get("DEFAULT_INCLUDE_UNKNOWN_DATES"), settings.DEFAULT_INCLUDE_UNKNOWN_DATES),
+                "DEFAULT_DATE_MIN": parse_str(config_dict.get("DEFAULT_DATE_MIN"), settings.DEFAULT_DATE_MIN or ""),
+                "DEFAULT_DATE_MAX": parse_str(config_dict.get("DEFAULT_DATE_MAX"), settings.DEFAULT_DATE_MAX or ""),
             }
         except Exception:
             # Fallback to local configs if sheet configs fail to read
@@ -489,6 +533,9 @@ class SheetsService:
                 "INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN": settings.INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN,
                 "INTERNAL_SEARCH_TIMEOUT_SECONDS": settings.INTERNAL_SEARCH_TIMEOUT_SECONDS,
                 "INTERNAL_SEARCH_DOMAINS_LIMIT": settings.INTERNAL_SEARCH_DOMAINS_LIMIT,
+                "DEFAULT_INCLUDE_UNKNOWN_DATES": settings.DEFAULT_INCLUDE_UNKNOWN_DATES,
+                "DEFAULT_DATE_MIN": settings.DEFAULT_DATE_MIN or "",
+                "DEFAULT_DATE_MAX": settings.DEFAULT_DATE_MAX or "",
             }
 
     def get_pending_books(self, sheet_id: str, limit: int = 10) -> List[Dict[str, Any]]:
