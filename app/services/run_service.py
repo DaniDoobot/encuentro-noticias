@@ -506,7 +506,9 @@ class RunService:
         search_mode = config.get("SEARCH_PROVIDER_MODE", settings.SEARCH_PROVIDER_MODE)
 
         # Check cascade search flag (from config or fallback to settings)
-        cascade_search = is_true(config.get("ENABLE_CASCADE_SEARCH", settings.ENABLE_CASCADE_SEARCH))
+        # Use getattr for resilience against stale Docker images missing newer settings
+        _enable_cascade_default = getattr(settings, "ENABLE_CASCADE_SEARCH", True)
+        cascade_search = is_true(config.get("ENABLE_CASCADE_SEARCH", _enable_cascade_default))
         
         # If SEARCH_PROVIDER_MODE is domain_index_plus_news, force cascade search
         if search_mode == "domain_index_plus_news":
@@ -579,9 +581,11 @@ class RunService:
             google_news_candidates_count = google_news_candidates
 
             # PHASE 3 — Internal Domain Search si hay pocos candidatos
-            min_candidates_internal = int(config.get("MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH", settings.MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH))
-            enable_deep_search = is_true(config.get("ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", settings.ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS))
-            enable_internal_search = is_true(config.get("ENABLE_INTERNAL_DOMAIN_SEARCH", settings.ENABLE_INTERNAL_DOMAIN_SEARCH))
+            _min_cand_default = getattr(settings, "MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH", 5)
+            _enable_deep_default = getattr(settings, "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", True)
+            min_candidates_internal = int(config.get("MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH", _min_cand_default))
+            enable_deep_search = is_true(config.get("ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", _enable_deep_default))
+            enable_internal_search = is_true(config.get("ENABLE_INTERNAL_DOMAIN_SEARCH", getattr(settings, "ENABLE_INTERNAL_DOMAIN_SEARCH", True)))
 
             total_before_internal = len(candidate_origin)
             
