@@ -188,7 +188,7 @@ class SheetsService:
                                     if fallback_val is not None:
                                         new_row.append(fallback_val)
                                     elif h == "¿Publicar?":
-                                        new_row.append("FALSE")
+                                        new_row.append(False)
                                     else:
                                         new_row.append("")
                                 else:
@@ -228,8 +228,8 @@ class SheetsService:
                 ["Fecha mínima", "2024-01-01"],
                 ["Fecha máxima", "2026-12-31"],
                 ["Máximo de libros", "5"],
-                ["Modo prueba", "TRUE"],
-                ["Incluir artículos sin fecha", "TRUE"],
+                ["Modo prueba", True],
+                ["Incluir artículos sin fecha", True],
                 ["Estado última búsqueda", "no iniciado"],
                 ["Última búsqueda_id", ""],
                 ["Última ejecución", ""],
@@ -741,8 +741,8 @@ class SheetsService:
         # Check if the worksheet uses the new layout
         headers = worksheet.row_values(1)
         if headers and headers[0] == "¿Publicar?":
-            # Prepend 7 empty fields: ¿Publicar? = FALSE, Estado publicación = "" (empty), ...
-            full_row = ["FALSE", "", "", "", "", "", ""] + review_data
+            # Prepend 7 empty fields: ¿Publicar? = False, Estado publicación = "" (empty), ...
+            full_row = [False, "", "", "", "", "", ""] + review_data
         else:
             full_row = review_data
             
@@ -975,10 +975,23 @@ class SheetsService:
         headers = worksheet.row_values(1)
         num_cols = len(headers) if headers else 27
 
+        # Fetch column A unformatted values to check if they are string "FALSE"
+        try:
+            col_a_range = f"A2:A{len(records) + 1}"
+            col_a_data = worksheet.get(col_a_range, value_render_option="UNFORMATTED_VALUE")
+        except Exception:
+            col_a_data = []
+
         reqs = []
         cleaned_count = 0
         for idx, row in enumerate(records):
             row_idx = idx + 2  # 1-indexed, headers is row 1
+            
+            # Safe retrieval from col_a_data
+            raw_a_val = None
+            if idx < len(col_a_data) and col_a_data[idx]:
+                raw_a_val = col_a_data[idx][0]
+
             if not self.is_row_real(row):
                 # Only clear if it contains any non-empty cell value (to minimize API overhead)
                 has_any_val = any(str(v).strip() for v in row.values())
@@ -996,6 +1009,31 @@ class SheetsService:
                         }
                     })
                     cleaned_count += 1
+            else:
+                # Real row: check if Column A is a string representation of FALSE (e.g. 'FALSE)
+                # and convert it to real bool value False.
+                if isinstance(raw_a_val, str):
+                    val_clean = raw_a_val.strip().upper()
+                    if val_clean in ("FALSE", "'FALSE", "FALSE "):
+                        reqs.append({
+                            "updateCells": {
+                                "range": {
+                                    "sheetId": worksheet.id,
+                                    "startRowIndex": row_idx - 1,
+                                    "endRowIndex": row_idx,
+                                    "startColumnIndex": 0,
+                                    "endColumnIndex": 1
+                                },
+                                "rows": [{
+                                    "values": [{
+                                        "userEnteredValue": {
+                                            "boolValue": False
+                                        }
+                                    }]
+                                }],
+                                "fields": "userEnteredValue"
+                            }
+                        })
 
         if reqs:
             spreadsheet.batch_update({"requests": reqs})

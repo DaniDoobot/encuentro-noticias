@@ -113,7 +113,7 @@ def post_publish_reviews(req: PublishReviewsRequest):
         # Capture first 5 debug examples
         if len(debug_examples) < 5:
             book_t = row.get("Título del libro") or row.get("Título del artículo") or "Sin título"
-            is_marked_t = str(row.get("¿Publicar?", "")).strip().upper() == "TRUE"
+            is_marked_t = str(row.get("¿Publicar?", "")).strip().upper() in ("TRUE", "1") or row.get("¿Publicar?") is True
             debug_examples.append(f"Row {row_idx}: {book_t} (¿Publicar?: {is_marked_t})")
             
         # Skip if already published (has WordPress ID)
@@ -122,7 +122,7 @@ def post_publish_reviews(req: PublishReviewsRequest):
             skipped_already_published += 1
             continue
             
-        is_marked = str(row.get("¿Publicar?", "")).strip().upper() == "TRUE"
+        is_marked = str(row.get("¿Publicar?", "")).strip().upper() in ("TRUE", "1") or row.get("¿Publicar?") is True
         
         if is_marked:
             selected_rows += 1
@@ -171,7 +171,7 @@ def post_publish_reviews(req: PublishReviewsRequest):
                 row_vals = []
                 for h in headers_ordered:
                     if h == "¿Publicar?":
-                        row_vals.append("TRUE")
+                        row_vals.append(True)
                     elif h == "Estado publicación":
                         row_vals.append("Publicada")
                     elif h == "Fecha intento publicación":
