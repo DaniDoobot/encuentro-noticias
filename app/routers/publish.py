@@ -113,7 +113,7 @@ def post_publish_reviews(req: PublishReviewsRequest):
                     "¿Publicar?", "Estado publicación", "Fecha intento publicación", "Fecha publicación",
                     "WordPress ID", "WordPress URL", "Error publicación", "ISBN", "Título del libro",
                     "Autor del libro", "Query", "URL", "URL normalizada", "Título del artículo",
-                    "Título del libro detectado por IA", "Autor del libro detectado por IA",
+                    "Título para Web", "Autor para Web",
                     "Medio de publicación", "Autor de la publicación", "Fecha de publicación",
                     "Idioma original", "Categoría", "Resumen", "Score de coincidencia",
                     "Tipo de contenido", "Fecha de extracción", "Hash deduplicación", "Estado"
@@ -135,7 +135,13 @@ def post_publish_reviews(req: PublishReviewsRequest):
                     elif h == "Error publicación":
                         row_vals.append("")
                     else:
-                        row_vals.append(str(row.get(h, "")))
+                        val = row.get(h)
+                        if val is None:
+                            if h == "Título para Web":
+                                val = row.get("Título del libro detectado por IA")
+                            elif h == "Autor para Web":
+                                val = row.get("Autor del libro detectado por IA")
+                        row_vals.append(str(val or ""))
                 
                 rows_to_append_pub.append(row_vals)
                 rows_to_delete.append(row_idx)

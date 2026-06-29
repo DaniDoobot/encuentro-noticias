@@ -24,8 +24,8 @@ La hoja de cálculo (`GOOGLE_SHEET_ID`) debe compartirse con el correo electrón
 *   **`Libros`**: Contiene la base de datos de libros a evaluar.
     *   *Columnas*: `ISBN`, `Título del libro`, `Autor del libro`, `Estado`, `Última ejecución`, `Reseñas encontradas`, `Observaciones`.
     *   *Estados posibles*: `pendiente`, `procesando`, `completado`, `sin_resultados`, `error`.
-*   **`Reseñas`**: Guarda las publicaciones aceptadas que superan el score mínimo de validación.
-    *   *Columnas*: `ISBN`, `Título del libro`, `Autor del libro`, `Query`, `URL`, `URL normalizada`, `Título del artículo`, `Título del libro detectado por IA`, `Autor del libro detectado por IA`, `Medio de publicación`, `Autor de la publicación`, `Fecha de publicación`, `Idioma original`, `Categoría`, `Resumen`, `Score de coincidencia`, `Tipo de contenido`, `Fecha de extracción`, `Hash deduplicación`, `Estado`.
+*   **`Reseñas por publicar` y `Reseñas publicadas`**: Guarda las publicaciones aceptadas que superan el score mínimo de validación.
+    *   *Columnas*: `¿Publicar?`, `Estado publicación`, `Fecha intento publicación`, `Fecha publicación`, `WordPress ID`, `WordPress URL`, `Error publicación`, `ISBN`, `Título del libro`, `Autor del libro`, `Query`, `URL`, `URL normalizada`, `Título del artículo`, `Título para Web`, `Autor para Web`, `Medio de publicación`, `Autor de la publicación`, `Fecha de publicación`, `Idioma original`, `Categoría`, `Resumen`, `Score de coincidencia`, `Tipo de contenido`, `Fecha de extracción`, `Hash deduplicación`, `Estado`.
 *   **`Descartes`**: URLs evaluadas pero descartadas por algún motivo.
     *   *Columnas*: `ISBN`, `Título del libro`, `Autor del libro`, `Query`, `URL`, `Título detectado`, `Motivo de descarte`, `Score de coincidencia`, `Fecha de extracción`.
     *   *Motivos*: `duplicado`, `no menciona el libro`, `habla solo del autor`, `extracción fallida`, `texto insuficiente`, `score bajo`, `error HTTP`, `error OpenAI`, `error desconocido`.

@@ -56,7 +56,7 @@ class SheetsService:
                 "¿Publicar?", "Estado publicación", "Fecha intento publicación", "Fecha publicación",
                 "WordPress ID", "WordPress URL", "Error publicación", "ISBN", "Título del libro",
                 "Autor del libro", "Query", "URL", "URL normalizada", "Título del artículo",
-                "Título del libro detectado por IA", "Autor del libro detectado por IA",
+                "Título para Web", "Autor para Web",
                 "Medio de publicación", "Autor de la publicación", "Fecha de publicación",
                 "Idioma original", "Categoría", "Resumen", "Score de coincidencia",
                 "Tipo de contenido", "Fecha de extracción", "Hash deduplicación", "Estado"
@@ -65,7 +65,7 @@ class SheetsService:
                 "¿Publicar?", "Estado publicación", "Fecha intento publicación", "Fecha publicación",
                 "WordPress ID", "WordPress URL", "Error publicación", "ISBN", "Título del libro",
                 "Autor del libro", "Query", "URL", "URL normalizada", "Título del artículo",
-                "Título del libro detectado por IA", "Autor del libro detectado por IA",
+                "Título para Web", "Autor para Web",
                 "Medio de publicación", "Autor de la publicación", "Fecha de publicación",
                 "Idioma original", "Categoría", "Resumen", "Score de coincidencia",
                 "Tipo de contenido", "Fecha de extracción", "Hash deduplicación", "Estado"
@@ -116,7 +116,16 @@ class SheetsService:
                             new_row = []
                             for h in headers:
                                 if h not in row_dict:
-                                    if h == "¿Publicar?":
+                                    # Fallback for renamed columns
+                                    fallback_val = None
+                                    if h == "Título para Web":
+                                        fallback_val = row_dict.get("Título del libro detectado por IA")
+                                    elif h == "Autor para Web":
+                                        fallback_val = row_dict.get("Autor del libro detectado por IA")
+                                        
+                                    if fallback_val is not None:
+                                        new_row.append(fallback_val)
+                                    elif h == "¿Publicar?":
                                         new_row.append("FALSE")
                                     else:
                                         new_row.append("")
@@ -586,12 +595,23 @@ class SheetsService:
 
     def add_review(self, sheet_id: str, review_data: List[Any]):
         """
-        Appends a row to Reseñas.
+        Appends a row to Reseñas por publicar.
+        Handles prepending control columns if the new layout is active.
         """
         client = self.get_client()
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.worksheet("Reseñas por publicar")
-        worksheet.append_row(review_data)
+        
+        # Check if the worksheet uses the new layout
+        headers = worksheet.row_values(1)
+        if headers and headers[0] == "¿Publicar?":
+            # Prepend 7 empty fields: ¿Publicar?, Estado publicación, Fecha intento publicación,
+            # Fecha publicación, WordPress ID, WordPress URL, Error publicación
+            full_row = ["FALSE", "", "", "", "", "", ""] + review_data
+        else:
+            full_row = review_data
+            
+        worksheet.append_row(full_row)
 
     def add_descarte(self, sheet_id: str, descarte_data: List[Any]):
         """

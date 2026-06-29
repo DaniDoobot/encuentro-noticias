@@ -176,8 +176,8 @@ class WordPressPublisher:
         """
         Builds the REST API payload for a WordPress post from the review data.
         """
-        title_book = review.get("Título del libro", "")
-        author_book = review.get("Autor del libro", "")
+        title_book = review.get("Título para Web") or review.get("Título del libro detectado por IA") or review.get("Título del libro", "")
+        author_book = review.get("Autor para Web") or review.get("Autor del libro detectado por IA") or review.get("Autor del libro", "")
         summary = review.get("Resumen", "")
         original_url = review.get("URL", "")
         medium = review.get("Medio de publicación", "")
