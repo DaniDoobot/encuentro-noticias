@@ -98,6 +98,21 @@ def test_query_builder_tiers():
     assert len(res["prioritarias"]) > 0
     assert len(res["dominios"]) > 0
 
+def test_query_builder_missing_data():
+    """
+    Verifies query builder outputs when ISBN or author is missing.
+    """
+    # 1. Title + Author (No ISBN)
+    res = query_builder.build_queries("Ficciones", "Borges", "")
+    assert '"Ficciones" "Borges" reseña' in res["prioritarias"]
+    assert '"Ficciones" "Borges" crítica' in res["prioritarias"]
+
+    # 2. Only Title (No Author, No ISBN)
+    res_only_title = query_builder.build_queries("Ficciones", "", "")
+    assert '"Ficciones" reseña libro' in res_only_title["prioritarias"]
+    assert '"Ficciones" crítica libro' in res_only_title["prioritarias"]
+    assert '"Ficciones" ediciones encuentro' in res_only_title["prioritarias"]
+
 def test_search_rate_limit_detection():
     """
     Verifies that search providers correctly identify and return rate-limiting status.

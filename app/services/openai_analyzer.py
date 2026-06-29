@@ -81,6 +81,7 @@ class OpenAIAnalyzer:
             "   - Tecnología\n"
             "   - Literatura\n"
             "   - Otros\n"
+            "7. Los datos de 'ISBN' o 'Autor del libro' del libro buscado pueden estar en blanco o no disponibles. En ese caso, evalúa la coincidencia basándote únicamente en los campos que sí estén provistos (ej. solo el título, o título y autor). No penalices ni descartes la coincidencia únicamente por la ausencia de estos datos opcionales.\n"
         )
 
         user_content = (

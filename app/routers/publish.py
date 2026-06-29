@@ -13,6 +13,14 @@ from app.services.logger_service import logger_service
 
 logger = logging.getLogger("encuentro-noticias")
 
+def is_row_real(row: dict) -> bool:
+    # Check if any of the target fields has non-empty text
+    target_fields = ["URL", "URL normalizada", "Título del artículo", "Título del libro", "ISBN", "Hash deduplicación", "Título para Web", "Título del libro detectado por IA"]
+    for field in target_fields:
+        if str(row.get(field, "")).strip():
+            return True
+    return False
+
 router = APIRouter(dependencies=[Depends(verify_admin_token)])
 
 class PublishReviewsRequest(BaseModel):
@@ -72,6 +80,10 @@ def post_publish_reviews(req: PublishReviewsRequest):
     for idx, row in enumerate(records):
         row_idx = idx + 2  # 1-indexed, headers is row 1
         
+        # Skip empty rows
+        if not is_row_real(row):
+            continue
+            
         # Skip if already published (has WordPress ID)
         wp_id = str(row.get("WordPress ID", "")).strip()
         if wp_id:

@@ -328,8 +328,30 @@ class RunService:
         Runs the extraction and validation pipeline for a single book.
         """
         log_prefix = "[PRUEBA] " if dry_run else ""
-        logger_service.log("INFO", "BOOK_PROCESS_START", f"{log_prefix}Procesando libro: '{title}' por {author}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-        self._add_in_memory_log(run_id, "INFO", "BOOK_PROCESS_START", f"{log_prefix}Procesando: '{title}' por {author}", isbn=isbn)
+        
+        # Check if title is missing
+        if not title or not title.strip():
+            err_msg = "Falta título del libro"
+            logger_service.log("ERROR", "BOOK_MISSING_TITLE", f"{log_prefix}{err_msg}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "ERROR", "BOOK_MISSING_TITLE", f"{log_prefix}{err_msg}", isbn=isbn)
+            if not dry_run:
+                try:
+                    sheets_service.update_book_status(
+                        sheet_id=sheet_id,
+                        row_index=row_index,
+                        status="error",
+                        last_run=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        reviews_found=0,
+                        observations=err_msg
+                    )
+                except Exception as e_sheet:
+                    logger_service.log("ERROR", "SHEET_UPDATE_FAIL", f"Fallo al marcar estado 'error' por falta de título: {e_sheet}", isbn=isbn, sheet_id=sheet_id)
+            logger_service.flush_log_batch(sheet_id, run_id)
+            return "error"
+
+        author_str = f" por {author}" if author.strip() else ""
+        logger_service.log("INFO", "BOOK_PROCESS_START", f"{log_prefix}Procesando libro: '{title}'{author_str}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+        self._add_in_memory_log(run_id, "INFO", "BOOK_PROCESS_START", f"{log_prefix}Procesando: '{title}'{author_str}", isbn=isbn)
 
         # Clear tracked providers used for this book
         search_service.providers_used_count.clear()
@@ -1034,6 +1056,17 @@ class RunService:
                 
                 reviews_added += 1
 
+        # Determine specific prefix observation depending on missing values
+        spec_obs = ""
+        has_isbn = bool(isbn and isbn.strip())
+        has_author = bool(author and author.strip())
+        if not has_isbn and not has_author:
+            spec_obs = "Búsqueda realizada solo por título. "
+        elif not has_isbn:
+            spec_obs = "Búsqueda realizada sin ISBN. "
+        elif not has_author:
+            spec_obs = "Búsqueda realizada sin autor. "
+
         # Determine final status
         final_status = "completado"
         if reviews_added == 0:
@@ -1043,6 +1076,9 @@ class RunService:
                 observation += f" ({failed_extractions} fallos de red/extracción)."
         else:
             observation = f"Proceso finalizado. Encontradas y guardadas {reviews_added} reseñas. {descartes_added} descartes."
+
+        # Prepend the missing-data observation prefix
+        observation = spec_obs + observation
 
         logger_service.log("INFO", "BOOK_PROCESS_END", f"{log_prefix}Libro finalizado con estado '{final_status}'. {observation}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
         self._add_in_memory_log(run_id, "INFO", "BOOK_PROCESS_END", f"{log_prefix}Finalizado: {final_status}. {observation}", isbn=isbn)

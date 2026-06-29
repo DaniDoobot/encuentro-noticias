@@ -9,55 +9,74 @@ class QueryBuilder:
         author_clean = author.replace('"', "'").strip()
         isbn_clean = isbn.replace('"', "").replace('-', "").strip()
 
-        # Tier 1 - Prioritarias (Nivel 1)
-        prioritarias = [
-            f'"{title_clean}" "{author_clean}"',
-            f'"{title_clean}" "{author_clean}" reseña',
-            f'"{title_clean}" "{author_clean}" crítica',
-            f'"{title_clean}" "{author_clean}" libro',
-            f'"{title_clean}" review',
-            f'"{title_clean}" crítica literaria',
-            f'"{title_clean}" entrevista'
-        ]
-        
-        if isbn_clean:
-            prioritarias.extend([
-                f'"{isbn_clean}" "{title_clean}"',
-                f'"{isbn_clean}" reseña',
-                f'"{isbn_clean}" crítica'
-            ])
+        has_author = bool(author_clean)
+        has_isbn = bool(isbn_clean)
 
-        # Tier 2 - Apoyo (Nivel 2)
-        apoyo = [
-            f'"{title_clean}" "{author_clean}" comentario',
-            f'"{title_clean}" "{author_clean}" opinión',
-            f'"{title_clean}" "{author_clean}" análisis',
-            f'"{title_clean}" "{author_clean}" artículo',
-            
-            # Negatives to bypass commercial sites in some queries
-            f'"{title_clean}" "{author_clean}" reseña -comprar -amazon -fnac -casadellibro -iberlibro',
-            f'"{title_clean}" "{author_clean}" crítica -comprar -amazon -fnac -casadellibro -iberlibro',
-            f'"{title_clean}" "{author_clean}" comentario -comprar -amazon -fnac -casadellibro -iberlibro',
-            
-            # International terms
-            f'"{title_clean}" "{author_clean}" review',
-            f'"{title_clean}" "{author_clean}" critique',
-            f'"{title_clean}" "{author_clean}" recensione',
-            f'"{title_clean}" "{author_clean}" recension',
-            f'"{title_clean}" recensión'
-        ]
-
-        # Tier 3 - Dominios (Nivel 3)
+        prioritarias = []
+        apoyo = []
         dominios = []
-        if review_domains:
-            for domain in review_domains:
-                domain_clean = domain.strip().lower()
-                if domain_clean:
-                    dominios.extend([
-                        f'site:{domain_clean} "{title_clean}" "{author_clean}"',
-                        f'site:{domain_clean} "{title_clean}"',
-                        f'site:{domain_clean} "{title_clean}" reseña'
-                    ])
+
+        if has_author:
+            # Title + Author (+ optional ISBN)
+            prioritarias = [
+                f'"{title_clean}" "{author_clean}" reseña',
+                f'"{title_clean}" "{author_clean}" crítica',
+                f'"{title_clean}" "{author_clean}"',
+                f'"{title_clean}" "{author_clean}" libro',
+                f'"{title_clean}" review',
+                f'"{title_clean}" crítica literaria'
+            ]
+            if has_isbn:
+                prioritarias.append(f'"{isbn_clean}"')
+                prioritarias.append(f'"{isbn_clean}" "{title_clean}"')
+
+            apoyo = [
+                f'"{title_clean}" "{author_clean}" comentario',
+                f'"{title_clean}" "{author_clean}" opinión',
+                f'"{title_clean}" "{author_clean}" análisis',
+                f'"{title_clean}" "{author_clean}" artículo',
+                f'"{title_clean}" "{author_clean}" reseña -comprar -amazon -fnac -casadellibro -iberlibro',
+                f'"{title_clean}" "{author_clean}" crítica -comprar -amazon -fnac -casadellibro -iberlibro',
+                f'"{title_clean}" "{author_clean}" review',
+                f'"{title_clean}" recensión'
+            ]
+            
+            if review_domains:
+                for domain in review_domains:
+                    domain_clean = domain.strip().lower()
+                    if domain_clean:
+                        dominios.extend([
+                            f'site:{domain_clean} "{title_clean}" "{author_clean}"',
+                            f'site:{domain_clean} "{title_clean}"',
+                            f'site:{domain_clean} "{title_clean}" reseña'
+                        ])
+        else:
+            # Only Title (+ optional ISBN)
+            prioritarias = [
+                f'"{title_clean}" reseña libro',
+                f'"{title_clean}" crítica libro',
+                f'"{title_clean}" ediciones encuentro'
+            ]
+            if has_isbn:
+                prioritarias.append(f'"{isbn_clean}"')
+                prioritarias.append(f'"{isbn_clean}" "{title_clean}"')
+                
+            apoyo = [
+                f'"{title_clean}" comentario libro',
+                f'"{title_clean}" reseña',
+                f'"{title_clean}" crítica',
+                f'"{title_clean}" opinión libro',
+                f'"{title_clean}" reseña -comprar -amazon -fnac -casadellibro -iberlibro'
+            ]
+            
+            if review_domains:
+                for domain in review_domains:
+                    domain_clean = domain.strip().lower()
+                    if domain_clean:
+                        dominios.extend([
+                            f'site:{domain_clean} "{title_clean}" reseña',
+                            f'site:{domain_clean} "{title_clean}"'
+                        ])
 
         # Deduplicate preserving order helper
         def clean_list(lst: List[str]) -> List[str]:

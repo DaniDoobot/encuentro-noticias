@@ -7,6 +7,14 @@ import logging
 
 logger = logging.getLogger("encuentro-noticias")
 
+def is_row_real(row: dict) -> bool:
+    # Check if any of the target fields has non-empty text
+    target_fields = ["URL", "URL normalizada", "Título del artículo", "Título del libro", "ISBN", "Hash deduplicación", "Título para Web", "Título del libro detectado por IA"]
+    for field in target_fields:
+        if str(row.get(field, "")).strip():
+            return True
+    return False
+
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive'
@@ -112,7 +120,9 @@ class SheetsService:
                             for i, val in enumerate(row):
                                 if i < len(existing_headers):
                                     row_dict[existing_headers[i]] = val
-                                    
+                            if not is_row_real(row_dict):
+                                continue
+                                
                             new_row = []
                             for h in headers:
                                 if h not in row_dict:
