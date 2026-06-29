@@ -183,22 +183,25 @@ class SheetsService:
                                 
                             new_row = []
                             for h in headers:
+                                raw_val = row_dict.get(h) if h in row_dict else None
                                 if h not in row_dict:
-                                    # Fallback for renamed columns
-                                    fallback_val = None
                                     if h == "Título para Web":
-                                        fallback_val = row_dict.get("Título del libro detectado por IA")
+                                        raw_val = row_dict.get("Título del libro detectado por IA")
                                     elif h == "Autor para Web":
-                                        fallback_val = row_dict.get("Autor del libro detectado por IA")
+                                        raw_val = row_dict.get("Autor del libro detectado por IA")
                                         
-                                    if fallback_val is not None:
-                                        new_row.append(fallback_val)
-                                    elif h == "¿Publicar?":
-                                        new_row.append(False)
-                                    else:
-                                        new_row.append("")
+                                if raw_val is not None:
+                                    if isinstance(raw_val, str):
+                                        s = raw_val.strip()
+                                        if s.lower() in ("titulo web", "título web", "autor web", "autor web "):
+                                            raw_val = ""
+                                        else:
+                                            raw_val = s
+                                    new_row.append(raw_val)
+                                elif h == "¿Publicar?":
+                                    new_row.append(False)
                                 else:
-                                    new_row.append(row_dict[h])
+                                    new_row.append("")
                             new_rows.append(new_row)
                             
                         # Overwrite sheet with new schema and reordered values
@@ -744,6 +747,16 @@ class SheetsService:
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.worksheet("Reseñas por publicar")
         
+        # Clean placeholders from review_data: "Titulo Web", "Autor Web"
+        def clean_val(val: Any) -> Any:
+            if isinstance(val, str):
+                s = val.strip()
+                if s.lower() in ("titulo web", "título web", "autor web", "autor web "):
+                    return ""
+                return s
+            return val
+        review_data = [clean_val(item) for item in review_data]
+        
         # Check if the worksheet uses the new layout
         headers = worksheet.row_values(1)
         if headers and headers[0] == "¿Publicar?":
@@ -1092,6 +1105,16 @@ class SheetsService:
         client = self.get_client()
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.worksheet("Reseñas publicadas")
+        
+        # Clean placeholders from rows_data: "Titulo Web", "Autor Web"
+        def clean_val(val: Any) -> Any:
+            if isinstance(val, str):
+                s = val.strip()
+                if s.lower() in ("titulo web", "título web", "autor web", "autor web "):
+                    return ""
+                return s
+            return val
+        rows_data = [[clean_val(item) for item in row] for row in rows_data]
         
         # Read existing records to find empty/false row indices
         records = worksheet.get_all_records()

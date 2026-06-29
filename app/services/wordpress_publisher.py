@@ -193,22 +193,42 @@ class WordPressPublisher:
         """
         Builds the REST API payload for a WordPress post from the review data.
         """
-        title_book = review.get("Título para Web") or review.get("Título del libro detectado por IA") or review.get("Título del libro", "")
-        author_book = review.get("Autor para Web") or review.get("Autor del libro detectado por IA") or review.get("Autor del libro", "")
+        def clean_val(val: Any) -> str:
+            if not val:
+                return ""
+            s = str(val).strip()
+            if s.lower() in ("titulo web", "título web", "autor web", "autor web "):
+                return ""
+            return s
+
+        title_libro = clean_val(review.get("Título del libro"))
+        title_web = clean_val(review.get("Título para Web"))
+        title_ia = clean_val(review.get("Título del libro detectado por IA"))
+        title_art = clean_val(review.get("Título del artículo"))
+
+        author_libro = clean_val(review.get("Autor del libro"))
+        author_web = clean_val(review.get("Autor para Web"))
+        author_ia = clean_val(review.get("Autor del libro detectado por IA"))
+
+        # wordpress title: priority is title_libro, title_web, title_ia, title_art, "Reseña"
+        post_title = (
+            title_libro
+            or title_web
+            or title_ia
+            or title_art
+            or "Reseña"
+        ).strip()
+
+        # used for content layout
+        title_book = title_web or title_libro or title_ia or "Sin título"
+        author_book = author_web or author_libro or author_ia or "Sin autor"
+
         summary = review.get("Resumen", "")
         original_url = review.get("URL", "")
         medium = review.get("Medio de publicación", "")
         pub_author = review.get("Autor de la publicación", "")
         pub_date = review.get("Fecha de publicación", "")
         content_type = review.get("Tipo de contenido", "reseña")
-        
-        post_title = (
-            review.get("Título para Web")
-            or review.get("Título del libro")
-            or review.get("Título del libro detectado por IA")
-            or review.get("Título del artículo")
-            or "Reseña"
-        ).strip()
         
         post_content = f"""<p><strong>Libro:</strong> {title_book}</p>
 <p><strong>Autor del libro:</strong> {author_book}</p>

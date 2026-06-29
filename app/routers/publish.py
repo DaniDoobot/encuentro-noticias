@@ -192,7 +192,10 @@ def post_publish_reviews(req: PublishReviewsRequest):
                                 val = row.get("Título del libro detectado por IA")
                             elif h == "Autor para Web":
                                 val = row.get("Autor del libro detectado por IA")
-                        row_vals.append(str(val or ""))
+                        val_str = str(val or "").strip()
+                        if val_str.lower() in ("titulo web", "título web", "autor web", "autor web "):
+                            val_str = ""
+                        row_vals.append(val_str)
                 
                 rows_to_append_pub.append(row_vals)
                 rows_to_delete.append(row_idx)
