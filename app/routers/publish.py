@@ -20,7 +20,8 @@ def is_row_real(row: dict) -> bool:
         "Título del libro", "Autor del libro", "ISBN", 
         "Resumen", "Hash deduplicación", 
         "Título para Web", "Autor para Web",
-        "Título del libro detectado por IA", "Autor del libro detectado por IA"
+        "Título del libro detectado por IA", "Autor del libro detectado por IA",
+        "WordPress ID", "WordPress URL", "Fecha publicación", "Fecha de publicación"
     ]
     for field in target_fields:
         if str(row.get(field, "")).strip():
@@ -219,7 +220,7 @@ def post_publish_reviews(req: PublishReviewsRequest):
         # Append to published worksheet
         if rows_to_append_pub:
             try:
-                ws_pub.append_rows(rows_to_append_pub)
+                sheets_service.add_published_reviews(sheet_id, rows_to_append_pub)
             except Exception as e_app:
                 logger.error(f"Error appending to Reseñas publicadas: {e_app}")
         # Delete rows in reverse order to keep correct indexing
@@ -338,33 +339,39 @@ def post_publish_test_draft(req: TestDraftRequest):
         status=res.get("status")
     )
 
+class CleanupEmptyRowsRequest(BaseModel):
+    worksheets: Optional[List[str]] = None
+
 class CleanupEmptyRowsResponse(BaseModel):
     success: bool
     message: str
-    cleaned_rows: int
+    cleaned_details: Dict[str, int]
 
 @router.post("/reviews/cleanup-empty-publication-rows", response_model=CleanupEmptyRowsResponse)
-def post_cleanup_empty_rows():
+def post_cleanup_empty_rows(req: Optional[CleanupEmptyRowsRequest] = None):
     """
-    Cleans up empty/false rows in the 'Reseñas por publicar' tab of Google Sheets.
+    Cleans up empty/false rows in the specified tabs (default: both Reseñas por publicar and Reseñas publicadas) of Google Sheets.
     """
     sheet_id = settings.GOOGLE_SHEET_ID
+    worksheets = req.worksheets if req else None
     try:
-        cleaned_count = sheets_service.cleanup_empty_publication_rows(sheet_id)
+        cleaned_details = sheets_service.cleanup_empty_publication_rows(sheet_id, worksheets)
+        total_cleaned = sum(cleaned_details.values())
         
         logger_service.log(
             level="INFO",
             action="REVIEWS_CLEANUP",
-            message=f"Limpieza de filas de publicación completada: {cleaned_count} filas limpiadas.",
+            message=f"Limpieza de filas de publicación completada: {total_cleaned} filas limpiadas en total.",
             sheet_id=sheet_id,
-            detail={"cleaned_rows": cleaned_count}
+            detail={"cleaned_details": cleaned_details}
         )
         logger_service.flush_log_batch(sheet_id)
         
+        ws_str = ", ".join(cleaned_details.keys())
         return CleanupEmptyRowsResponse(
             success=True,
-            message=f"Se limpiaron {cleaned_count} filas vacías de publicación en la pestaña 'Reseñas por publicar'.",
-            cleaned_rows=cleaned_count
+            message=f"Se limpiaron {total_cleaned} filas vacías en total en las pestañas: {ws_str}.",
+            cleaned_details=cleaned_details
         )
     except Exception as e:
         raise HTTPException(

@@ -9,7 +9,13 @@ logger = logging.getLogger("encuentro-noticias")
 
 def is_row_real(row: dict) -> bool:
     # Check if any of the target fields has non-empty text
-    target_fields = ["URL", "URL normalizada", "Título del artículo", "Título del libro", "ISBN", "Hash deduplicación", "Título para Web", "Título del libro detectado por IA", "Resumen"]
+    target_fields = [
+        "URL", "URL normalizada", "Título del artículo", "Título del libro", 
+        "Autor del libro", "ISBN", "Resumen", "Hash deduplicación", 
+        "Título para Web", "Autor para Web", "Título del libro detectado por IA", 
+        "Autor del libro detectado por IA", "WordPress ID", "WordPress URL", 
+        "Fecha publicación", "Fecha de publicación"
+    ]
     for field in target_fields:
         if str(row.get(field, "")).strip():
             return True
@@ -945,76 +951,70 @@ class SheetsService:
     @staticmethod
     def is_row_real(row: dict) -> bool:
         """
-        Determines if a row in Reseñas por publicar contains real review data.
+        Determines if a row in Reseñas por publicar or Reseñas publicadas contains real review data.
         """
         target_fields = [
             "URL", "URL normalizada", "Título del artículo", 
             "Título del libro", "Autor del libro", "ISBN", 
             "Resumen", "Hash deduplicación", 
             "Título para Web", "Autor para Web",
-            "Título del libro detectado por IA", "Autor del libro detectado por IA"
+            "Título del libro detectado por IA", "Autor del libro detectado por IA",
+            "WordPress ID", "WordPress URL", "Fecha publicación", "Fecha de publicación"
         ]
         for field in target_fields:
             if str(row.get(field, "")).strip():
                 return True
         return False
 
-    def cleanup_empty_publication_rows(self, sheet_id: str) -> int:
+    def cleanup_empty_publication_rows(self, sheet_id: str, worksheet_names: List[str] = None) -> Dict[str, int]:
         """
-        Clears cells for rows in 'Reseñas por publicar' that do not contain real review data,
-        preserving the checkbox validation formats.
+        Clears cells for rows in specified worksheets (default: ['Reseñas por publicar', 'Reseñas publicadas'])
+        that do not contain real review data, preserving checkbox validation formats.
+        Converts text/string boolean values ('FALSE' / 'TRUE') to real checkboxes in real rows.
         """
+        if not worksheet_names:
+            worksheet_names = ["Reseñas por publicar", "Reseñas publicadas"]
+            
         client = self.get_client()
         spreadsheet = client.open_by_key(sheet_id)
-        worksheet = spreadsheet.worksheet("Reseñas por publicar")
-        records = worksheet.get_all_records()
-        if not records:
-            return 0
+        
+        results = {}
+        for ws_name in worksheet_names:
+            try:
+                worksheet = spreadsheet.worksheet(ws_name)
+            except Exception:
+                continue
+                
+            records = worksheet.get_all_records()
+            if not records:
+                results[ws_name] = 0
+                continue
 
-        # Get header length
-        headers = worksheet.row_values(1)
-        num_cols = len(headers) if headers else 27
+            # Get header length
+            headers = worksheet.row_values(1)
+            num_cols = len(headers) if headers else 27
 
-        # Fetch column A unformatted values to check if they are string "FALSE"
-        try:
-            col_a_range = f"A2:A{len(records) + 1}"
-            col_a_data = worksheet.get(col_a_range, value_render_option="UNFORMATTED_VALUE")
-        except Exception:
-            col_a_data = []
+            # Fetch column A unformatted values to check if they are string "FALSE" / "TRUE"
+            try:
+                col_a_range = f"A2:A{len(records) + 1}"
+                col_a_data = worksheet.get(col_a_range, value_render_option="UNFORMATTED_VALUE")
+            except Exception:
+                col_a_data = []
 
-        reqs = []
-        cleaned_count = 0
-        for idx, row in enumerate(records):
-            row_idx = idx + 2  # 1-indexed, headers is row 1
-            
-            # Safe retrieval from col_a_data
-            raw_a_val = None
-            if idx < len(col_a_data) and col_a_data[idx]:
-                raw_a_val = col_a_data[idx][0]
+            reqs = []
+            cleaned_count = 0
+            for idx, row in enumerate(records):
+                row_idx = idx + 2  # 1-indexed, headers is row 1
+                
+                # Safe retrieval from col_a_data
+                raw_a_val = None
+                if idx < len(col_a_data) and col_a_data[idx]:
+                    raw_a_val = col_a_data[idx][0]
 
-            if not self.is_row_real(row):
-                # Only clear if it contains any non-empty cell value (to minimize API overhead)
-                has_any_val = any(str(v).strip() for v in row.values())
-                if has_any_val:
-                    reqs.append({
-                        "updateCells": {
-                            "range": {
-                                "sheetId": worksheet.id,
-                                "startRowIndex": row_idx - 1,
-                                "endRowIndex": row_idx,
-                                "startColumnIndex": 0,
-                                "endColumnIndex": num_cols
-                            },
-                            "fields": "userEnteredValue"
-                        }
-                    })
-                    cleaned_count += 1
-            else:
-                # Real row: check if Column A is a string representation of FALSE (e.g. 'FALSE)
-                # and convert it to real bool value False.
-                if isinstance(raw_a_val, str):
-                    val_clean = raw_a_val.strip().upper()
-                    if val_clean in ("FALSE", "'FALSE", "FALSE "):
+                if not self.is_row_real(row):
+                    # Only clear if it contains any non-empty cell value (to minimize API overhead)
+                    has_any_val = any(str(v).strip() for v in row.values())
+                    if has_any_val:
                         reqs.append({
                             "updateCells": {
                                 "range": {
@@ -1022,23 +1022,111 @@ class SheetsService:
                                     "startRowIndex": row_idx - 1,
                                     "endRowIndex": row_idx,
                                     "startColumnIndex": 0,
-                                    "endColumnIndex": 1
+                                    "endColumnIndex": num_cols
                                 },
-                                "rows": [{
-                                    "values": [{
-                                        "userEnteredValue": {
-                                            "boolValue": False
-                                        }
-                                    }]
-                                }],
                                 "fields": "userEnteredValue"
                             }
                         })
+                        cleaned_count += 1
+                else:
+                    # Real row: check if Column A is a string representation of FALSE or TRUE
+                    # and convert to real bool values.
+                    if isinstance(raw_a_val, str):
+                        val_clean = raw_a_val.strip().upper()
+                        if val_clean in ("FALSE", "'FALSE", "FALSE "):
+                            reqs.append({
+                                "updateCells": {
+                                    "range": {
+                                        "sheetId": worksheet.id,
+                                        "startRowIndex": row_idx - 1,
+                                        "endRowIndex": row_idx,
+                                        "startColumnIndex": 0,
+                                        "endColumnIndex": 1
+                                    },
+                                    "rows": [{
+                                        "values": [{
+                                            "userEnteredValue": {
+                                                "boolValue": False
+                                            }
+                                        }]
+                                    }],
+                                    "fields": "userEnteredValue"
+                                }
+                            })
+                        elif val_clean in ("TRUE", "'TRUE", "TRUE "):
+                            reqs.append({
+                                "updateCells": {
+                                    "range": {
+                                        "sheetId": worksheet.id,
+                                        "startRowIndex": row_idx - 1,
+                                        "endRowIndex": row_idx,
+                                        "startColumnIndex": 0,
+                                        "endColumnIndex": 1
+                                    },
+                                    "rows": [{
+                                        "values": [{
+                                            "userEnteredValue": {
+                                                "boolValue": True
+                                            }
+                                        }]
+                                    }],
+                                    "fields": "userEnteredValue"
+                                }
+                            })
 
-        if reqs:
-            spreadsheet.batch_update({"requests": reqs})
+            if reqs:
+                spreadsheet.batch_update({"requests": reqs})
 
-        return cleaned_count
+            results[ws_name] = cleaned_count
+            
+        return results
+
+    def add_published_reviews(self, sheet_id: str, rows_data: List[List[Any]]):
+        """
+        Adds multiple published reviews to Reseñas publicadas, reusing empty/false rows if they exist,
+        otherwise appending them.
+        """
+        if not rows_data:
+            return
+            
+        client = self.get_client()
+        spreadsheet = client.open_by_key(sheet_id)
+        worksheet = spreadsheet.worksheet("Reseñas publicadas")
+        
+        # Read existing records to find empty/false row indices
+        records = worksheet.get_all_records()
+        
+        # Find all row indices that are not real (1-based, headers is row 1)
+        empty_row_indices = []
+        for idx, row in enumerate(records):
+            if not self.is_row_real(row):
+                empty_row_indices.append(idx + 2)
+                
+        # We will write to these empty row indices first
+        # Any remaining rows in rows_data will be appended
+        rows_to_append = []
+        batch_data = []
+        empty_idx_cursor = 0
+        
+        for row_val in rows_data:
+            if empty_idx_cursor < len(empty_row_indices):
+                target_row = empty_row_indices[empty_idx_cursor]
+                empty_idx_cursor += 1
+                batch_data.append({
+                    "range": f"'Reseñas publicadas'!A{target_row}",
+                    "values": [row_val]
+                })
+            else:
+                rows_to_append.append(row_val)
+                
+        if batch_data:
+            spreadsheet.values_batch_update({
+                "valueInputOption": "USER_ENTERED",
+                "data": batch_data
+            })
+            
+        if rows_to_append:
+            worksheet.append_rows(rows_to_append, value_input_option="USER_ENTERED")
 
     def cleanup_descartes(self, sheet_id: str, max_rows: int = 1000, retention_days: int = 30) -> Dict[str, Any]:
         """

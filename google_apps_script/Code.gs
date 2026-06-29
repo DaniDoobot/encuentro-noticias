@@ -592,9 +592,19 @@ function cleanupEmptyPublicationRows() {
     if (resCode >= 200 && resCode < 300) {
       var data = JSON.parse(resText);
       var msg = data.message || "Limpieza completada.";
-      var cleaned = data.cleaned_rows || 0;
       
-      SpreadsheetApp.getUi().alert("Limpieza de filas vacías completada.\n" + msg + "\n\nDetalle:\n- Filas limpiadas: " + cleaned);
+      var detailStr = "";
+      if (data.cleaned_details) {
+        detailStr = "\n\nDetalle por pestaña:\n";
+        for (var key in data.cleaned_details) {
+          detailStr += "- " + key + ": " + data.cleaned_details[key] + " filas limpiadas\n";
+        }
+      } else {
+        var cleaned = data.cleaned_rows || 0;
+        detailStr = "\n\nDetalle:\n- Filas limpiadas: " + cleaned;
+      }
+      
+      SpreadsheetApp.getUi().alert("Limpieza de filas vacías completada.\n" + msg + detailStr);
     } else {
       SpreadsheetApp.getUi().alert("Error al limpiar filas vacías (HTTP " + resCode + "):\n" + resText);
     }
