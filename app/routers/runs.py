@@ -102,7 +102,12 @@ def get_run(run_id: str):
         books_failed=status_data["books_failed"],
         books_no_results=status_data["books_no_results"],
         message=status_data["message"],
-        logs=status_data["logs"]
+        logs=status_data["logs"],
+        books_details=status_data.get("books_details"),
+        books_rows_read=status_data.get("books_rows_read"),
+        books_pending_detected=status_data.get("books_pending_detected"),
+        books_skipped_missing_title=status_data.get("books_skipped_missing_title"),
+        books_skipped_non_pending_status=status_data.get("books_skipped_non_pending_status")
     )
 
 @router.post("/dedupe/rebuild", response_model=DedupeRebuildResponse)

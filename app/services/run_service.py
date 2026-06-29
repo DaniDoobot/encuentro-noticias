@@ -34,6 +34,10 @@ class RunService:
             "books_completed": 0,
             "books_failed": 0,
             "books_no_results": 0,
+            "books_rows_read": 0,
+            "books_pending_detected": 0,
+            "books_skipped_missing_title": 0,
+            "books_skipped_non_pending_status": 0,
             "message": "Iniciando ejecución...",
             "logs": [],
             "books_details": []
@@ -127,10 +131,37 @@ class RunService:
             self._add_in_memory_log(run_id, "INFO", "CONFIG_LOADED", f"Configuraciones leídas: Max libros={max_books}, Min score={min_score}, Dominios específicos={len(review_domains)}")
             
             # 2. Get pending books
-            pending_books = sheets_service.get_pending_books(sheet_id, limit=max_books)
+            books_result = sheets_service.get_pending_books(sheet_id, limit=max_books)
+            pending_books = books_result["books"]
+            books_rows_read = books_result["books_rows_read"]
+            books_pending_detected = books_result["books_pending_detected"]
+            books_skipped_missing_title = books_result["books_skipped_missing_title"]
+            books_skipped_non_pending_status = books_result["books_skipped_non_pending_status"]
+
+            current_runs[run_id]["books_rows_read"] = books_rows_read
+            current_runs[run_id]["books_pending_detected"] = books_pending_detected
+            current_runs[run_id]["books_skipped_missing_title"] = books_skipped_missing_title
+            current_runs[run_id]["books_skipped_non_pending_status"] = books_skipped_non_pending_status
+
             total_books = len(pending_books)
             current_runs[run_id]["books_total"] = total_books
-            
+
+            detection_summary = (
+                f"Detección libros pendientes: leidas={books_rows_read}, "
+                f"pendientes={books_pending_detected}, "
+                f"omitidas_sin_título={books_skipped_missing_title}, "
+                f"omitidas_estado={books_skipped_non_pending_status}"
+            )
+            logger_service.log("INFO", "BOOKS_DETECTION_SUMMARY", f"{log_prefix}{detection_summary}", sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "INFO", "BOOKS_DETECTION_SUMMARY", detection_summary)
+
+            if books_skipped_missing_title > 0:
+                logger_service.log(
+                    "WARNING", "BOOK_ROW_SKIPPED_MISSING_TITLE",
+                    f"{log_prefix}{books_skipped_missing_title} fila(s) omitidas por falta de título.",
+                    sheet_id=sheet_id, run_id=run_id
+                )
+
             if total_books == 0:
                 msg = "No se encontraron libros con estado 'pendiente' en la pestaña 'Libros'."
                 current_runs[run_id]["status"] = "completed"
@@ -152,6 +183,20 @@ class RunService:
                 title = book["title"]
                 author = book["author"]
                 row_index = book["row_index"]
+
+                # Log acceptance with available fields
+                if not isbn and not author:
+                    self._add_in_memory_log(run_id, "INFO", "BOOK_ROW_ACCEPTED_PENDING_WITHOUT_ISBN",
+                        f"{log_prefix}Libro aceptado sin ISBN ni autor: '{title}'", isbn="")
+                    logger_service.log("INFO", "BOOK_ROW_ACCEPTED_PENDING_WITHOUT_ISBN",
+                        f"{log_prefix}Libro aceptado solo con título: '{title}'",
+                        isbn="", sheet_id=sheet_id, run_id=run_id)
+                elif not isbn:
+                    self._add_in_memory_log(run_id, "INFO", "BOOK_ROW_ACCEPTED_PENDING_WITHOUT_ISBN",
+                        f"{log_prefix}Libro aceptado sin ISBN: '{title}' por {author}", isbn="")
+                    logger_service.log("INFO", "BOOK_ROW_ACCEPTED_PENDING_WITHOUT_ISBN",
+                        f"{log_prefix}Libro aceptado sin ISBN: '{title}' por {author}",
+                        isbn="", sheet_id=sheet_id, run_id=run_id)
 
                 try:
                     final_status = self._process_book(

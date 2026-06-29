@@ -410,6 +410,10 @@ class SheetsService:
             {"Clave": "DEFAULT_INCLUDE_UNKNOWN_DATES", "Valor": settings.DEFAULT_INCLUDE_UNKNOWN_DATES, "Descripción": "Incluir artículos sin fecha de publicación detectada por defecto (true/false)"},
             {"Clave": "DEFAULT_DATE_MIN", "Valor": settings.DEFAULT_DATE_MIN or "", "Descripción": "Fecha de publicación mínima por defecto (YYYY-MM-DD)"},
             {"Clave": "DEFAULT_DATE_MAX", "Valor": settings.DEFAULT_DATE_MAX or "", "Descripción": "Fecha de publicación máxima por defecto (YYYY-MM-DD)"},
+            {"Clave": "MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH", "Valor": settings.MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH, "Descripción": "Mínimo de candidatos requeridos antes de activar la búsqueda interna profunda"},
+            {"Clave": "MIN_CANDIDATES_BEFORE_AI", "Valor": settings.MIN_CANDIDATES_BEFORE_AI, "Descripción": "Mínimo de candidatos requeridos para ejecutar el análisis IA de OpenAI"},
+            {"Clave": "ENABLE_CASCADE_SEARCH", "Valor": settings.ENABLE_CASCADE_SEARCH, "Descripción": "Activar búsqueda en cascada (Domain Index -> RSS -> Búsqueda Interna)"},
+            {"Clave": "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", "Valor": settings.ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS, "Descripción": "Activar búsqueda interna si el total de candidatos es bajo"},
             {"Clave": "BACKEND_BASE_URL", "Valor": "http://127.0.0.1:8000", "Descripción": "URL base del backend para Apps Script"},
             {"Clave": "ADMIN_TOKEN", "Valor": settings.ADMIN_TOKEN or "secret_admin_token", "Descripción": "Token de administración secreto para Apps Script (cabecera X-Admin-Token)"},
             {"Clave": "WORDPRESS_BASE_URL", "Valor": settings.WORDPRESS_BASE_URL or "", "Descripción": "URL base de WordPress (ej. https://miweb.com)"},
@@ -506,6 +510,10 @@ class SheetsService:
                 "DEFAULT_INCLUDE_UNKNOWN_DATES": parse_bool(config_dict.get("DEFAULT_INCLUDE_UNKNOWN_DATES"), settings.DEFAULT_INCLUDE_UNKNOWN_DATES),
                 "DEFAULT_DATE_MIN": parse_str(config_dict.get("DEFAULT_DATE_MIN"), settings.DEFAULT_DATE_MIN or ""),
                 "DEFAULT_DATE_MAX": parse_str(config_dict.get("DEFAULT_DATE_MAX"), settings.DEFAULT_DATE_MAX or ""),
+                "MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH": parse_int(config_dict.get("MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH"), settings.MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH),
+                "MIN_CANDIDATES_BEFORE_AI": parse_int(config_dict.get("MIN_CANDIDATES_BEFORE_AI"), settings.MIN_CANDIDATES_BEFORE_AI),
+                "ENABLE_CASCADE_SEARCH": parse_bool(config_dict.get("ENABLE_CASCADE_SEARCH"), settings.ENABLE_CASCADE_SEARCH),
+                "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS": parse_bool(config_dict.get("ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS"), settings.ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS),
             }
         except Exception:
             # Fallback to local configs if sheet configs fail to read
@@ -547,37 +555,76 @@ class SheetsService:
                 "DEFAULT_INCLUDE_UNKNOWN_DATES": settings.DEFAULT_INCLUDE_UNKNOWN_DATES,
                 "DEFAULT_DATE_MIN": settings.DEFAULT_DATE_MIN or "",
                 "DEFAULT_DATE_MAX": settings.DEFAULT_DATE_MAX or "",
+                "MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH": settings.MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH,
+                "MIN_CANDIDATES_BEFORE_AI": settings.MIN_CANDIDATES_BEFORE_AI,
+                "ENABLE_CASCADE_SEARCH": settings.ENABLE_CASCADE_SEARCH,
+                "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS": settings.ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS,
             }
 
-    def get_pending_books(self, sheet_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+    def get_pending_books(
+        self,
+        sheet_id: str,
+        limit: int = 10
+    ) -> Dict[str, Any]:
         """
-        Reads Libros tab. Treats a row as pending if it has ISBN, title, and author,
-        and its status is empty or 'pendiente'.
+        Reads Libros tab. A row is pending if it has a non-empty title
+        and its status is empty or 'pendiente'. ISBN and author are optional.
+
+        Returns a dict with:
+          - 'books': list of pending book dicts
+          - 'books_rows_read': total rows read
+          - 'books_pending_detected': rows accepted as pending
+          - 'books_skipped_missing_title': rows skipped due to missing title
+          - 'books_skipped_non_pending_status': rows skipped because status ≠ pendiente
         """
         client = self.get_client()
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.worksheet("Libros")
         records = worksheet.get_all_records()
-        
+
         pending_books = []
-        for index, row in enumerate(records, start=2): # Headers are row 1, records start at row 2
+        rows_read = 0
+        skipped_missing_title = 0
+        skipped_non_pending = 0
+
+        for index, row in enumerate(records, start=2):  # Headers are row 1
             isbn = str(row.get("ISBN", "")).strip()
             title = str(row.get("Título del libro", "")).strip()
             author = str(row.get("Autor del libro", "")).strip()
             status = str(row.get("Estado", "")).strip().lower()
 
-            if isbn and title and author:
-                if status in ("", "pendiente", "none"):
-                    pending_books.append({
-                        "row_index": index,
-                        "isbn": isbn,
-                        "title": title,
-                        "author": author,
-                        "status": "pendiente"
-                    })
-                    if len(pending_books) >= limit:
-                        break
-        return pending_books
+            # Skip fully empty rows
+            if not isbn and not title and not author and not status:
+                continue
+
+            rows_read += 1
+
+            if not title:
+                skipped_missing_title += 1
+                continue
+
+            if status not in ("", "pendiente", "none"):
+                skipped_non_pending += 1
+                continue
+
+            pending_books.append({
+                "row_index": index,
+                "isbn": isbn,
+                "title": title,
+                "author": author,
+                "status": "pendiente"
+            })
+
+            if len(pending_books) >= limit:
+                break
+
+        return {
+            "books": pending_books,
+            "books_rows_read": rows_read,
+            "books_pending_detected": len(pending_books),
+            "books_skipped_missing_title": skipped_missing_title,
+            "books_skipped_non_pending_status": skipped_non_pending
+        }
 
     def get_book_by_isbn(self, sheet_id: str, isbn: str) -> Optional[Dict[str, Any]]:
         """

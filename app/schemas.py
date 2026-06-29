@@ -44,6 +44,11 @@ class RunStatusResponse(BaseModel):
     books_no_results: int
     message: str
     logs: List[Dict[str, Any]]
+    books_details: Optional[List[Dict[str, Any]]] = None
+    books_rows_read: Optional[int] = None
+    books_pending_detected: Optional[int] = None
+    books_skipped_missing_title: Optional[int] = None
+    books_skipped_non_pending_status: Optional[int] = None
 
 class BooksStatusResponse(BaseModel):
     pendiente: int
