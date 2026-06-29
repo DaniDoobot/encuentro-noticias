@@ -131,14 +131,24 @@ class WordPressPublisher:
         checks.append(c3)
         checks_dict[c3["name"]] = c3
 
-        # 4. GET {WORDPRESS_BASE_URL}/wp-json/wp/v2/types (Authenticated types check)
-        c4 = perform_check("authenticated_types", f"{url_clean}/wp-json/wp/v2/types", use_auth=True)
+        # 4. GET {WORDPRESS_BASE_URL}/wp-json/wp/v2/posts?per_page=1&context=edit (Authenticated posts context=edit)
+        c4 = perform_check("authenticated_posts_edit_context", f"{url_clean}/wp-json/wp/v2/posts?per_page=1&context=edit", use_auth=True)
         checks.append(c4)
         checks_dict[c4["name"]] = c4
 
+        # 5. GET {WORDPRESS_BASE_URL}/wp-json/wp/v2/types?context=edit (Authenticated types context=edit)
+        c5 = perform_check("authenticated_types_edit_context", f"{url_clean}/wp-json/wp/v2/types?context=edit", use_auth=True)
+        checks.append(c5)
+        checks_dict[c5["name"]] = c5
+
         # Deduce status
-        authenticated = checks_dict.get("authenticated_user", {}).get("ok", False)
-        can_publish = authenticated and checks_dict.get("authenticated_types", {}).get("ok", False)
+        users_me_ok = checks_dict.get("authenticated_user", {}).get("ok", False)
+        posts_edit_ok = checks_dict.get("authenticated_posts_edit_context", {}).get("ok", False)
+        types_edit_ok = checks_dict.get("authenticated_types_edit_context", {}).get("ok", False)
+
+        users_me_blocked = (not users_me_ok) and posts_edit_ok
+        authenticated = posts_edit_ok
+        can_publish = posts_edit_ok and types_edit_ok
 
         likely_problem = "none"
         if not url:
@@ -148,13 +158,19 @@ class WordPressPublisher:
             # If all checks failed to connect or returned 404
             if all(sc is None or sc == 404 for sc in status_codes):
                 likely_problem = "wrong_base_url"
-            # If REST API is blocked or returned WAF/403
+            # If public REST API failed
             elif not checks_dict.get("public_rest_api", {}).get("ok", False) and any(sc in (403, 401, 503) for sc in status_codes[:2]):
                 likely_problem = "rest_api_blocked_or_waf"
-            # If REST API is working but credentials fail
+            # If public posts failed
+            elif not checks_dict.get("public_posts", {}).get("ok", False):
+                likely_problem = "public_posts_blocked"
+            # If authenticated posts edit context failed
             elif not authenticated:
                 likely_problem = "invalid_credentials"
-            # If authenticated but permissions fail
+            # If authenticated works but users/me is blocked
+            elif users_me_blocked:
+                likely_problem = "users_endpoint_blocked_but_auth_ok"
+            # If types edit context failed
             elif not can_publish:
                 likely_problem = "insufficient_permissions"
 
@@ -166,6 +182,7 @@ class WordPressPublisher:
             "wordpress_base_url": url,
             "wordpress_username_masked": masked_user,
             "checks": checks,
+            "users_me_blocked": users_me_blocked,
             "authenticated": authenticated,
             "can_publish": can_publish,
             "likely_problem": likely_problem,
