@@ -202,8 +202,13 @@ class WordPressPublisher:
         pub_date = review.get("Fecha de publicación", "")
         content_type = review.get("Tipo de contenido", "reseña")
         
-        # Build HTML content
-        post_title = f"Reseña: {title_book} - {author_book}"
+        post_title = (
+            review.get("Título para Web")
+            or review.get("Título del libro")
+            or review.get("Título del libro detectado por IA")
+            or review.get("Título del artículo")
+            or "Reseña"
+        ).strip()
         
         post_content = f"""<p><strong>Libro:</strong> {title_book}</p>
 <p><strong>Autor del libro:</strong> {author_book}</p>
