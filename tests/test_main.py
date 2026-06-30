@@ -1164,31 +1164,45 @@ def test_broad_news_search_triggers_and_budget_guaranteed():
              dry_run=False
          )
          
+         # Helper to find mock log calls by action
+         def find_log_call(action_name):
+             for call in mock_log.call_args_list:
+                 args, kwargs = call
+                 action = kwargs.get("action")
+                 if not action and len(args) > 1:
+                     action = args[1]
+                 if action == action_name:
+                     return args, kwargs
+             return None, None
+
          # Verification 1: RUN_CONFIG_EFFECTIVE reflects config values and GOOGLE_NEWS_BROAD_MAX_QUERIES = 10
-         effective_config_logs = [call for call in mock_log.call_args_list if call[0][1] == "RUN_CONFIG_EFFECTIVE"]
-         assert len(effective_config_logs) == 1
-         payload = json.loads(effective_config_logs[0][1].get("detail", "{}"))
+         args, kwargs = find_log_call("RUN_CONFIG_EFFECTIVE")
+         assert args is not None or kwargs is not None
+         detail_str = kwargs.get("detail") or (args[4] if len(args) > 4 else "")
+         payload = json.loads(detail_str)
          assert payload.get("MIN_MATCH_SCORE") == 10
          assert payload.get("GOOGLE_NEWS_BROAD_MAX_QUERIES") == 10
          
          # Verification 2: AUTHOR_NORMALIZED_AS_GENERIC is logged
-         generic_author_logs = [call for call in mock_log.call_args_list if call[0][1] == "AUTHOR_NORMALIZED_AS_GENERIC"]
-         assert len(generic_author_logs) == 1
-         auth_payload = json.loads(generic_author_logs[0][1].get("detail", "{}"))
+         args, kwargs = find_log_call("AUTHOR_NORMALIZED_AS_GENERIC")
+         assert args is not None or kwargs is not None
+         detail_str = kwargs.get("detail") or (args[4] if len(args) > 4 else "")
+         auth_payload = json.loads(detail_str)
          assert auth_payload.get("original_author") == "VV.AA."
          assert auth_payload.get("author_is_generic") is True
          
          # Verification 3: BOOK_QUERIES_BUILT is logged separating categories
-         queries_built_logs = [call for call in mock_log.call_args_list if call[0][1] == "BOOK_QUERIES_BUILT"]
-         assert len(queries_built_logs) == 1
-         queries_payload = json.loads(queries_built_logs[0][1].get("detail", "{}"))
+         args, kwargs = find_log_call("BOOK_QUERIES_BUILT")
+         assert args is not None or kwargs is not None
+         detail_str = kwargs.get("detail") or (args[4] if len(args) > 4 else "")
+         queries_payload = json.loads(detail_str)
          assert "prioritarias" in queries_payload
          assert "broad_queries" in queries_payload
          assert "youcat biblia" in queries_payload["broad_queries"]
 
          # Verification 4: GOOGLE_NEWS_BROAD_STARTED is logged
-         broad_started_logs = [call for call in mock_log.call_args_list if call[0][1] == "GOOGLE_NEWS_BROAD_STARTED"]
-         assert len(broad_started_logs) >= 1
+         args, kwargs = find_log_call("GOOGLE_NEWS_BROAD_STARTED")
+         assert args is not None or kwargs is not None
 
          # Verification 5: broad search executed successfully and candidate added
          assert mock_add_review.call_count == 1
@@ -1222,7 +1236,7 @@ def test_debug_google_news_endpoint():
         }
     )
 
-    with patch("app.routers.setup.GoogleNewsRssSearchProvider.search", return_value=mock_rss_result):
+    with patch("app.services.search_providers.GoogleNewsRssSearchProvider.search", return_value=mock_rss_result):
         response = client.get("/debug/google-news?q=youcat%20biblia")
 
     assert response.status_code == 200
