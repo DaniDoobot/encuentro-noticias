@@ -60,3 +60,27 @@ def post_descartes_cleanup():
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to cleanup descartes: {str(e)}"
         )
+
+class DeleteAllDescartesResponse(BaseModel):
+    success: bool
+    message: str
+    deleted_count: int
+
+@router.post("/descartes/delete-all", response_model=DeleteAllDescartesResponse)
+def post_descartes_delete_all():
+    """
+    Deletes all descartes entries in the 'Descartes' worksheet of Google Sheets.
+    """
+    sheet_id = settings.GOOGLE_SHEET_ID
+    try:
+        res = sheets_service.clear_all_rows(sheet_id, "Descartes")
+        return DeleteAllDescartesResponse(
+            success=True,
+            message="Todos los descartes fueron eliminados correctamente.",
+            deleted_count=res.get("deleted_count", 0)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete all descartes: {str(e)}"
+        )

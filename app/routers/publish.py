@@ -1,13 +1,15 @@
 import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 import gspread
+import threading
+import uuid
 
 from app.config import settings
 from app.dependencies import verify_admin_token
-from app.services.sheets_service import sheets_service
+from app.services.sheets_service import sheets_service, get_now_madrid_str
 from app.services.wordpress_publisher import wordpress_publisher
 from app.services.logger_service import logger_service
 
@@ -30,8 +32,13 @@ def is_row_real(row: dict) -> bool:
 
 router = APIRouter(dependencies=[Depends(verify_admin_token)])
 
+# In-memory publication runs
+current_publications: Dict[str, Dict[str, Any]] = {}
+cancelled_publications: Set[str] = set()
+
 class PublishReviewsRequest(BaseModel):
     dry_run: bool = True
+    background: bool = False
 
 class PublishReviewsResponse(BaseModel):
     success: bool
@@ -48,22 +55,9 @@ class PublishReviewsResponse(BaseModel):
     errors_count: int
     dry_run: bool
     debug_examples: List[str]
+    publish_id: Optional[str] = None
 
-@router.post("/publish/reviews", response_model=PublishReviewsResponse)
-def post_publish_reviews(req: PublishReviewsRequest):
-    """
-    Reads marked reviews from 'Reseñas por publicar', publishes them,
-    and moves successfully published ones to 'Reseñas publicadas'.
-    """
-    sheet_id = settings.GOOGLE_SHEET_ID
-    dry_run = req.dry_run
-    
-    try:
-        config = sheets_service.get_config_dict(sheet_id)
-    except Exception as e_cfg:
-        logger.error(f"Error reading config for publication: {e_cfg}")
-        config = {}
-
+def execute_publication_sync(publish_id: Optional[str], sheet_id: str, dry_run: bool) -> PublishReviewsResponse:
     try:
         client = sheets_service.get_client()
         spreadsheet = client.open_by_key(sheet_id)
@@ -99,11 +93,22 @@ def post_publish_reviews(req: PublishReviewsRequest):
     rows_to_append_pub: List[List[Any]] = []
     cells_to_update: List[gspread.Cell] = []
     
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_str = get_now_madrid_str()
     
+    try:
+        config = sheets_service.get_config_dict(sheet_id)
+    except Exception as e_cfg:
+        logger.error(f"Error reading config for publication: {e_cfg}")
+        config = {}
+
     for idx, row in enumerate(records):
         row_idx = idx + 2  # 1-indexed, headers is row 1
         
+        # Check cancellation
+        if publish_id and publish_id in cancelled_publications:
+            logger.info(f"Proceso de publicación {publish_id} cancelado cooperativamente.")
+            break
+
         # Skip empty rows
         if not is_row_real(row):
             skipped_empty_rows += 1
@@ -247,6 +252,9 @@ def post_publish_reviews(req: PublishReviewsRequest):
 
     # Log action
     summary_msg = f"Publicación finalizada. Publicadas: {published_count}, Errores: {errors_count}, No marcadas: {unselected_count}."
+    if publish_id and publish_id in cancelled_publications:
+        summary_msg = f"Publicación cancelada por el usuario. Publicadas antes de cancelar: {published_count}, Errores: {errors_count}."
+
     logger_service.log(
         level="INFO",
         action="PUBLISH_REVIEWS",
@@ -256,14 +264,15 @@ def post_publish_reviews(req: PublishReviewsRequest):
             "dry_run": dry_run,
             "published": published_count,
             "errors": errors_count,
-            "unselected": unselected_count
+            "unselected": unselected_count,
+            "cancelled": bool(publish_id and publish_id in cancelled_publications)
         }
     )
     logger_service.flush_log_batch(sheet_id)
 
     return PublishReviewsResponse(
         success=True,
-        message="Simulación completada en dry_run." if dry_run else "Proceso de publicación completado con éxito.",
+        message="Simulación completada en dry_run." if dry_run else ("Publicación cancelada por el usuario." if publish_id and publish_id in cancelled_publications else "Proceso de publicación completado con éxito."),
         sheet_id=sheet_id,
         worksheet_name="Reseñas por publicar",
         total_rows_read=total_rows_read,
@@ -275,8 +284,103 @@ def post_publish_reviews(req: PublishReviewsRequest):
         published_count=published_count,
         errors_count=errors_count,
         dry_run=dry_run,
-        debug_examples=debug_examples
+        debug_examples=debug_examples,
+        publish_id=publish_id
     )
+
+def execute_publication_background(publish_id: str, sheet_id: str, dry_run: bool):
+    try:
+        res = execute_publication_sync(publish_id, sheet_id, dry_run)
+        if publish_id in cancelled_publications:
+            current_publications[publish_id]["status"] = "cancelled"
+            current_publications[publish_id]["message"] = "Publicación cancelada por el usuario."
+        else:
+            current_publications[publish_id]["status"] = "completed"
+            current_publications[publish_id]["message"] = "Publicación en segundo plano completada."
+        current_publications[publish_id]["published_count"] = res.published_count
+        current_publications[publish_id]["errors_count"] = res.errors_count
+        current_publications[publish_id]["details"] = res.model_dump()
+    except Exception as e:
+        logger.error(f"Error in background publication {publish_id}: {e}")
+        current_publications[publish_id]["status"] = "failed"
+        current_publications[publish_id]["message"] = f"Fallo en la publicación: {str(e)}"
+
+@router.post("/publish/reviews", response_model=PublishReviewsResponse)
+def post_publish_reviews(req: PublishReviewsRequest):
+    """
+    Reads marked reviews from 'Reseñas por publicar', publishes them,
+    and moves successfully published ones to 'Reseñas publicadas'.
+    Supports optional background execution if background = true in payload.
+    """
+    sheet_id = settings.GOOGLE_SHEET_ID
+    dry_run = req.dry_run
+    
+    if req.background:
+        publish_id = f"pub_{uuid.uuid4().hex[:8]}"
+        current_publications[publish_id] = {
+            "status": "running",
+            "published_count": 0,
+            "errors_count": 0,
+            "message": "Iniciando proceso de publicación en segundo plano...",
+            "details": None
+        }
+        thread = threading.Thread(
+            target=execute_publication_background,
+            args=(publish_id, sheet_id, dry_run)
+        )
+        thread.daemon = True
+        thread.start()
+        
+        return PublishReviewsResponse(
+            success=True,
+            message="Proceso de publicación iniciado en segundo plano.",
+            sheet_id=sheet_id,
+            worksheet_name="Reseñas por publicar",
+            total_rows_read=0,
+            non_empty_rows_detected=0,
+            selected_rows=0,
+            unselected_rows=0,
+            skipped_empty_rows=0,
+            skipped_already_published=0,
+            published_count=0,
+            errors_count=0,
+            dry_run=dry_run,
+            debug_examples=[],
+            publish_id=publish_id
+        )
+    else:
+        return execute_publication_sync(None, sheet_id, dry_run)
+
+class PublishStatusResponse(BaseModel):
+    publish_id: str
+    status: str
+    published_count: int
+    errors_count: int
+    message: str
+    details: Optional[Dict[str, Any]] = None
+
+@router.get("/publish/{publish_id}/status", response_model=PublishStatusResponse)
+def get_publish_status(publish_id: str):
+    if publish_id not in current_publications:
+        raise HTTPException(status_code=404, detail="Proceso de publicación no encontrado.")
+    pub = current_publications[publish_id]
+    return PublishStatusResponse(
+        publish_id=publish_id,
+        status=pub["status"],
+        published_count=pub["published_count"],
+        errors_count=pub["errors_count"],
+        message=pub["message"],
+        details=pub.get("details")
+    )
+
+@router.post("/publish/{publish_id}/cancel")
+def post_publish_cancel(publish_id: str):
+    if publish_id in current_publications:
+        cancelled_publications.add(publish_id)
+        current_publications[publish_id]["status"] = "cancelled"
+        current_publications[publish_id]["message"] = "Publicación cancelada por el usuario."
+        return {"success": True, "message": f"Publicación {publish_id} cancelada cooperativamente."}
+    return {"success": False, "message": f"Proceso de publicación '{publish_id}' no encontrado."}
 
 @router.post("/publish/test-wordpress")
 def post_publish_test_wordpress():

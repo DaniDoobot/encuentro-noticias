@@ -3,15 +3,17 @@ function onOpen() {
     .createMenu('Encuentro Noticias')
     .addItem('Lanzar búsqueda', 'launchSearch')
     .addItem('Consultar estado', 'checkRunStatus')
+    .addItem('Cancelar búsqueda', 'cancelSearch')
     .addSeparator()
     .addItem('Publicar reseñas', 'publishReviews')
     .addItem('Consultar publicación', 'checkPublishStatus')
+    .addItem('Cancelar publicación', 'cancelPublish')
     .addSeparator()
     .addItem('Indexar fuentes', 'indexSources')
     .addItem('Consultar indexación', 'checkIndexStatus')
     .addSeparator()
-    .addItem('Limpiar logs antiguos', 'cleanupLogs')
-    .addItem('Limpiar descartes antiguos', 'cleanupDescartes')
+    .addItem('Borrar logs', 'cleanupLogs')
+    .addItem('Borrar descartes', 'cleanupDescartes')
     .addItem('Limpiar filas vacías de publicación', 'cleanupEmptyPublicationRows')
     .addToUi();
 }
@@ -139,7 +141,7 @@ function launchSearch() {
       
       panelSheet.getRange("B8").setValue("running");
       panelSheet.getRange("B9").setValue(runId);
-      panelSheet.getRange("B10").setValue(new Date().toISOString().replace("T", " ").slice(0, 19));
+      panelSheet.getRange("B10").setValue(Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss"));
       panelSheet.getRange("B11").setValue("Búsqueda iniciada correctamente.");
       
       SpreadsheetApp.getUi().alert("Búsqueda iniciada correctamente.\nBúsqueda ID: " + runId + "\nPuede refrescar el estado usando el botón 'Consultar estado'.");
@@ -208,7 +210,7 @@ function checkRunStatus() {
       var msg = data.message || "";
       
       panelSheet.getRange("B8").setValue(status);
-      panelSheet.getRange("B10").setValue(new Date().toISOString().replace("T", " ").slice(0, 19));
+      panelSheet.getRange("B10").setValue(Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss"));
       panelSheet.getRange("B11").setValue("Procesados: " + processed + "/" + total + " — " + msg);
       
       SpreadsheetApp.getActiveSpreadsheet().toast("Estado de la búsqueda " + runId + " actualizado: " + status, "Encuentro Noticias", 5);
@@ -248,8 +250,10 @@ function publishReviews() {
     backendUrl = backendUrl.slice(0, -1);
   }
   
+  // Usar background = true para ejecución asíncrona
   var payload = {
-    "dry_run": dryRun !== false
+    "dry_run": dryRun !== false,
+    "background": true
   };
   
   var headers = {
@@ -268,22 +272,31 @@ function publishReviews() {
   
   try {
     panelSheet.getRange("B8").setValue("Publicando...");
+    panelSheet.getRange("B10").setValue(Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss"));
+    panelSheet.getRange("B11").setValue("Iniciando publicación...");
+    
     var response = UrlFetchApp.fetch(backendUrl + "/publish/reviews", options);
     var resCode = response.getResponseCode();
     var resText = response.getContentText();
     
     if (resCode >= 200 && resCode < 300) {
       var data = JSON.parse(resText);
-      var msg = data.message || "Publicación completada.";
-      var pubCount = data.published_count || 0;
-      var errCount = data.errors_count || 0;
-      var skipCount = data.unselected_count || 0;
+      var publishId = data.publish_id || "";
       
-      panelSheet.getRange("B8").setValue("completed");
-      panelSheet.getRange("B10").setValue(new Date().toISOString().replace("T", " ").slice(0, 19));
-      panelSheet.getRange("B11").setValue("Publicadas: " + pubCount + ", Errores: " + errCount + ", No marcadas: " + skipCount);
-      
-      SpreadsheetApp.getUi().alert("Publicación completada.\n" + msg + "\n\nResumen:\n- Publicadas: " + pubCount + "\n- Errores: " + errCount + "\n- No marcadas: " + skipCount);
+      if (publishId) {
+        PropertiesService.getScriptProperties().setProperty("LAST_PUBLISH_ID", publishId);
+        panelSheet.getRange("B9").setValue(publishId); // Guardar ID en B9 para check status
+        panelSheet.getRange("B11").setValue("Proceso de publicación iniciado en segundo plano. ID: " + publishId);
+        SpreadsheetApp.getUi().alert("Publicación iniciada correctamente.\nPublicación ID: " + publishId + "\nPuede refrescar el estado usando 'Consultar publicación'.");
+      } else {
+        var pubCount = data.published_count || 0;
+        var errCount = data.errors_count || 0;
+        var skipCount = data.unselected_count || 0;
+        
+        panelSheet.getRange("B8").setValue("completed");
+        panelSheet.getRange("B11").setValue("Publicadas: " + pubCount + ", Errores: " + errCount);
+        SpreadsheetApp.getUi().alert("Publicación completada (síncrona).\n- Publicadas: " + pubCount + "\n- Errores: " + errCount);
+      }
     } else {
       panelSheet.getRange("B8").setValue("error");
       panelSheet.getRange("B11").setValue("HTTP " + resCode + ": " + resText);
@@ -297,10 +310,200 @@ function publishReviews() {
 }
 
 /**
- * Consulta el estado de publicación (para complementar la interfaz).
+ * Consulta el estado de publicación en segundo plano usando LAST_PUBLISH_ID o el ID de B9.
  */
 function checkPublishStatus() {
-  SpreadsheetApp.getUi().alert("El proceso de publicación se ejecuta síncronamente y actualiza el panel al instante al terminar.");
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var panelSheet = ss.getSheetByName("Panel");
+  if (!panelSheet) {
+    SpreadsheetApp.getUi().alert("Error: No se encontró la pestaña 'Panel'.");
+    return;
+  }
+  
+  var publishId = PropertiesService.getScriptProperties().getProperty("LAST_PUBLISH_ID");
+  var cellVal = panelSheet.getRange("B9").getValue().toString().trim();
+  if (cellVal.indexOf("pub_") === 0) {
+    publishId = cellVal;
+  }
+  
+  if (!publishId) {
+    SpreadsheetApp.getUi().alert("Error: No hay ningún ID de publicación registrado.");
+    return;
+  }
+  
+  var backendUrl = getConfigValue("BACKEND_BASE_URL");
+  var adminToken = getConfigValue("ADMIN_TOKEN");
+  
+  if (!backendUrl) {
+    SpreadsheetApp.getUi().alert("Error: Configure 'BACKEND_BASE_URL' en la pestaña 'Config'.");
+    return;
+  }
+  
+  if (backendUrl.slice(-1) === "/") {
+    backendUrl = backendUrl.slice(0, -1);
+  }
+  
+  var headers = {};
+  if (adminToken) {
+    headers["X-Admin-Token"] = adminToken;
+  }
+  
+  var options = {
+    "method": "get",
+    "headers": headers,
+    "muteHttpExceptions": true
+  };
+  
+  try {
+    var response = UrlFetchApp.fetch(backendUrl + "/publish/" + publishId + "/status", options);
+    var resCode = response.getResponseCode();
+    var resText = response.getContentText();
+    
+    if (resCode === 200) {
+      var data = JSON.parse(resText);
+      var status = data.status || "unknown";
+      var pubCount = data.published_count || 0;
+      var errCount = data.errors_count || 0;
+      var msg = data.message || "";
+      
+      panelSheet.getRange("B8").setValue(status);
+      panelSheet.getRange("B10").setValue(Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss"));
+      
+      var progressMsg = "Publicadas: " + pubCount + ", Errores: " + errCount + " — " + msg;
+      panelSheet.getRange("B11").setValue(progressMsg);
+      
+      if (status === "completed" || status === "cancelled" || status === "failed") {
+        SpreadsheetApp.getUi().alert("Proceso de publicación finalizado.\nEstado: " + status + "\n" + progressMsg);
+      } else {
+        SpreadsheetApp.getActiveSpreadsheet().toast("Estado de publicación: " + status + " (" + pubCount + " publicadas)", "Info", 4);
+      }
+    } else {
+      SpreadsheetApp.getUi().alert("Error al consultar publicación (HTTP " + resCode + "):\n" + resText);
+    }
+  } catch (e) {
+    SpreadsheetApp.getUi().alert("Error de conexión:\n" + e.toString());
+  }
+}
+
+/**
+ * Envía una solicitud al backend para cancelar la búsqueda activa en B9.
+ */
+function cancelSearch() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var panelSheet = ss.getSheetByName("Panel");
+  if (!panelSheet) {
+    SpreadsheetApp.getUi().alert("Error: No se encontró la pestaña 'Panel'.");
+    return;
+  }
+  
+  var runId = panelSheet.getRange("B9").getValue().toString().trim();
+  if (!runId || runId.indexOf("run_") !== 0) {
+    SpreadsheetApp.getUi().alert("Error: No hay ningún ID de búsqueda activo en B9 para cancelar.");
+    return;
+  }
+  
+  var backendUrl = getConfigValue("BACKEND_BASE_URL");
+  var adminToken = getConfigValue("ADMIN_TOKEN");
+  
+  if (!backendUrl) {
+    SpreadsheetApp.getUi().alert("Error: Configure 'BACKEND_BASE_URL' en la pestaña 'Config'.");
+    return;
+  }
+  
+  if (backendUrl.slice(-1) === "/") {
+    backendUrl = backendUrl.slice(0, -1);
+  }
+  
+  var headers = {};
+  if (adminToken) {
+    headers["X-Admin-Token"] = adminToken;
+  }
+  
+  var options = {
+    "method": "post",
+    "headers": headers,
+    "muteHttpExceptions": true
+  };
+  
+  try {
+    var response = UrlFetchApp.fetch(backendUrl + "/runs/" + runId + "/cancel", options);
+    var resCode = response.getResponseCode();
+    var resText = response.getContentText();
+    
+    if (resCode >= 200 && resCode < 300) {
+      panelSheet.getRange("B8").setValue("cancelled");
+      panelSheet.getRange("B10").setValue(Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss"));
+      panelSheet.getRange("B11").setValue("Búsqueda cancelada.");
+      SpreadsheetApp.getUi().alert("La solicitud de cancelación de la búsqueda fue enviada al backend correctamente.");
+    } else {
+      SpreadsheetApp.getUi().alert("Error al cancelar la búsqueda (HTTP " + resCode + "):\n" + resText);
+    }
+  } catch (e) {
+    SpreadsheetApp.getUi().alert("Error de conexión:\n" + e.toString());
+  }
+}
+
+/**
+ * Envía una solicitud al backend para cancelar la publicación activa.
+ */
+function cancelPublish() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var panelSheet = ss.getSheetByName("Panel");
+  if (!panelSheet) {
+    SpreadsheetApp.getUi().alert("Error: No se encontró la pestaña 'Panel'.");
+    return;
+  }
+  
+  var publishId = PropertiesService.getScriptProperties().getProperty("LAST_PUBLISH_ID");
+  var cellVal = panelSheet.getRange("B9").getValue().toString().trim();
+  if (cellVal.indexOf("pub_") === 0) {
+    publishId = cellVal;
+  }
+  
+  if (!publishId) {
+    SpreadsheetApp.getUi().alert("Error: No hay ningún ID de publicación activo para cancelar.");
+    return;
+  }
+  
+  var backendUrl = getConfigValue("BACKEND_BASE_URL");
+  var adminToken = getConfigValue("ADMIN_TOKEN");
+  
+  if (!backendUrl) {
+    SpreadsheetApp.getUi().alert("Error: Configure 'BACKEND_BASE_URL' en la pestaña 'Config'.");
+    return;
+  }
+  
+  if (backendUrl.slice(-1) === "/") {
+    backendUrl = backendUrl.slice(0, -1);
+  }
+  
+  var headers = {};
+  if (adminToken) {
+    headers["X-Admin-Token"] = adminToken;
+  }
+  
+  var options = {
+    "method": "post",
+    "headers": headers,
+    "muteHttpExceptions": true
+  };
+  
+  try {
+    var response = UrlFetchApp.fetch(backendUrl + "/publish/" + publishId + "/cancel", options);
+    var resCode = response.getResponseCode();
+    var resText = response.getContentText();
+    
+    if (resCode >= 200 && resCode < 300) {
+      panelSheet.getRange("B8").setValue("cancelled");
+      panelSheet.getRange("B10").setValue(Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss"));
+      panelSheet.getRange("B11").setValue("Publicación cancelada.");
+      SpreadsheetApp.getUi().alert("La solicitud de cancelación de la publicación fue enviada al backend correctamente.");
+    } else {
+      SpreadsheetApp.getUi().alert("Error al cancelar la publicación (HTTP " + resCode + "):\n" + resText);
+    }
+  } catch (e) {
+    SpreadsheetApp.getUi().alert("Error de conexión:\n" + e.toString());
+  }
 }
 
 /**
@@ -474,22 +677,21 @@ function cleanupLogs() {
   };
   
   try {
-    var response = UrlFetchApp.fetch(backendUrl + "/logs/cleanup", options);
+    var response = UrlFetchApp.fetch(backendUrl + "/logs/delete-all", options);
     var resCode = response.getResponseCode();
     var resText = response.getContentText();
     
     if (resCode >= 200 && resCode < 300) {
       var data = JSON.parse(resText);
-      var msg = data.message || "Limpieza completada.";
+      var msg = data.message || "Borrado de logs completado.";
       var deleted = data.deleted_count || 0;
-      var remaining = data.remaining_count || 0;
       
-      panelSheet.getRange("B10").setValue(new Date().toISOString().replace("T", " ").slice(0, 19));
-      panelSheet.getRange("B11").setValue("Logs limpiados: " + deleted + " eliminados, quedan: " + remaining);
+      panelSheet.getRange("B10").setValue(Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss"));
+      panelSheet.getRange("B11").setValue("Logs eliminados: " + deleted + " filas.");
       
-      SpreadsheetApp.getUi().alert("Limpieza de logs completada.\n" + msg + "\n\nDetalle:\n- Logs eliminados: " + deleted + "\n- Logs restantes: " + remaining);
+      SpreadsheetApp.getUi().alert("Borrado de logs completado.\n" + msg + "\n\nDetalle:\n- Filas eliminadas: " + deleted);
     } else {
-      SpreadsheetApp.getUi().alert("Error al limpiar logs (HTTP " + resCode + "):\n" + resText);
+      SpreadsheetApp.getUi().alert("Error al borrar logs (HTTP " + resCode + "):\n" + resText);
     }
   } catch (e) {
     SpreadsheetApp.getUi().alert("Error de conexión:\n" + e.toString());
@@ -531,19 +733,20 @@ function cleanupDescartes() {
   };
   
   try {
-    var response = UrlFetchApp.fetch(backendUrl + "/descartes/cleanup", options);
+    var response = UrlFetchApp.fetch(backendUrl + "/descartes/delete-all", options);
     var resCode = response.getResponseCode();
     var resText = response.getContentText();
     
     if (resCode >= 200 && resCode < 300) {
       var data = JSON.parse(resText);
-      var msg = data.message || "Limpieza completada.";
-      var deleted = data.deleted_rows || 0;
-      var remaining = data.remaining_rows || 0;
+      var msg = data.message || "Borrado de descartes completado.";
+      var deleted = data.deleted_count || 0;
       
-      SpreadsheetApp.getUi().alert("Limpieza de descartes completada.\n" + msg + "\n\nDetalle:\n- Descartes eliminados: " + deleted + "\n- Descartes restantes: " + remaining);
+      panelSheet.getRange("B10").setValue(Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss"));
+      panelSheet.getRange("B11").setValue("Descartes eliminados: " + deleted + " filas.");
+      SpreadsheetApp.getUi().alert("Borrado de descartes completado.\n" + msg + "\n\nDetalle:\n- Filas eliminadas: " + deleted);
     } else {
-      SpreadsheetApp.getUi().alert("Error al limpiar descartes (HTTP " + resCode + "):\n" + resText);
+      SpreadsheetApp.getUi().alert("Error al borrar descartes (HTTP " + resCode + "):\n" + resText);
     }
   } catch (e) {
     SpreadsheetApp.getUi().alert("Error de conexión:\n" + e.toString());

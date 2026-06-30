@@ -19,7 +19,7 @@ class BookValidationResult(BaseModel):
     publication_date: str = Field(description="Fecha de publicación detectada (en formato YYYY-MM-DD si es posible).")
     language: str = Field(description="Idioma original del artículo.")
     category: str = Field(description="Categoría a la que pertenece el artículo, debe ser exactamente una de: Cultura/Educación, Política, Economía, Historia, Religión, Sociedad, Ciencia, Tecnología, Literatura, Otros.")
-    summary: str = Field(description="Resumen periodístico en español de aproximadamente 120 palabras sobre lo que dice el artículo acerca del libro.")
+    summary: str = Field(description="Explicación en español de aproximadamente 120 palabras de dónde, cómo y qué se menciona en el artículo sobre el libro buscado, detallando su relevancia.")
 
 class OpenAIAnalyzer:
     def __init__(self):
@@ -64,24 +64,23 @@ class OpenAIAnalyzer:
         system_prompt = (
             "Eres un analista literario y periodista experto de habla hispana.\n"
             "Tu tarea es evaluar si un artículo web habla sobre un libro específico y extraer metadatos relevantes.\n\n"
-            "REGLAS CRÍTICAS DE VALIDACIÓN:\n"
-            "1. 'is_valid' solo puede ser true si el artículo trata sobre el libro concreto indicado (reseñas, críticas, noticias de lanzamiento, entrevistas al autor sobre este libro, o artículos donde el libro sea un tema principal o parte relevante).\n"
-            "2. Si el artículo solo menciona al autor pero NO al libro concreto, 'is_valid' DEBE ser false.\n"
-            "3. Si la mención del libro es trivial o ambigua (por ejemplo, solo aparece listado en un catálogo sin comentarios adicionales), 'is_valid' DEBE ser false.\n"
-            "4. Si la coincidencia del título es casual y trata realmente de otro tema o de otra obra homónima, 'is_valid' DEBE ser false.\n"
-            "5. El resumen ('summary') DEBE estar escrito en ESPAÑOL, con tono periodístico profesional y tener alrededor de 120 palabras. Si la fuente está en inglés u otro idioma, tradúcelo y resúmelo igualmente al español.\n"
-            "6. La categoría ('category') DEBE ser estrictamente una de las siguientes opciones:\n"
-            "   - Cultura/Educación\n"
-            "   - Política\n"
-            "   - Economía\n"
-            "   - Historia\n"
-            "   - Religión\n"
-            "   - Sociedad\n"
-            "   - Ciencia\n"
-            "   - Tecnología\n"
-            "   - Literatura\n"
-            "   - Otros\n"
-            "7. Los datos de 'ISBN' o 'Autor del libro' del libro buscado pueden estar en blanco o no disponibles. En ese caso, evalúa la coincidencia basándote únicamente en los campos que sí estén provistos (ej. solo el título, o título y autor). No penalices ni descartes la coincidencia únicamente por la ausencia de estos datos opcionales.\n"
+            "REGLAS CRÍTICAS DE VALIDACIÓN Y CRITERIOS FLEXIBLES:\n"
+            "1. 'is_valid' solo debe ser true si el artículo trata sobre el libro concreto indicado. Esto incluye reseñas completas, críticas, noticias de lanzamiento, entrevistas al autor sobre este libro, o artículos donde el libro sea un tema principal, parte relevante o se mencione de forma sustancial en el cuerpo.\n"
+            "2. NO exijas coincidencia literal del título del libro. Acepta variantes parciales, naturales o reordenadas si el artículo habla inequívocamente de la misma obra (ej. 'la nueva Biblia de YOUCAT' es una variante válida de 'YOUCAT Biblia'). El título del libro puede aparecer solo en el cuerpo del artículo y no en el título de la página.\n"
+            "3. Si el artículo solo menciona al autor pero NO al libro concreto, 'is_valid' DEBE ser false.\n"
+            "4. CUIDADO CON TÍTULOS GENÉRICOS: Para títulos muy genéricos o cortos (ej. 'Símbolos', 'Biblia', 'Diario', 'Introducción a los símbolos'), NO debes aceptar coincidencias parciales pobres. En estos casos, exige señales adicionales claras (coincidencia de autor, editorial, ISBN, subtítulo o contexto temático muy específico con múltiples menciones en el cuerpo) para validar la coincidencia.\n"
+            "5. Si la mención del libro es puramente tangencial/secundaria (ej. solo aparece en una lista bibliográfica sin comentario o se nombra de pasada en una oración sin aportar nada sobre la obra), 'is_valid' DEBE ser false.\n"
+            "6. Si la coincidencia del título es casual y trata realmente de otra obra o de un tema homónimo distinto, 'is_valid' DEBE ser false.\n"
+            "7. Los datos de 'ISBN' o 'Autor del libro' del libro buscado pueden estar en blanco. En ese caso, evalúa la coincidencia basándote en los campos provistos sin penalizar por la ausencia de datos opcionales.\n"
+            "8. La categoría ('category') DEBE ser estrictamente una de las siguientes opciones:\n"
+            "   - Cultura/Educación, Política, Economía, Historia, Religión, Sociedad, Ciencia, Tecnología, Literatura, Otros.\n"
+            "9. El resumen ('summary') DEBE estar escrito en ESPAÑOL y tener alrededor de 120 palabras. NO debe ser un resumen genérico del artículo completo, sino una explicación útil que indique DÓNDE, CÓMO y QUÉ menciona el artículo respecto al libro en cuestión, detallando si está centrado en el libro o lo menciona parcialmente y qué dice de él.\n\n"
+            "GUÍA DE PUNTUACIÓN ('match_score'):\n"
+            "- 0: No hay relación suficiente con el libro o habla de otra obra.\n"
+            "- 30-49: Mención débil o tangencial (no suficiente para ser validado).\n"
+            "- 50-69: Mención relevante pero no es una reseña completa (ej. se comenta en un párrafo extenso dentro de un artículo más amplio).\n"
+            "- 70-89: Artículo/crítica claramente sobre el libro con análisis sustancial.\n"
+            "- 90-100: Reseña muy clara y dedicada, donde el título o la gran parte del artículo se centran directamente en la obra.\n"
         )
 
         user_content = (

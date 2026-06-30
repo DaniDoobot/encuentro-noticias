@@ -707,3 +707,50 @@ def test_clean_domain_string_normalization():
     assert clean_domain_string("https://wmagazin.com/") == "wmagazin.com"
     assert clean_domain_string("http://wmagazin.com/subpath") == "wmagazin.com"
 
+
+def test_delete_all_logs_and_descartes():
+    """
+    Tests manual delete-all endpoints for Logs and Descartes worksheets.
+    """
+    # 1. Logs
+    with patch("app.routers.logs.sheets_service") as mock_sheets:
+        mock_sheets.clear_all_rows.return_value = {"deleted_count": 15}
+        response = client.post("/logs/delete-all")
+        assert response.status_code == 200
+        assert response.json()["deleted_count"] == 15
+        mock_sheets.clear_all_rows.assert_called_once_with(mock_sheets.clear_all_rows.call_args[0][0], "Logs")
+        
+    # 2. Descartes
+    with patch("app.routers.descartes.sheets_service") as mock_sheets:
+        mock_sheets.clear_all_rows.return_value = {"deleted_count": 30}
+        response = client.post("/descartes/delete-all")
+        assert response.status_code == 200
+        assert response.json()["deleted_count"] == 30
+        mock_sheets.clear_all_rows.assert_called_once_with(mock_sheets.clear_all_rows.call_args[0][0], "Descartes")
+
+def test_cancellation_endpoints():
+    """
+    Tests the cancellation endpoints for search runs and publication tasks.
+    """
+    # 1. Search cancel
+    from app.services.run_service import current_runs, cancelled_runs
+    run_id = "test_run_123"
+    current_runs[run_id] = {"status": "running", "message": "Initial", "logs": []}
+    
+    response = client.post(f"/runs/{run_id}/cancel")
+    assert response.status_code == 200
+    assert response.json() == {"success": True, "message": f"Run {run_id} has been marked for cancellation."}
+    assert run_id in cancelled_runs
+    assert current_runs[run_id]["status"] == "cancelled"
+    
+    # 2. Publish cancel
+    from app.routers.publish import current_publications, cancelled_publications
+    pub_id = "test_pub_456"
+    current_publications[pub_id] = {"status": "running", "published_count": 0, "errors_count": 0, "message": ""}
+    
+    response = client.post(f"/publish/{pub_id}/cancel")
+    assert response.status_code == 200
+    assert response.json() == {"success": True, "message": f"Publicación {pub_id} cancelada cooperativamente."}
+    assert pub_id in cancelled_publications
+    assert current_publications[pub_id]["status"] == "cancelled"
+

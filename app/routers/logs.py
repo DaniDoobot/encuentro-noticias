@@ -57,3 +57,27 @@ def post_logs_cleanup():
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to cleanup logs: {str(e)}"
         )
+
+class DeleteAllLogsResponse(BaseModel):
+    success: bool
+    message: str
+    deleted_count: int
+
+@router.post("/logs/delete-all", response_model=DeleteAllLogsResponse)
+def post_logs_delete_all():
+    """
+    Deletes all log entries in the 'Logs' worksheet of Google Sheets.
+    """
+    sheet_id = settings.GOOGLE_SHEET_ID
+    try:
+        res = sheets_service.clear_all_rows(sheet_id, "Logs")
+        return DeleteAllLogsResponse(
+            success=True,
+            message="Todos los logs fueron eliminados correctamente.",
+            deleted_count=res.get("deleted_count", 0)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete all logs: {str(e)}"
+        )

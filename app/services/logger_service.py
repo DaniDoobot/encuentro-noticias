@@ -2,7 +2,7 @@ import logging
 import datetime
 import threading
 from typing import List, Any, Optional
-from app.services.sheets_service import sheets_service
+from app.services.sheets_service import sheets_service, get_now_madrid_str
 
 
 class LoggerService:
@@ -57,7 +57,7 @@ class LoggerService:
 
         # Batch for Sheets
         if sheet_id and run_id:
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            timestamp = get_now_madrid_str()
             log_row = [run_id, timestamp, level_upper, isbn, action, message, detail]
             batch_key = f"{sheet_id}:{run_id}"
             with self._batch_lock:

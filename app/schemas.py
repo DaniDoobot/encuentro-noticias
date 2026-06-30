@@ -11,7 +11,7 @@ class SetupResponse(BaseModel):
     sheet_url: str
 
 class RunConfig(BaseModel):
-    limit_books: Optional[int] = Field(default=10, description="Max books to process in this run")
+    limit_books: Optional[int] = Field(default=None, description="Max books to process in this run")
     dry_run: Optional[bool] = Field(default=False, description="If true, does search/extraction but doesn't modify google sheets reviews/descartes or change book status to completed/error")
     date_min: Optional[str] = Field(default=None, description="ISO Date YYYY-MM-DD")
     date_max: Optional[str] = Field(default=None, description="ISO Date YYYY-MM-DD")

@@ -4,6 +4,14 @@ from app.config import settings
 from typing import List, Dict, Any, Optional, Tuple
 import datetime
 import logging
+import pytz
+
+def get_now_madrid() -> datetime.datetime:
+    madrid_tz = pytz.timezone("Europe/Madrid")
+    return datetime.datetime.now(madrid_tz)
+
+def get_now_madrid_str() -> str:
+    return get_now_madrid().strftime("%Y-%m-%d %H:%M:%S")
 
 logger = logging.getLogger("encuentro-noticias")
 
@@ -536,6 +544,8 @@ class SheetsService:
                 "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH": parse_bool(config_dict.get("ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH"), getattr(settings, "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", True)),
                 "DESCARTES_RETENTION_DAYS": parse_int(config_dict.get("DESCARTES_RETENTION_DAYS"), getattr(settings, "DESCARTES_RETENTION_DAYS", 30)),
                 "DESCARTES_MAX_ROWS": parse_int(config_dict.get("DESCARTES_MAX_ROWS"), getattr(settings, "DESCARTES_MAX_ROWS", 1000)),
+                "LOG_RETENTION_DAYS": parse_int(config_dict.get("LOG_RETENTION_DAYS"), settings.LOG_RETENTION_DAYS),
+                "LOG_MAX_ROWS": parse_int(config_dict.get("LOG_MAX_ROWS"), settings.LOG_MAX_ROWS),
             }
         except Exception:
             # Fallback to local configs if sheet configs fail to read
@@ -584,6 +594,8 @@ class SheetsService:
                 "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH": getattr(settings, "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", True),
                 "DESCARTES_RETENTION_DAYS": getattr(settings, "DESCARTES_RETENTION_DAYS", 30),
                 "DESCARTES_MAX_ROWS": getattr(settings, "DESCARTES_MAX_ROWS", 1000),
+                "LOG_RETENTION_DAYS": settings.LOG_RETENTION_DAYS,
+                "LOG_MAX_ROWS": settings.LOG_MAX_ROWS,
             }
 
     def get_pending_books(
@@ -887,6 +899,33 @@ class SheetsService:
             import logging
             logging.getLogger("encuentro-noticias").warning(f"update_source_stats error: {e}")
 
+    def clear_all_rows(self, sheet_id: str, worksheet_name: str) -> Dict[str, Any]:
+        """Clears all rows in a worksheet except the first row (header)."""
+        client = self.get_client()
+        spreadsheet = client.open_by_key(sheet_id)
+        worksheet = spreadsheet.worksheet(worksheet_name)
+        num_rows = worksheet.row_count
+        deleted_count = 0
+        if num_rows > 1:
+            reqs = [{
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": worksheet.id,
+                        "dimension": "ROWS",
+                        "startIndex": 1,
+                        "endIndex": num_rows
+                    }
+                }
+            }]
+            spreadsheet.batch_update({"requests": reqs})
+            deleted_count = num_rows - 1
+            
+        return {
+            "deleted_count": deleted_count,
+            "remaining_count": 0,
+            "message": f"Se eliminaron todas las filas de la pestaña '{worksheet_name}'."
+        }
+
     def cleanup_logs(self, sheet_id: str, max_rows: int = 1000, retention_days: int = 30) -> Dict[str, Any]:
         """
         Cleans up old logs based on retention days and a maximum row limit.
@@ -898,7 +937,7 @@ class SheetsService:
         if not records:
             return {"deleted_count": 0, "remaining_count": 0, "message": "La hoja de Logs está vacía."}
             
-        now = datetime.datetime.now()
+        now = get_now_madrid()
         cutoff_date = now - datetime.timedelta(days=retention_days)
         
         rows_to_delete = []
@@ -1162,7 +1201,7 @@ class SheetsService:
         if not records:
             return {"deleted_count": 0, "remaining_count": 0, "message": "La hoja de Descartes está vacía."}
             
-        now = datetime.datetime.now()
+        now = get_now_madrid()
         cutoff_date = now - datetime.timedelta(days=retention_days)
         
         rows_to_delete = []

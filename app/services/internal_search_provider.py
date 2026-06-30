@@ -143,7 +143,12 @@ class InternalDomainSearchProvider:
             
         soup = BeautifulSoup(r.text, "html.parser")
         # Extract terms of the query for relevance check
-        query_terms = [t.lower() for t in _filter_stopwords(query).split() if len(t) > 2]
+        raw_terms = _filter_stopwords(query).split()
+        query_terms = []
+        for t in raw_terms:
+            t_clean = t.strip('\'"“”‘’“”.,()[]{}').lower()
+            if len(t_clean) > 2:
+                query_terms.append(t_clean)
         
         a_tags = soup.find_all("a", href=True)
         seen_urls = set()

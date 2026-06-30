@@ -7,7 +7,7 @@ import threading
 from urllib.parse import urlparse
 
 from app.config import settings
-from app.services.sheets_service import sheets_service
+from app.services.sheets_service import sheets_service, get_now_madrid_str
 from app.services.query_builder import query_builder
 from app.services.search_service import search_service, is_true
 from app.services.article_extractor import article_extractor
@@ -19,10 +19,30 @@ from app.services.cache_service import cache_service
 
 # In-memory storage for runs
 current_runs: Dict[str, Dict[str, Any]] = {}
+cancelled_runs: Set[str] = set()
+
+class RunCancelledException(Exception):
+    def __init__(self, message: str, reviews_added: int = 0):
+        super().__init__(message)
+        self.reviews_added = reviews_added
 
 class RunService:
     def get_run_status(self, run_id: str) -> Optional[Dict[str, Any]]:
         return current_runs.get(run_id)
+
+    def cancel_run(self, run_id: str) -> bool:
+        if run_id in current_runs:
+            if current_runs[run_id]["status"] not in ("completed", "failed", "cancelled"):
+                current_runs[run_id]["status"] = "cancelled"
+                current_runs[run_id]["message"] = "Búsqueda cancelada por el usuario."
+                cancelled_runs.add(run_id)
+                self._add_in_memory_log(run_id, "INFO", "RUN_CANCELLED", "La ejecución ha sido cancelada por el usuario.")
+                return True
+        return False
+
+    def _check_cancellation(self, run_id: str, reviews_added: int = 0):
+        if run_id in cancelled_runs or (run_id in current_runs and current_runs[run_id].get("status") == "cancelled"):
+            raise RunCancelledException("Búsqueda cancelada por el usuario.", reviews_added=reviews_added)
 
     def trigger_run(self, limit_books: int = 10, dry_run: bool = False, date_min: Optional[str] = None, date_max: Optional[str] = None, include_unknown_dates: Optional[bool] = None) -> str:
         run_id = f"run_{uuid.uuid4().hex[:8]}"
@@ -97,7 +117,7 @@ class RunService:
 
     def _add_in_memory_log(self, run_id: str, level: str, action: str, message: str, isbn: str = "", detail: str = ""):
         if run_id in current_runs:
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            timestamp = get_now_madrid_str()
             current_runs[run_id]["logs"].append({
                 "timestamp": timestamp,
                 "level": level,
@@ -119,7 +139,15 @@ class RunService:
             
             # 1. Fetch configs from Google Sheets Config sheet
             run_config = sheets_service.get_config_dict(sheet_id)
-            max_books = min(limit_books, run_config["MAX_BOOKS_PER_RUN"])
+            # Priority:
+            # 1. limit_books from request (if not None)
+            # 2. Config "MAX_BOOKS_PER_RUN"
+            # 3. Fallback to settings.MAX_BOOKS_PER_RUN (10)
+            config_max_books = run_config.get("MAX_BOOKS_PER_RUN", settings.MAX_BOOKS_PER_RUN)
+            if limit_books is not None:
+                max_books = limit_books
+            else:
+                max_books = config_max_books
             max_pages = run_config["MAX_SEARCH_PAGES_PER_QUERY"]
             max_candidates = run_config["MAX_CANDIDATES_PER_BOOK"]
             min_score = run_config["MIN_MATCH_SCORE"]
@@ -179,6 +207,8 @@ class RunService:
             self._add_in_memory_log(run_id, "INFO", "DEDUPE_INIT", f"Reseñas cargadas: {len(existing_reviews)}. Hashes únicos: {len(existing_hashes)}")
 
             for book in pending_books:
+                if run_id in cancelled_runs or current_runs[run_id].get("status") == "cancelled":
+                    break
                 isbn = book["isbn"]
                 title = book["title"]
                 author = book["author"]
@@ -226,6 +256,26 @@ class RunService:
                         current_runs[run_id]["books_no_results"] += 1
                     elif final_status == "error":
                         current_runs[run_id]["books_failed"] += 1
+                except RunCancelledException as e:
+                    reviews_added = e.reviews_added
+                    new_status = "cancelado" if reviews_added > 0 else "pendiente"
+                    logger_service.log("INFO", "RUN_CANCELLED", f"Ejecución cancelada durante el procesamiento del libro '{title}'.", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                    self._add_in_memory_log(run_id, "INFO", "RUN_CANCELLED", f"Ejecución cancelada durante '{title}'.", isbn=isbn)
+                    if not dry_run:
+                        try:
+                            sheets_service.update_book_status(
+                                sheet_id=sheet_id,
+                                row_index=row_index,
+                                status=new_status,
+                                last_run=get_now_madrid_str(),
+                                reviews_found=reviews_added,
+                                observations="Búsqueda cancelada por el usuario."
+                            )
+                        except Exception as e_sheet:
+                            logger_service.log("ERROR", "SHEET_UPDATE_FAIL", f"Fallo al restaurar estado a '{new_status}': {e_sheet}", isbn=isbn, sheet_id=sheet_id)
+                    current_runs[run_id]["status"] = "cancelled"
+                    current_runs[run_id]["message"] = "Búsqueda cancelada por el usuario."
+                    break
                 except Exception as e:
                     logger_service.log("ERROR", "BOOK_PROCESS_FAIL", f"Error procesando libro '{title}': {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
                     self._add_in_memory_log(run_id, "ERROR", "BOOK_PROCESS_FAIL", str(e), isbn=isbn)
@@ -253,7 +303,7 @@ class RunService:
                                 sheet_id=sheet_id,
                                 row_index=row_index,
                                 status="error",
-                                last_run=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                last_run=get_now_madrid_str(),
                                 reviews_found=0,
                                 observations=f"Error de proceso: {str(e)}"
                             )
@@ -262,11 +312,15 @@ class RunService:
                 finally:
                     current_runs[run_id]["books_processed"] += 1
             
-            current_runs[run_id]["status"] = "completed"
-            current_runs[run_id]["message"] = f"Ejecución completada. Procesados {current_runs[run_id]['books_processed']} libros."
-            self._auto_cleanup_descartes(sheet_id, run_id)
-            self._add_in_memory_log(run_id, "INFO", "RUN_END", f"Ejecución global completada. Completados={current_runs[run_id]['books_completed']}, Sin resultados={current_runs[run_id]['books_no_results']}, Fallidos={current_runs[run_id]['books_failed']}")
-            logger_service.log("INFO", "RUN_END", f"Ejecución global completada. Completados={current_runs[run_id]['books_completed']}, Sin resultados={current_runs[run_id]['books_no_results']}, Fallidos={current_runs[run_id]['books_failed']}", sheet_id=sheet_id, run_id=run_id)
+            if current_runs[run_id]["status"] != "cancelled":
+                current_runs[run_id]["status"] = "completed"
+                current_runs[run_id]["message"] = f"Ejecución completada. Procesados {current_runs[run_id]['books_processed']} libros."
+                self._auto_cleanup_descartes(sheet_id, run_id)
+                self._add_in_memory_log(run_id, "INFO", "RUN_END", f"Ejecución global completada. Completados={current_runs[run_id]['books_completed']}, Sin resultados={current_runs[run_id]['books_no_results']}, Fallidos={current_runs[run_id]['books_failed']}")
+                logger_service.log("INFO", "RUN_END", f"Ejecución global completada. Completados={current_runs[run_id]['books_completed']}, Sin resultados={current_runs[run_id]['books_no_results']}, Fallidos={current_runs[run_id]['books_failed']}", sheet_id=sheet_id, run_id=run_id)
+            else:
+                self._add_in_memory_log(run_id, "INFO", "RUN_END", f"Ejecución global cancelada por el usuario.")
+                logger_service.log("INFO", "RUN_END", f"Ejecución global cancelada por el usuario.", sheet_id=sheet_id, run_id=run_id)
 
         except Exception as e:
             current_runs[run_id]["status"] = "failed"
@@ -363,7 +417,7 @@ class RunService:
                             sheet_id=sheet_id,
                             row_index=book["row_index"],
                             status="error",
-                            last_run=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            last_run=get_now_madrid_str(),
                             reviews_found=0,
                             observations=f"Error de proceso: {str(e)}"
                         )
@@ -408,6 +462,7 @@ class RunService:
         """
         Runs the extraction and validation pipeline for a single book.
         """
+        self._check_cancellation(run_id)
         log_prefix = "[PRUEBA] " if dry_run else ""
         
         # Check if title is missing
@@ -421,7 +476,7 @@ class RunService:
                         sheet_id=sheet_id,
                         row_index=row_index,
                         status="error",
-                        last_run=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        last_run=get_now_madrid_str(),
                         reviews_found=0,
                         observations=err_msg
                     )
@@ -478,7 +533,7 @@ class RunService:
                     sheet_id=sheet_id,
                     row_index=row_index,
                     status="procesando",
-                    last_run=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    last_run=get_now_madrid_str(),
                     reviews_found=0,
                     observations="Procesando..."
                 )
@@ -516,8 +571,23 @@ class RunService:
         if search_mode == "domain_index_plus_news":
             cascade_search = True
 
+        # Log resolved search mode
+        logger_service.log("INFO", "SEARCH_MODE_RESOLVED", f"{log_prefix}Modo de búsqueda resuelto: config={config.get('SEARCH_PROVIDER_MODE')}, resolved={search_mode}, cascade={cascade_search}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+        self._add_in_memory_log(run_id, "INFO", "SEARCH_MODE_RESOLVED", f"Modo de búsqueda resuelto: config={config.get('SEARCH_PROVIDER_MODE')}, resolved={search_mode}, cascade={cascade_search}", isbn=isbn)
+
+        internal_domains_attempted = 0
+        internal_domains_with_results = 0
+
         if cascade_search:
+            self._check_cancellation(run_id)
+            logger_service.log("INFO", "CASCADE_SEARCH_STARTED", f"{log_prefix}Iniciando búsqueda en cascada", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "INFO", "CASCADE_SEARCH_STARTED", "Iniciando búsqueda en cascada", isbn=isbn)
+
             # PHASE 1 — Domain Index
+            self._check_cancellation(run_id)
+            logger_service.log("INFO", "DOMAIN_INDEX_SEARCH_STARTED", f"{log_prefix}Iniciando Fase 1: Domain Index", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "INFO", "DOMAIN_INDEX_SEARCH_STARTED", "Iniciando Fase 1: Domain Index", isbn=isbn)
+            
             local_matches = source_discovery.find_candidates(
                 title=title,
                 author=author,
@@ -545,12 +615,19 @@ class RunService:
                         run_id=run_id
                     )
             domain_index_candidates_count = len(candidate_origin)
+            logger_service.log("INFO", "DOMAIN_INDEX_SEARCH_COMPLETED", f"{log_prefix}Fase 1: Domain Index completada. Candidatos={domain_index_candidates_count}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "INFO", "DOMAIN_INDEX_SEARCH_COMPLETED", f"Fase 1: Domain Index completada. Candidatos={domain_index_candidates_count}", isbn=isbn)
             
             # PHASE 2 — Google News RSS / Búsqueda externa ligera
+            self._check_cancellation(run_id)
+            logger_service.log("INFO", "GOOGLE_NEWS_COMPLEMENT_STARTED", f"{log_prefix}Iniciando Fase 2: Google News Complement", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "INFO", "GOOGLE_NEWS_COMPLEMENT_STARTED", "Iniciando Fase 2: Google News Complement", isbn=isbn)
+            
             rss_max = int(config.get("DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES))
             rss_queries_done = 0
             google_news_candidates = 0
             for q in prioritarias:
+                self._check_cancellation(run_id)
                 if rss_queries_done >= rss_max or queries_executed >= max_queries:
                     break
                 if len(candidate_origin) >= max_candidates:
@@ -581,8 +658,11 @@ class RunService:
                         }
                         google_news_candidates += 1
             google_news_candidates_count = google_news_candidates
+            logger_service.log("INFO", "GOOGLE_NEWS_COMPLEMENT_COMPLETED", f"{log_prefix}Fase 2: Google News Complement completada. Candidatos nuevos={google_news_candidates_count}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "INFO", "GOOGLE_NEWS_COMPLEMENT_COMPLETED", f"Fase 2: Google News Complement completada. Candidatos nuevos={google_news_candidates_count}", isbn=isbn)
 
             # PHASE 3 — Internal Domain Search
+            self._check_cancellation(run_id)
             _always_internal_default = getattr(settings, "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", True)
             _min_cand_default = getattr(settings, "MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH", 5)
             _enable_deep_default = getattr(settings, "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", True)
@@ -644,9 +724,11 @@ class RunService:
                 domains = [s["domain"] for s in sources if s.get("active", True) and s.get("domain")]
                 domains = domains[:domains_limit]
 
+                internal_domains_attempted = len(domains)
                 if domains:
                     new_urls_found = 0
                     for domain in domains:
+                        self._check_cancellation(run_id)
                         try:
                             items = internal_search_provider.search_domain_for_book(
                                 domain=domain,
@@ -655,6 +737,8 @@ class RunService:
                                 isbn=isbn,
                                 config=config
                             )
+                            if items:
+                                internal_domains_with_results += 1
                             for item in items:
                                 url = item["url"]
                                 title_found = item.get("title") or ""
@@ -867,13 +951,18 @@ class RunService:
         errors_count = search_service.get_and_reset_errors_count()
 
         search_summary = {
-            "queries_executed": queries_executed,
+            "search_provider_mode_config": config.get("SEARCH_PROVIDER_MODE", settings.SEARCH_PROVIDER_MODE),
+            "search_provider_mode_resolved": search_mode,
+            "enable_cascade_search": cascade_search,
             "providers_used": providers_used,
-            "provider_errors": errors_count,
-            "candidate_urls": len(candidate_urls),
             "domain_index_candidates_count": domain_index_candidates_count,
             "google_news_candidates_count": google_news_candidates_count,
             "internal_search_candidates_count": internal_search_candidates_count,
+            "internal_domains_attempted": internal_domains_attempted,
+            "internal_domains_with_results": internal_domains_with_results,
+            "queries_executed": queries_executed,
+            "candidate_urls": len(candidate_urls),
+            "provider_errors": errors_count,
             "total_candidates_before_dedup": domain_index_candidates_count + google_news_candidates_count + internal_search_candidates_count,
             "total_candidates_after_dedup": len(candidate_urls),
             "candidates_discarded_by_limit": candidates_discarded_by_limit,
@@ -916,8 +1005,10 @@ class RunService:
 
         observation = ""
 
+        self._check_cancellation(run_id, reviews_added=reviews_added)
         # 3. Process candidate URLs
         for url in candidate_urls:
+            self._check_cancellation(run_id, reviews_added=reviews_added)
             item = candidate_origin[url]
             origin_query = item["query"]
             provider_name = item["provider"]
@@ -950,7 +1041,7 @@ class RunService:
                     )
                     if not dry_run:
                         sheets_service.add_descarte(sheet_id, [
-                            isbn, title, author, origin_query, url, "", "fuera de rango de fechas", 0, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            isbn, title, author, origin_query, url, "", "fuera de rango de fechas", 0, get_now_madrid_str()
                         ])
                     descartes_added += 1
                     continue
@@ -963,7 +1054,7 @@ class RunService:
                 logger_service.log("DEBUG", "DEDUPLICATE_SKIP", f"{log_prefix}Saltando URL duplicada: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
                 if not dry_run:
                     sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, origin_query, url, "", "duplicado", 0, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        isbn, title, author, origin_query, url, "", "duplicado", 0, get_now_madrid_str()
                     ])
                 descartes_added += 1
                 continue
@@ -982,7 +1073,7 @@ class RunService:
                 logger_service.log("WARNING", "EXTRACTION_FAILED", f"{log_prefix}Error extrayendo {url}: {err_msg}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
                 if not dry_run:
                     sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, origin_query, url, "", reason, 0, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        isbn, title, author, origin_query, url, "", reason, 0, get_now_madrid_str()
                     ])
                 descartes_added += 1
                 failed_extractions += 1
@@ -1018,7 +1109,7 @@ class RunService:
                     )
                     if not dry_run:
                         sheets_service.add_descarte(sheet_id, [
-                            isbn, title, author, origin_query, url, art_title, "fuera de rango de fechas", 0, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            isbn, title, author, origin_query, url, art_title, "fuera de rango de fechas", 0, get_now_madrid_str()
                         ])
                     descartes_added += 1
                     continue
@@ -1031,6 +1122,7 @@ class RunService:
                 self._add_in_memory_log(run_id, "WARNING", "DEDUPLICATE_SECONDARY_WARN", f"Posible duplicado secundario: {url}", isbn=isbn)
 
             # Analyze content with OpenAI
+            self._check_cancellation(run_id, reviews_added=reviews_added)
             try:
                 analysis = openai_analyzer.analyze_article(
                     isbn=isbn,
@@ -1049,7 +1141,7 @@ class RunService:
                 logger_service.log("ERROR", "OPENAI_FAILED", f"{log_prefix}Error OpenAI para {url}: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
                 if not dry_run:
                     sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, origin_query, url, art_title, "error OpenAI", 0, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        isbn, title, author, origin_query, url, art_title, "error OpenAI", 0, get_now_madrid_str()
                     ])
                 descartes_added += 1
                 continue
@@ -1084,7 +1176,7 @@ class RunService:
                     )
                     if not dry_run:
                         sheets_service.add_descarte(sheet_id, [
-                            isbn, title, author, origin_query, url, art_title, "fuera de rango de fechas", 0, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            isbn, title, author, origin_query, url, art_title, "fuera de rango de fechas", 0, get_now_madrid_str()
                         ])
                     descartes_added += 1
                     continue
@@ -1109,7 +1201,7 @@ class RunService:
                     )
                     if not dry_run:
                         sheets_service.add_descarte(sheet_id, [
-                            isbn, title, author, origin_query, url, art_title, "fuera de rango de fechas", 0, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            isbn, title, author, origin_query, url, art_title, "fuera de rango de fechas", 0, get_now_madrid_str()
                         ])
                     descartes_added += 1
                     continue
@@ -1136,7 +1228,7 @@ class RunService:
                 
                 if not dry_run:
                     sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, origin_query, url, art_title, descarte_reason, score, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        isbn, title, author, origin_query, url, art_title, descarte_reason, score, get_now_madrid_str()
                     ])
                 descartes_added += 1
             else:
@@ -1164,7 +1256,7 @@ class RunService:
                         analysis.get("summary", ""),
                         score,
                         analysis.get("content_type", ""),
-                        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        get_now_madrid_str(),
                         prim_hash,
                         "pendiente"
                     ])
@@ -1237,6 +1329,7 @@ class RunService:
         logger_service.log("INFO", "BOOK_PROCESS_END", f"{log_prefix}Libro finalizado con estado '{final_status}'. {observation}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
         self._add_in_memory_log(run_id, "INFO", "BOOK_PROCESS_END", f"{log_prefix}Finalizado: {final_status}. {observation}", isbn=isbn)
 
+        self._check_cancellation(run_id, reviews_added=reviews_added)
         if dry_run:
             # Update row in Libros to show proof run, but KEEP status as 'pendiente'
             try:
@@ -1244,7 +1337,7 @@ class RunService:
                     sheet_id=sheet_id,
                     row_index=row_index,
                     status="pendiente", # Keep pending!
-                    last_run=f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (Prueba)",
+                    last_run=f"{get_now_madrid_str()} (Prueba)",
                     reviews_found=reviews_added,
                     observations=f"[PRUEBA] {observation}"
                 )
@@ -1260,7 +1353,7 @@ class RunService:
                 sheet_id=sheet_id,
                 row_index=row_index,
                 status=final_status,
-                last_run=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                last_run=get_now_madrid_str(),
                 reviews_found=reviews_added,
                 observations=observation
             )

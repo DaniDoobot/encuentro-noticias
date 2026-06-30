@@ -110,6 +110,19 @@ def get_run(run_id: str):
         books_skipped_non_pending_status=status_data.get("books_skipped_non_pending_status")
     )
 
+@router.post("/runs/{run_id}/cancel")
+def post_cancel_run(run_id: str):
+    """
+    Cancels a running background execution.
+    """
+    success = run_service.cancel_run(run_id)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Run {run_id} not found or not in running state."
+        )
+    return {"success": True, "message": f"Run {run_id} has been marked for cancellation."}
+
 @router.post("/dedupe/rebuild", response_model=DedupeRebuildResponse)
 def rebuild_dedupe():
     """
