@@ -754,3 +754,96 @@ def test_cancellation_endpoints():
     assert pub_id in cancelled_publications
     assert current_publications[pub_id]["status"] == "cancelled"
 
+
+def test_book_title_preservation_and_logs():
+    """
+    Regression test to ensure that 'book_title' (original book title)
+    is preserved throughout the loop and not overwritten by candidate titles,
+    ensuring correct book_title is passed to openai_analyzer.analyze_article and sheets_service.add_descarte.
+    """
+    from app.services.run_service import run_service
+    from app.services.sheets_service import sheets_service
+    from app.services.openai_analyzer import openai_analyzer
+    
+    book_title = "San Manuel Bueno, mártir"
+    book_author = "Miguel de Unamuno"
+    candidate_url = "https://www.zendalibros.com/zenda-recomienda-san-manuel-bueno-martir-de-miguel-de-unamuno/"
+    candidate_title = "Zenda recomienda: San Manuel Bueno, mártir, de Miguel de Unamuno"
+    
+    mock_candidate = {
+        "url": candidate_url,
+        "query": "local_index",
+        "provider": "DomainIndex",
+        "title": candidate_title,
+        "snippet": "Test snippet",
+        "position": 1,
+        "score": 100,
+        "pub_date": None
+    }
+    
+    with patch("app.services.source_discovery.source_discovery.find_candidates", return_value=[mock_candidate]), \
+         patch("app.services.sheets_service.sheets_service.get_config_dict", return_value={
+             "MAX_SEARCH_PAGES_PER_QUERY": 1,
+             "MAX_CANDIDATES_PER_BOOK": 5,
+             "MIN_MATCH_SCORE": 70,
+             "SEARCH_PROVIDER_MODE": "auto",
+             "ENABLE_CASCADE_SEARCH": "true",
+             "ENABLE_INTERNAL_DOMAIN_SEARCH": "false",
+             "DEFAULT_INCLUDE_UNKNOWN_DATES": "true"
+         }), \
+         patch("app.services.sheets_service.sheets_service.get_all_reviews", return_value=[]), \
+         patch("app.services.article_extractor.article_extractor.extract", return_value={
+             "title": candidate_title,
+             "text": "Cuerpo del articulo sobre San Manuel Bueno, martir",
+             "date": "2024-02-18",
+             "author": "Miguel de Unamuno",
+             "publication_name": "Zenda"
+         }), \
+         patch("app.services.openai_analyzer.openai_analyzer.analyze_article", return_value={
+             "is_valid": False,
+             "match_score": 30,
+             "reason": "Mención tangencial del libro",
+             "detected_book_title": book_title,
+             "detected_book_author": book_author,
+             "content_type": "reseña",
+             "publication_name": "Zenda",
+             "publication_author": "Miguel de Unamuno",
+             "publication_date": "2024-02-18",
+             "language": "es",
+             "category": "Literatura",
+             "summary": "Resumen de prueba"
+         }) as mock_analyze, \
+         patch("app.services.sheets_service.sheets_service.add_descarte") as mock_add_descarte, \
+         patch("app.services.sheets_service.sheets_service.update_book_status") as mock_status:
+         
+         run_service._process_book(
+             run_id="run_test_preservation",
+             sheet_id="sheet_id",
+             row_index=2,
+             isbn="123456",
+             title=book_title,
+             author=book_author,
+             max_pages=1,
+             max_candidates=5,
+             min_score=70,
+             openai_model="gpt-4o",
+             existing_hashes=set(),
+             existing_secondary_keys=set(),
+             dry_run=False
+         )
+         
+         # Verification 1: OpenAI received the correct original book_title
+         assert mock_analyze.call_count >= 1
+         for call in mock_analyze.call_args_list:
+             called_kwargs = call[1]
+             assert called_kwargs["book_title"] == book_title
+             assert called_kwargs["book_author"] == book_author
+         
+         # Verification 2: add_descarte was called with the correct book title
+         assert mock_add_descarte.call_count >= 1
+         for call in mock_add_descarte.call_args_list:
+             called_row = call[0][1]
+             assert called_row[1] == book_title # Col 2: Título del libro (not candidate_title!)
+             if called_row[4] == candidate_url:
+                 assert called_row[5] == candidate_title # Col 6: Título detectado / artículo
+

@@ -924,7 +924,7 @@ class RunService:
         for url, item in candidate_origin.items():
             provider_name = item["provider"]
             origin_query = item["query"]
-            title = item.get("title") or ""
+            cand_title = item.get("title") or ""
             snippet = item.get("snippet") or ""
             pos = item.get("position") or ""
 
@@ -933,7 +933,7 @@ class RunService:
                 action="CANDIDATE_FOUND",
                 message=f"{log_prefix}Candidato de {provider_name}: {url}",
                 isbn=isbn,
-                detail=f"provider={provider_name} | query={origin_query} | url={url} | title={title} | snippet={snippet} | position={pos}",
+                detail=f"provider={provider_name} | query={origin_query} | url={url} | title={cand_title} | snippet={snippet} | position={pos}",
                 sheet_id=sheet_id,
                 run_id=run_id
             )
@@ -943,7 +943,7 @@ class RunService:
                 action="CANDIDATE_FOUND",
                 message=f"{log_prefix}Candidato de {provider_name}: {url}",
                 isbn=isbn,
-                detail=f"provider={provider_name} | query={origin_query} | url={url} | title={title} | snippet={snippet} | position={pos}"
+                detail=f"provider={provider_name} | query={origin_query} | url={url} | title={cand_title} | snippet={snippet} | position={pos}"
             )
 
         # Compile and Log Search Summary
@@ -1123,6 +1123,40 @@ class RunService:
 
             # Analyze content with OpenAI
             self._check_cancellation(run_id, reviews_added=reviews_added)
+
+            # Log validation input
+            logger_service.log(
+                level="INFO",
+                action="OPENAI_VALIDATION_INPUT",
+                message=f"Enviando candidato a OpenAI: {url}",
+                isbn=isbn,
+                detail=json.dumps({
+                    "isbn": isbn,
+                    "book_title": title,
+                    "book_author": author,
+                    "candidate_title": art_title,
+                    "candidate_url": url,
+                    "query": origin_query
+                }),
+                sheet_id=sheet_id,
+                run_id=run_id
+            )
+            self._add_in_memory_log(
+                run_id=run_id,
+                level="INFO",
+                action="OPENAI_VALIDATION_INPUT",
+                message=f"Enviando a OpenAI: {url}",
+                isbn=isbn,
+                detail=json.dumps({
+                    "isbn": isbn,
+                    "book_title": title,
+                    "book_author": author,
+                    "candidate_title": art_title,
+                    "candidate_url": url,
+                    "query": origin_query
+                })
+            )
+
             try:
                 analysis = openai_analyzer.analyze_article(
                     isbn=isbn,
@@ -1136,6 +1170,41 @@ class RunService:
                     detected_author=article_data.get("author") or "",
                     detected_medium=article_data.get("publication_name") or "",
                     model_override=openai_model
+                )
+
+                # Log validation result
+                logger_service.log(
+                    level="INFO",
+                    action="OPENAI_VALIDATION_RESULT",
+                    message=f"Resultado validación OpenAI para {url}: is_valid={analysis.get('is_valid')}, score={analysis.get('match_score')}",
+                    isbn=isbn,
+                    detail=json.dumps({
+                        "book_title": title,
+                        "candidate_title": art_title,
+                        "candidate_url": url,
+                        "is_match": analysis.get("is_valid", False),
+                        "match_score": analysis.get("match_score", 0),
+                        "reason": analysis.get("reason", ""),
+                        "summary": analysis.get("summary", "")
+                    }),
+                    sheet_id=sheet_id,
+                    run_id=run_id
+                )
+                self._add_in_memory_log(
+                    run_id=run_id,
+                    level="INFO",
+                    action="OPENAI_VALIDATION_RESULT",
+                    message=f"Resultado OpenAI: is_valid={analysis.get('is_valid')}, score={analysis.get('match_score')}",
+                    isbn=isbn,
+                    detail=json.dumps({
+                        "book_title": title,
+                        "candidate_title": art_title,
+                        "candidate_url": url,
+                        "is_match": analysis.get("is_valid", False),
+                        "match_score": analysis.get("match_score", 0),
+                        "reason": analysis.get("reason", ""),
+                        "summary": analysis.get("summary", "")
+                    })
                 )
             except Exception as e:
                 logger_service.log("ERROR", "OPENAI_FAILED", f"{log_prefix}Error OpenAI para {url}: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
