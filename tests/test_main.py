@@ -1129,6 +1129,11 @@ def test_broad_news_search_triggers_and_budget_guaranteed():
          }), \
          patch("app.services.sheets_service.sheets_service.get_all_reviews", return_value=[]), \
          patch("app.services.search_service.search_service.search_with_fallback", side_effect=side_effect_search) as mock_search, \
+         patch("app.services.article_extractor.article_extractor.extract", return_value={
+             "title": "YOUCAT Biblia - Zenda",
+             "text": "Este es el contenido de un artículo sobre YOUCAT Biblia.",
+             "date": "2024-02-18"
+         }), \
          patch("app.services.openai_analyzer.openai_analyzer.analyze_article", return_value={
              "is_valid": True,
              "match_score": 85,
