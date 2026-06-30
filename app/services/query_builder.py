@@ -9,7 +9,22 @@ class QueryBuilder:
         author_clean = author.replace('"', "'").strip()
         isbn_clean = isbn.replace('"', "").replace('-', "").strip()
 
-        has_author = bool(author_clean)
+        # Helper to check for generic authors
+        import re
+        import unicodedata
+
+        def is_generic_author(auth_str: str) -> bool:
+            if not auth_str:
+                return True
+            norm = auth_str.strip().lower()
+            # Remove accents/diacritics
+            norm = "".join(c for c in unicodedata.normalize('NFD', norm) if unicodedata.category(c) != 'Mn')
+            # Keep alphanumeric only
+            norm = re.sub(r'[^a-z0-9]', '', norm)
+            # Match against common generic patterns
+            return norm in {"vvaa", "aavv", "variosautores", "varios", "anonimo", "autorvario", "autoresvarios"}
+
+        has_author = bool(author_clean) and not is_generic_author(author_clean)
         has_isbn = bool(isbn_clean)
 
         prioritarias = []
@@ -53,6 +68,7 @@ class QueryBuilder:
         else:
             # Only Title (+ optional ISBN)
             prioritarias = [
+                f'"{title_clean}"',
                 f'"{title_clean}" reseña libro',
                 f'"{title_clean}" crítica libro',
                 f'"{title_clean}" ediciones encuentro'
@@ -60,13 +76,26 @@ class QueryBuilder:
             if has_isbn:
                 prioritarias.append(f'"{isbn_clean}"')
                 prioritarias.append(f'"{isbn_clean}" "{title_clean}"')
+
+            # Permuted/compound variants for titles with multiple words (e.g. "YOUCAT Biblia" -> "Biblia YOUCAT")
+            words = title_clean.split()
+            if len(words) >= 2:
+                w1, w2 = words[0], words[1]
+                prioritarias.extend([
+                    f'"{w2} {w1}"',
+                    f'"{w2} de {w1}"',
+                    f'"la nueva {w2} de {w1}"'
+                ])
                 
             apoyo = [
                 f'"{title_clean}" comentario libro',
                 f'"{title_clean}" reseña',
                 f'"{title_clean}" crítica',
                 f'"{title_clean}" opinión libro',
-                f'"{title_clean}" reseña -comprar -amazon -fnac -casadellibro -iberlibro'
+                f'"{title_clean}" reseña -comprar -amazon -fnac -casadellibro -iberlibro',
+                f'{title_clean} reseña',
+                f'{title_clean} artículo',
+                f'{title_clean} crítica'
             ]
             
             if review_domains:

@@ -26,6 +26,22 @@ class RunCancelledException(Exception):
         super().__init__(message)
         self.reviews_added = reviews_added
 
+def is_consent_or_cookie_page(text: str) -> bool:
+    if not text:
+        return False
+    text_lower = text.lower()
+    keywords = ["cookies", "política de privacidad", "uso de datos", "consent", "before you continue", "aceptar todo", "configurar cookies"]
+    matches = [kw in text_lower for kw in keywords]
+    count = sum(matches)
+    
+    if "before you continue" in text_lower or ("cookies" in text_lower and "consent" in text_lower):
+        return True
+    if count >= 2:
+        return True
+    if "cookies" in text_lower and len(text_lower) < 2000 and ("política" in text_lower or "privacidad" in text_lower or "datos" in text_lower):
+        return True
+    return False
+
 class RunService:
     def get_run_status(self, run_id: str) -> Optional[Dict[str, Any]]:
         return current_runs.get(run_id)
@@ -1013,6 +1029,36 @@ class RunService:
             origin_query = item["query"]
             provider_name = item["provider"]
             
+            original_candidate_url = url
+            resolved_url = url
+            
+            # Resolve Google News RSS redirect URLs to final article URLs
+            if url.startswith("https://news.google.com/rss/articles/"):
+                try:
+                    from googlenewsdecoder import gnewsdecoder
+                    decoded = gnewsdecoder(url, interval=1)
+                    if decoded.get("status") and decoded.get("decoded_url"):
+                        resolved_url = decoded["decoded_url"]
+                        logger_service.log("INFO", "URL_RESOLVED", f"URL de Google News resuelta: {url} -> {resolved_url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                    else:
+                        logger_service.log("WARNING", "URL_RESOLUTION_FAILED", f"No se pudo resolver URL de Google News: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                except Exception as e:
+                    logger_service.log("ERROR", "URL_RESOLUTION_ERROR", f"Error resolviendo URL de Google News {url}: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+
+            # Fallback if Google News URL could not be resolved
+            if original_candidate_url.startswith("https://news.google.com/rss/articles/") and resolved_url == original_candidate_url:
+                logger_service.log("WARNING", "URL_RESOLUTION_FAILED_SKIP", f"{log_prefix}Saltando URL de Google News no resuelta: {original_candidate_url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                if not dry_run:
+                    sheets_service.add_descarte(sheet_id, [
+                        isbn, title, author, origin_query, original_candidate_url, item.get("title") or "", "no se pudo resolver URL de Google News", 0, get_now_madrid_str()
+                    ])
+                descartes_added += 1
+                failed_extractions += 1
+                continue
+
+            # Use resolved URL as the real URL for all subsequent logic
+            url = resolved_url
+
             # Phase 1: Filter candidates with known date (e.g. from Google News RSS pub_date)
             cand_pub_date = parse_iso_date(item.get("pub_date"))
             if cand_pub_date is not None:
@@ -1041,7 +1087,7 @@ class RunService:
                     )
                     if not dry_run:
                         sheets_service.add_descarte(sheet_id, [
-                            isbn, title, author, origin_query, url, "", "fuera de rango de fechas", 0, get_now_madrid_str()
+                            isbn, title, author, origin_query, url, item.get("title") or "", "fuera de rango de fechas", 0, get_now_madrid_str()
                         ])
                     descartes_added += 1
                     continue
@@ -1054,7 +1100,7 @@ class RunService:
                 logger_service.log("DEBUG", "DEDUPLICATE_SKIP", f"{log_prefix}Saltando URL duplicada: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
                 if not dry_run:
                     sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, origin_query, url, "", "duplicado", 0, get_now_madrid_str()
+                        isbn, title, author, origin_query, url, item.get("title") or "", "duplicado", 0, get_now_madrid_str()
                     ])
                 descartes_added += 1
                 continue
@@ -1073,13 +1119,26 @@ class RunService:
                 logger_service.log("WARNING", "EXTRACTION_FAILED", f"{log_prefix}Error extrayendo {url}: {err_msg}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
                 if not dry_run:
                     sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, origin_query, url, "", reason, 0, get_now_madrid_str()
+                        isbn, title, author, origin_query, url, item.get("title") or "", reason, 0, get_now_madrid_str()
                     ])
                 descartes_added += 1
                 failed_extractions += 1
                 continue
 
-            art_title = article_data.get("title") or ""
+            # Fallback to candidate title or snippet if extracted ones are empty
+            art_title = article_data.get("title") or item.get("title") or ""
+            
+            # Detect cookies or consent wall pages
+            extracted_text = article_data.get("text") or ""
+            if is_consent_or_cookie_page(extracted_text):
+                logger_service.log("WARNING", "EXTRACTION_COOKIES_DETECTED", f"{log_prefix}Detectada página de cookies/consentimiento para URL: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                if not dry_run:
+                    sheets_service.add_descarte(sheet_id, [
+                        isbn, title, author, origin_query, url, item.get("title") or "", "página de cookies/consent", 0, get_now_madrid_str()
+                    ])
+                descartes_added += 1
+                failed_extractions += 1
+                continue
 
             # Phase 2: Filter extracted articles with known date
             ext_pub_date = parse_iso_date(article_data.get("date"))
@@ -1136,6 +1195,7 @@ class RunService:
                     "book_author": author,
                     "candidate_title": art_title,
                     "candidate_url": url,
+                    "original_candidate_url": original_candidate_url,
                     "query": origin_query
                 }),
                 sheet_id=sheet_id,
@@ -1153,6 +1213,7 @@ class RunService:
                     "book_author": author,
                     "candidate_title": art_title,
                     "candidate_url": url,
+                    "original_candidate_url": original_candidate_url,
                     "query": origin_query
                 })
             )

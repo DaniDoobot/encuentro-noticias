@@ -18,6 +18,7 @@ HEADERS = {
 }
 
 def clean_html(html_str: str) -> str:
+    import html
     if not html_str:
         return ""
     # Strip HTML tags
@@ -26,15 +27,27 @@ def clean_html(html_str: str) -> str:
     clean = html.unescape(clean)
     return clean.strip()
 
+def is_generic_author(auth_str: str) -> bool:
+    if not auth_str:
+        return True
+    import re
+    import unicodedata
+    norm = auth_str.strip().lower()
+    norm = "".join(c for c in unicodedata.normalize('NFD', norm) if unicodedata.category(c) != 'Mn')
+    norm = re.sub(r'[^a-z0-9]', '', norm)
+    return norm in {"vvaa", "aavv", "variosautores", "varios", "anonimo", "autorvario", "autoresvarios"}
+
 def generate_internal_queries(title: str, author: str, isbn: str) -> List[str]:
     queries = []
+    
+    has_author = author and not is_generic_author(author)
     
     # 1. "título completo"
     if title:
         queries.append(f'"{title}"')
         
     # 2. "título completo" "autor"
-    if title and author:
+    if title and has_author:
         queries.append(f'"{title}" "{author}"')
         
     # 3. ISBN sin guiones
@@ -44,7 +57,7 @@ def generate_internal_queries(title: str, author: str, isbn: str) -> List[str]:
             queries.append(clean_isbn)
             
     # 4. autor + palabra significativa del título
-    if author and title:
+    if has_author and title:
         title_terms = _filter_stopwords(title).split()
         # Find a long/significant word in the title terms
         sig_words = [t for t in title_terms if len(t) > 3]

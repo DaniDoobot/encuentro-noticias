@@ -847,3 +847,180 @@ def test_book_title_preservation_and_logs():
              if called_row[4] == candidate_url:
                  assert called_row[5] == candidate_title # Col 6: Título detectado / artículo
 
+
+def test_generic_author_query_builder():
+    """
+    Verifies that if the author is generic (e.g. VV.AA., AA.VV., Varios autores),
+    the query builder ignores the author and generates variants without it,
+    including 2-word swaps/permutations for titles like "YOUCAT Biblia".
+    """
+    from app.services.query_builder import query_builder
+    
+    # 1. Author "VV.AA."
+    res = query_builder.build_queries("YOUCAT Biblia", "VV.AA.", "978-84-1339-264-6")
+    
+    # Ensure "VV.AA." is not in any prioritarias queries
+    for q in res["prioritarias"]:
+        assert "VV.AA." not in q
+        assert "vv.aa." not in q.lower()
+        
+    # Ensure "YOUCAT Biblia", "Biblia YOUCAT", "Biblia de YOUCAT", and "la nueva Biblia de YOUCAT" are generated
+    assert '"YOUCAT Biblia"' in res["prioritarias"]
+    assert '"Biblia YOUCAT"' in res["prioritarias"]
+    assert '"Biblia de YOUCAT"' in res["prioritarias"]
+    assert '"la nueva Biblia de YOUCAT"' in res["prioritarias"]
+    assert '"9788413392646"' in res["prioritarias"]
+    
+    # Ensure no-quotes variants are in "apoyo"
+    assert "YOUCAT Biblia reseña" in res["apoyo"]
+    assert "YOUCAT Biblia artículo" in res["apoyo"]
+    assert "YOUCAT Biblia crítica" in res["apoyo"]
+    
+    # 2. Author "Varios autores"
+    res2 = query_builder.build_queries("El sentido religioso", "Varios autores", "")
+    for q in res2["prioritarias"]:
+        assert "varios" not in q.lower()
+        assert "autores" not in q.lower()
+
+
+def test_internal_generic_author():
+    """
+    Verifies that generate_internal_queries also ignores generic authors.
+    """
+    from app.services.internal_search_provider import generate_internal_queries
+    
+    queries = generate_internal_queries("YOUCAT Biblia", "VV.AA.", "978-84-1339-264-6")
+    for q in queries:
+        assert "VV.AA." not in q
+        assert "vv.aa." not in q.lower()
+    
+    # Ensure the title query and clean ISBN query are generated
+    assert '"YOUCAT Biblia"' in queries
+    assert '9788413392646' in queries
+
+
+def test_consent_page_detection():
+    """
+    Tests the is_consent_or_cookie_page function with various texts.
+    """
+    from app.services.run_service import is_consent_or_cookie_page
+    
+    # Cookie/consent text
+    text_cookie1 = "Before you continue to Google... We use cookies and data to deliver and maintain services..."
+    text_cookie2 = "Esta web utiliza cookies propias y de terceros para su funcionamiento y para mostrarle publicidad personalizada. Política de privacidad y Uso de datos."
+    
+    # Real article text
+    text_article = "Esta es una reseña literaria sobre el libro San Manuel Bueno, mártir de Unamuno, que trata el dilema existencial de la fe y el cura rural."
+    
+    assert is_consent_or_cookie_page(text_cookie1) is True
+    assert is_consent_or_cookie_page(text_cookie2) is True
+    assert is_consent_or_cookie_page(text_article) is False
+
+
+def test_google_news_resolution_and_fallbacks():
+    """
+    Regression test for Google News RSS URL resolution, resolution failure,
+    cookie page detection, and title preservation in run_service._process_book.
+    """
+    from app.services.run_service import run_service
+    from app.services.sheets_service import sheets_service
+    
+    cand1_url = "https://news.google.com/rss/articles/CBMi1_ok_success"
+    cand2_url = "https://news.google.com/rss/articles/CBMi2_resolution_fails"
+    cand3_url = "https://news.google.com/rss/articles/CBMi3_cookie_page"
+    
+    resolved1_url = "https://www.zendalibros.com/success-article"
+    resolved3_url = "https://cadenaser.com/cookie-page-article"
+    
+    mock_candidates = [
+        {"url": cand1_url, "query": "q", "provider": "GoogleNews", "title": "Titulo 1", "snippet": "S1", "position": 1, "score": 100, "pub_date": None},
+        {"url": cand2_url, "query": "q", "provider": "GoogleNews", "title": "Titulo 2", "snippet": "S2", "position": 2, "score": 100, "pub_date": None},
+        {"url": cand3_url, "query": "q", "provider": "GoogleNews", "title": "Titulo 3", "snippet": "S3", "position": 3, "score": 100, "pub_date": None}
+    ]
+    
+    def mock_gnewsdecoder(url, interval=1):
+        if url == cand1_url:
+            return {"status": True, "decoded_url": resolved1_url}
+        elif url == cand3_url:
+            return {"status": True, "decoded_url": resolved3_url}
+        return {"status": False}
+
+    def mock_extract(url):
+        if url == resolved1_url:
+            return {"title": "Titulo Real 1", "text": "Reseña literaria sobre San Manuel Bueno martir.", "date": "2024-02-18"}
+        elif url == resolved3_url:
+            return {"title": "Google Consent", "text": "Before you continue... We use cookies and data...", "date": "2024-02-18"}
+        raise Exception("Extraction failed")
+
+    with patch("app.services.source_discovery.source_discovery.find_candidates", return_value=mock_candidates), \
+         patch("app.services.sheets_service.sheets_service.get_config_dict", return_value={
+             "MAX_SEARCH_PAGES_PER_QUERY": 1,
+             "MAX_CANDIDATES_PER_BOOK": 5,
+             "MIN_MATCH_SCORE": 70,
+             "SEARCH_PROVIDER_MODE": "auto",
+             "ENABLE_CASCADE_SEARCH": "true",
+             "ENABLE_INTERNAL_DOMAIN_SEARCH": "false",
+             "DEFAULT_INCLUDE_UNKNOWN_DATES": "true"
+         }), \
+         patch("app.services.sheets_service.sheets_service.get_all_reviews", return_value=[]), \
+         patch("googlenewsdecoder.gnewsdecoder", side_effect=mock_gnewsdecoder), \
+         patch("app.services.article_extractor.article_extractor.extract", side_effect=mock_extract), \
+         patch("app.services.openai_analyzer.openai_analyzer.analyze_article", return_value={
+             "is_valid": True,
+             "match_score": 85,
+             "reason": "Excelente reseña",
+             "detected_book_title": "San Manuel Bueno, mártir",
+             "detected_book_author": "Miguel de Unamuno",
+             "content_type": "reseña",
+             "publication_name": "Zenda",
+             "publication_author": "Autor",
+             "publication_date": "2024-02-18",
+             "language": "es",
+             "category": "Literatura",
+             "summary": "Resumen de prueba"
+         }) as mock_analyze, \
+         patch("app.services.sheets_service.sheets_service.add_descarte") as mock_add_descarte, \
+         patch("app.services.sheets_service.sheets_service.add_review") as mock_add_review, \
+         patch("app.services.sheets_service.sheets_service.update_book_status") as mock_status:
+         
+         run_service._process_book(
+             run_id="run_test_decoding",
+             sheet_id="sheet_id",
+             row_index=2,
+             isbn="123456",
+             title="San Manuel Bueno, mártir",
+             author="Miguel de Unamuno",
+             max_pages=1,
+             max_candidates=5,
+             min_score=70,
+             openai_model="gpt-4o",
+             existing_hashes=set(),
+             existing_secondary_keys=set(),
+             dry_run=False
+         )
+         
+         # Verification 1: Only 1 candidate (resolved1_url) was sent to OpenAI validation
+         assert mock_analyze.call_count == 1
+         called_kwargs = mock_analyze.call_args[1]
+         assert called_kwargs["url"] == resolved1_url
+         
+         # Verification 2: add_review is called with the resolved URL
+         assert mock_add_review.call_count == 1
+         assert mock_add_review.call_args[0][1][4] == resolved1_url
+         
+         # Verification 3: add_descarte is called for failed resolution and cookie pages
+         assert mock_add_descarte.call_count >= 2
+         discard_reasons = [call[0][1][6] for call in mock_add_descarte.call_args_list]
+         discard_urls = [call[0][1][4] for call in mock_add_descarte.call_args_list]
+         discard_titles = [call[0][1][5] for call in mock_add_descarte.call_args_list]
+         
+         # One descarte is failed resolution
+         assert "no se pudo resolver URL de Google News" in discard_reasons
+         assert cand2_url in discard_urls
+         assert "Titulo 2" in discard_titles
+         
+         # One descarte is cookie consent page
+         assert "página de cookies/consent" in discard_reasons
+         assert resolved3_url in discard_urls
+         assert "Titulo 3" in discard_titles
+
