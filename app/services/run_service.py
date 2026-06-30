@@ -561,15 +561,57 @@ class RunService:
                 logger_service.log("ERROR", "BOOK_STATUS_UPDATE_FAIL", f"No se pudo actualizar el estado del libro a procesando: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
                 self._add_in_memory_log(run_id, "ERROR", "BOOK_STATUS_UPDATE_FAIL", f"Fallo al marcar procesando: {e}", isbn=isbn)
 
-        # 1. Generate queries categorized into 3 levels
+        # 1. Load configs & log effective configuration
+        effective_min_score = min_score
+        effective_max_candidates = max_candidates
+        effective_news_complement = int(config.get("DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES))
+        effective_max_queries = max_queries
+        
+        config_effective_detail = json.dumps({
+            "MIN_MATCH_SCORE": effective_min_score,
+            "MAX_CANDIDATES_PER_BOOK": effective_max_candidates,
+            "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES": effective_news_complement,
+            "MAX_QUERIES_PER_BOOK": effective_max_queries,
+            "GOOGLE_NEWS_BROAD_MAX_QUERIES": 10
+        })
+        logger_service.log("INFO", "RUN_CONFIG_EFFECTIVE", f"{log_prefix}Configuración efectiva para este libro", isbn=isbn, detail=config_effective_detail, sheet_id=sheet_id, run_id=run_id)
+        self._add_in_memory_log(run_id, "INFO", "RUN_CONFIG_EFFECTIVE", f"{log_prefix}Configuración efectiva para este libro", isbn=isbn, detail=config_effective_detail)
+
+        # Check if author is generic and log normalization
+        author_is_generic = False
+        if author and author.strip():
+            author_is_generic = query_builder.is_generic_author(author)
+            if author_is_generic:
+                auth_norm_detail = json.dumps({
+                    "original_author": author,
+                    "normalized_author": "",
+                    "author_is_generic": True
+                })
+                logger_service.log("INFO", "AUTHOR_NORMALIZED_AS_GENERIC", f"{log_prefix}Autor genérico detectado y normalizado", isbn=isbn, detail=auth_norm_detail, sheet_id=sheet_id, run_id=run_id)
+                self._add_in_memory_log(run_id, "INFO", "AUTHOR_NORMALIZED_AS_GENERIC", f"{log_prefix}Autor genérico detectado y normalizado", isbn=isbn, detail=auth_norm_detail)
+
+        # Generate queries categorized into 3 levels plus broad queries
         queries_dict = query_builder.build_queries(title, author, isbn, review_domains=review_domains)
         prioritarias = queries_dict["prioritarias"]
         apoyo = queries_dict["apoyo"]
         dominios = queries_dict["dominios"]
+        broad_queries = query_builder.build_broad_queries(title, author, isbn)
         
+        queries_built_detail = json.dumps({
+            "book_title": title,
+            "book_author": author,
+            "author_is_generic": author_is_generic,
+            "prioritarias": prioritarias,
+            "apoyo": apoyo,
+            "dominios": dominios,
+            "broad_queries": broad_queries
+        }, ensure_ascii=False)
+        logger_service.log("INFO", "BOOK_QUERIES_BUILT", f"{log_prefix}Queries generadas para la búsqueda", isbn=isbn, detail=queries_built_detail, sheet_id=sheet_id, run_id=run_id)
+        self._add_in_memory_log(run_id, "INFO", "BOOK_QUERIES_BUILT", f"{log_prefix}Queries generadas para la búsqueda", isbn=isbn, detail=queries_built_detail)
+
         self._add_in_memory_log(
             run_id, "INFO", "QUERIES_GENERATED", 
-            f"{log_prefix}Generadas queries por nivel: Prioritarias={len(prioritarias)}, Apoyo={len(apoyo)}, Dominios={len(dominios)}", 
+            f"{log_prefix}Generadas queries por nivel: Prioritarias={len(prioritarias)}, Apoyo={len(apoyo)}, Dominios={len(dominios)}, Broad={len(broad_queries)}", 
             isbn=isbn
         )
 
@@ -680,6 +722,63 @@ class RunService:
             google_news_candidates_count = google_news_candidates
             logger_service.log("INFO", "GOOGLE_NEWS_COMPLEMENT_COMPLETED", f"{log_prefix}Fase 2: Google News Complement completada. Candidatos nuevos={google_news_candidates_count}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
             self._add_in_memory_log(run_id, "INFO", "GOOGLE_NEWS_COMPLEMENT_COMPLETED", f"Fase 2: Google News Complement completada. Candidatos nuevos={google_news_candidates_count}", isbn=isbn)
+
+            # If no candidates were found on Google News, run Broad Google News phase
+            if google_news_candidates_count == 0:
+                logger_service.log(
+                    "INFO", "GOOGLE_NEWS_BROAD_STARTED",
+                    f"{log_prefix}0 candidatos en Google News. Iniciando Fase 2 Broad (queries amplias)",
+                    isbn=isbn, sheet_id=sheet_id, run_id=run_id
+                )
+                self._add_in_memory_log(
+                    run_id, "INFO", "GOOGLE_NEWS_BROAD_STARTED",
+                    f"{log_prefix}0 candidatos en Google News. Iniciando Fase 2 Broad (queries amplias)",
+                    isbn=isbn
+                )
+                broad_queries_done = 0
+                for q in broad_queries:
+                    self._check_cancellation(run_id)
+                    # Broad queries run on their own budget of up to 10 queries, ignoring max_queries!
+                    if broad_queries_done >= 10:
+                        break
+                    if len(candidate_origin) >= max_candidates:
+                        break
+                    if queries_executed > 0 or broad_queries_done > 0:
+                        time.sleep(search_delay)
+                    rss_results = search_service.search_with_fallback(
+                        query=q,
+                        max_pages=max_pages,
+                        sheet_id=sheet_id,
+                        run_id=run_id,
+                        isbn=isbn,
+                        config={**config, "SEARCH_PROVIDER_MODE": "google_news_only"},
+                        log_callback=self._add_in_memory_log
+                    )
+                    queries_executed += 1
+                    broad_queries_done += 1
+                    for item in rss_results:
+                        url = item["url"]
+                        if url not in candidate_origin and len(candidate_origin) < max_candidates:
+                            candidate_origin[url] = {
+                                "query": item.get("query") or q,
+                                "provider": item.get("provider"),
+                                "title": item.get("title") or "",
+                                "snippet": item.get("snippet") or "",
+                                "position": item.get("position"),
+                                "pub_date": item.get("pub_date")
+                            }
+                            google_news_candidates += 1
+                google_news_candidates_count = google_news_candidates
+                logger_service.log(
+                    "INFO", "GOOGLE_NEWS_BROAD_COMPLETED",
+                    f"{log_prefix}Fase 2 Broad completada. Candidatos nuevos={google_news_candidates}, total Google News={google_news_candidates_count}",
+                    isbn=isbn, sheet_id=sheet_id, run_id=run_id
+                )
+                self._add_in_memory_log(
+                    run_id, "INFO", "GOOGLE_NEWS_BROAD_COMPLETED",
+                    f"{log_prefix}Fase 2 Broad completada. Candidatos nuevos={google_news_candidates}",
+                    isbn=isbn
+                )
 
             # PHASE 3 — Internal Domain Search
             self._check_cancellation(run_id)
@@ -934,6 +1033,55 @@ class RunService:
                                 "query": item.get("query") or q, "provider": item.get("provider"), "title": item.get("title") or "", "snippet": item.get("snippet") or "", "position": item.get("position"), "pub_date": item.get("pub_date")
                             }
                 internal_search_candidates_count = len(candidate_origin) - google_news_candidates_count
+
+            # If search_mode is google_news_only and we got 0 candidates, run Broad Google News phase
+            if len(candidate_origin) == 0 and search_mode == "google_news_only":
+                logger_service.log(
+                    "INFO", "GOOGLE_NEWS_BROAD_STARTED",
+                    f"{log_prefix}0 candidatos en Google News (modo single-provider). Iniciando queries amplias",
+                    isbn=isbn, sheet_id=sheet_id, run_id=run_id
+                )
+                self._add_in_memory_log(
+                    run_id, "INFO", "GOOGLE_NEWS_BROAD_STARTED",
+                    f"{log_prefix}0 candidatos en Google News (modo single-provider). Iniciando queries amplias",
+                    isbn=isbn
+                )
+                broad_queries_done = 0
+                for q in broad_queries:
+                    self._check_cancellation(run_id)
+                    # Broad queries run on their own budget of up to 10 queries, ignoring max_queries!
+                    if broad_queries_done >= 10:
+                        break
+                    if len(candidate_origin) >= max_candidates:
+                        break
+                    if queries_executed > 0 or broad_queries_done > 0:
+                        time.sleep(search_delay)
+                    found_items = search_service.search_with_fallback(
+                        query=q, max_pages=max_pages, sheet_id=sheet_id, run_id=run_id, isbn=isbn, config=config, log_callback=self._add_in_memory_log
+                    )
+                    queries_executed += 1
+                    broad_queries_done += 1
+                    for item in found_items:
+                        url = item["url"]
+                        if url not in candidate_origin and len(candidate_origin) < max_candidates:
+                            candidate_origin[url] = {
+                                "query": item.get("query") or q,
+                                "provider": item.get("provider"),
+                                "title": item.get("title") or "",
+                                "snippet": item.get("snippet") or "",
+                                "position": item.get("position"),
+                                "pub_date": item.get("pub_date")
+                            }
+                logger_service.log(
+                    "INFO", "GOOGLE_NEWS_BROAD_COMPLETED",
+                    f"{log_prefix}Fase Broad completada. total Google News={len(candidate_origin)}",
+                    isbn=isbn, sheet_id=sheet_id, run_id=run_id
+                )
+                self._add_in_memory_log(
+                    run_id, "INFO", "GOOGLE_NEWS_BROAD_COMPLETED",
+                    f"{log_prefix}Fase Broad completada. total Google News={len(candidate_origin)}",
+                    isbn=isbn
+                )
 
             candidates_discarded_by_limit = 0
             internal_search_was_forced = False

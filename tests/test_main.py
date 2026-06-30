@@ -1068,3 +1068,166 @@ def test_ensure_sheet_endpoint_propagates_errors():
     assert response.status_code == 500
     detail = response.json().get("detail", "")
     assert "libros_ws" in detail or "Google Sheets setup failed" in detail
+
+import json
+
+def test_build_broad_queries():
+    """
+    Tests build_broad_queries with generic author.
+    Verifies that it contains lowercase youcat biblia, doesn't contain VV.AA., and doesn't contain reseña/crítica.
+    """
+    from app.services.query_builder import query_builder
+    
+    broad = query_builder.build_broad_queries("YOUCAT Biblia", "VV.AA.", "978-84-1339-264-6")
+    
+    # 1. Contains lowercase youcat biblia
+    assert "youcat biblia" in broad
+    
+    # 2. No VV.AA. or variations
+    for q in broad:
+        assert "VV.AA." not in q
+        assert "vv.aa." not in q.lower()
+        
+    # 3. No reseña/crítica
+    for q in broad:
+        assert "reseña" not in q.lower()
+        assert "crítica" not in q.lower()
+        assert "critica" not in q.lower()
+        assert "libro" not in q.lower() # No "libro" restrictor
+
+
+def test_broad_news_search_triggers_and_budget_guaranteed():
+    """
+    Verifies that if normal Google News search returns 0 candidates,
+    GOOGLE_NEWS_BROAD is triggered with its own budget (10 queries),
+    even if MAX_QUERIES_PER_BOOK is low (e.g. 1).
+    """
+    from unittest.mock import patch
+    from app.services.run_service import run_service
+    
+    # Setup candidate mock lists:
+    # First search_with_fallback returns empty list (0 candidates found in Phase 2)
+    # Broad query search returns 1 candidate
+    mock_rss_normal = []
+    mock_rss_broad = [{"url": "https://www.zendalibros.com/youcat-article", "title": "YOUCAT Biblia - Zenda", "snippet": "Snippet", "position": 1, "pub_date": "2024-02-18", "provider": "GoogleNewsRss"}]
+    
+    def side_effect_search(query, *args, **kwargs):
+        # If it's a broad query (doesn't contain "reseña" or "crítica" or "libro" and title is YOUCAT Biblia)
+        q_lower = query.lower()
+        if "reseña" not in q_lower and "crítica" not in q_lower and "libro" not in q_lower:
+            return mock_rss_broad
+        return mock_rss_normal
+
+    with patch("app.services.source_discovery.source_discovery.find_candidates", return_value=[]), \
+         patch("app.services.sheets_service.sheets_service.get_config_dict", return_value={
+             "MAX_QUERIES_PER_BOOK": 1, # extremely low limit to test budget bypass
+             "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES": 1,
+             "MIN_MATCH_SCORE": 10,
+             "MAX_CANDIDATES_PER_BOOK": 5,
+             "SEARCH_PROVIDER_MODE": "google_news_only",
+             "ENABLE_CASCADE_SEARCH": "true"
+         }), \
+         patch("app.services.sheets_service.sheets_service.get_all_reviews", return_value=[]), \
+         patch("app.services.search_service.search_service.search_with_fallback", side_effect=side_effect_search) as mock_search, \
+         patch("app.services.openai_analyzer.openai_analyzer.analyze_article", return_value={
+             "is_valid": True,
+             "match_score": 85,
+             "reason": "Excelente artículo",
+             "detected_book_title": "YOUCAT Biblia",
+             "detected_book_author": "VV.AA.",
+             "content_type": "artículo",
+             "publication_name": "Zenda",
+             "publication_author": "Autor",
+             "publication_date": "2024-02-18",
+             "language": "es",
+             "category": "Religión",
+             "summary": "Resumen"
+         }), \
+         patch("app.services.sheets_service.sheets_service.add_descarte") as mock_add_descarte, \
+         patch("app.services.sheets_service.sheets_service.add_review") as mock_add_review, \
+         patch("app.services.sheets_service.sheets_service.update_book_status") as mock_status, \
+         patch("app.services.logger_service.logger_service.log") as mock_log:
+         
+         run_service._process_book(
+             run_id="run_test_broad",
+             sheet_id="sheet_id",
+             row_index=2,
+             isbn="123456",
+             title="YOUCAT Biblia",
+             author="VV.AA.",
+             max_pages=1,
+             max_candidates=5,
+             min_score=10,
+             openai_model="gpt-4o",
+             existing_hashes=set(),
+             existing_secondary_keys=set(),
+             dry_run=False
+         )
+         
+         # Verification 1: RUN_CONFIG_EFFECTIVE reflects config values and GOOGLE_NEWS_BROAD_MAX_QUERIES = 10
+         effective_config_logs = [call for call in mock_log.call_args_list if call[0][1] == "RUN_CONFIG_EFFECTIVE"]
+         assert len(effective_config_logs) == 1
+         payload = json.loads(effective_config_logs[0][1].get("detail", "{}"))
+         assert payload.get("MIN_MATCH_SCORE") == 10
+         assert payload.get("GOOGLE_NEWS_BROAD_MAX_QUERIES") == 10
+         
+         # Verification 2: AUTHOR_NORMALIZED_AS_GENERIC is logged
+         generic_author_logs = [call for call in mock_log.call_args_list if call[0][1] == "AUTHOR_NORMALIZED_AS_GENERIC"]
+         assert len(generic_author_logs) == 1
+         auth_payload = json.loads(generic_author_logs[0][1].get("detail", "{}"))
+         assert auth_payload.get("original_author") == "VV.AA."
+         assert auth_payload.get("author_is_generic") is True
+         
+         # Verification 3: BOOK_QUERIES_BUILT is logged separating categories
+         queries_built_logs = [call for call in mock_log.call_args_list if call[0][1] == "BOOK_QUERIES_BUILT"]
+         assert len(queries_built_logs) == 1
+         queries_payload = json.loads(queries_built_logs[0][1].get("detail", "{}"))
+         assert "prioritarias" in queries_payload
+         assert "broad_queries" in queries_payload
+         assert "youcat biblia" in queries_payload["broad_queries"]
+
+         # Verification 4: GOOGLE_NEWS_BROAD_STARTED is logged
+         broad_started_logs = [call for call in mock_log.call_args_list if call[0][1] == "GOOGLE_NEWS_BROAD_STARTED"]
+         assert len(broad_started_logs) >= 1
+
+         # Verification 5: broad search executed successfully and candidate added
+         assert mock_add_review.call_count == 1
+         review_data = mock_add_review.call_args[0][1]
+         assert review_data.get("URL") == "https://www.zendalibros.com/youcat-article"
+
+
+def test_debug_google_news_endpoint():
+    """
+    Tests GET /debug/google-news endpoint structure.
+    """
+    from unittest.mock import patch
+    from app.services.search_providers import SearchProviderResult
+
+    mock_rss_result = SearchProviderResult(
+        provider="GoogleNewsRss",
+        query="youcat biblia",
+        status="ok",
+        status_code=200,
+        urls=["https://www.zendalibros.com/youcat-article"],
+        debug={
+            "organic_results_parsed": [
+                {
+                    "url": "https://www.zendalibros.com/youcat-article",
+                    "title": "YOUCAT Biblia - Zenda",
+                    "snippet": "Snippet",
+                    "pub_date": "2024-02-18",
+                    "position": 1
+                }
+            ]
+        }
+    )
+
+    with patch("app.routers.setup.GoogleNewsRssSearchProvider.search", return_value=mock_rss_result):
+        response = client.get("/debug/google-news?q=youcat%20biblia")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["query"] == "youcat biblia"
+    assert data["parsed_results_count"] == 1
+    assert data["results"][0]["source"] == "Zenda"
+    assert data["results"][0]["url"] == "https://www.zendalibros.com/youcat-article"

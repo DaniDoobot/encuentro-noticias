@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     SCRAPER_USER_AGENT: str = "Mozilla/5.0 compatible encuentro-noticias"
     SEARCH_DELAY_SECONDS: int = 3
     SEARCH_BACKOFF_SECONDS: int = 30
-    MAX_QUERIES_PER_BOOK: int = 20
+    MAX_QUERIES_PER_BOOK: int = 12
     ENABLE_GOOGLE_NEWS_RSS: bool = True
     SEARCH_PROVIDER_MODE: str = "auto"
     ENABLE_SERPAPI: bool = False
@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     DOMAIN_INDEX_REFRESH_DAYS: int = 7
     DOMAIN_INDEX_MIN_SCORE: int = 70
     DOMAIN_INDEX_DB_PATH: str = "data/reviews_index.sqlite"
-    DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES: int = 6
+    DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES: int = 10
     ENRICH_INDEXED_URLS: bool = True
     DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN: int = 200
     DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS: int = 10

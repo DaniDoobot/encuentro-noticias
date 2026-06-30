@@ -1,7 +1,73 @@
 import urllib.parse
 from typing import List, Dict
+import re
+import unicodedata
 
 class QueryBuilder:
+    @staticmethod
+    def is_generic_author(auth_str: str) -> bool:
+        if not auth_str:
+            return True
+        norm = auth_str.strip().lower()
+        # Remove accents/diacritics
+        norm = "".join(c for c in unicodedata.normalize('NFD', norm) if unicodedata.category(c) != 'Mn')
+        # Keep alphanumeric only
+        norm = re.sub(r'[^a-z0-9]', '', norm)
+        # Match against common generic patterns
+        return norm in {"vvaa", "aavv", "variosautores", "varios", "anonimo", "autorvario", "autoresvarios"}
+
+    @staticmethod
+    def build_broad_queries(title: str, author: str, isbn: str) -> List[str]:
+        title_clean = title.replace('"', "'").strip()
+        isbn_clean = isbn.replace('"', "").replace('-', "").strip()
+        
+        # Broad queries must never contain generic authors, nor restrictors like reseña/crítica.
+        # They start with broad queries like title without quotes, title with quotes, etc.
+        queries = []
+        
+        # Add lowercase variant first/second as requested ("youcat biblia")
+        title_lower = title_clean.lower()
+        queries.append(title_lower)
+        
+        # Original case title without quotes
+        queries.append(title_clean)
+        
+        # Title with quotes
+        queries.append(f'"{title_clean}"')
+        
+        words = title_clean.split()
+        if len(words) >= 2:
+            w1, w2 = words[0], words[1]
+            w1_lower, w2_lower = w1.lower(), w2.lower()
+            queries.extend([
+                f'{w2_lower} {w1_lower}',  # Permuted lowercase
+                f'{w2} {w1}',              # Permuted original case
+                f'"{w2} {w1}"',
+                f'"{w2} de {w1}"',
+                f'"la nueva {w2} de {w1}"',
+                f'"nueva {w2} {w1}"'
+            ])
+            
+        queries.extend([
+            f'{title_clean} noticia',
+            f'{title_clean} artículo'
+        ])
+        
+        if isbn_clean:
+            queries.append(isbn_clean)
+        if isbn and isbn.strip():
+            queries.append(isbn.strip())
+            
+        # Deduplicate preserving order
+        seen = set()
+        cleaned = []
+        for q in queries:
+            q_strip = q.strip()
+            if q_strip and q_strip not in seen:
+                seen.add(q_strip)
+                cleaned.append(q_strip)
+        return cleaned
+
     @staticmethod
     def build_queries(title: str, author: str, isbn: str, review_domains: List[str] = None) -> Dict[str, List[str]]:
         # Clean inputs: remove trailing/leading spaces, replace double quotes with single quotes inside text
@@ -9,22 +75,7 @@ class QueryBuilder:
         author_clean = author.replace('"', "'").strip()
         isbn_clean = isbn.replace('"', "").replace('-', "").strip()
 
-        # Helper to check for generic authors
-        import re
-        import unicodedata
-
-        def is_generic_author(auth_str: str) -> bool:
-            if not auth_str:
-                return True
-            norm = auth_str.strip().lower()
-            # Remove accents/diacritics
-            norm = "".join(c for c in unicodedata.normalize('NFD', norm) if unicodedata.category(c) != 'Mn')
-            # Keep alphanumeric only
-            norm = re.sub(r'[^a-z0-9]', '', norm)
-            # Match against common generic patterns
-            return norm in {"vvaa", "aavv", "variosautores", "varios", "anonimo", "autorvario", "autoresvarios"}
-
-        has_author = bool(author_clean) and not is_generic_author(author_clean)
+        has_author = bool(author_clean) and not QueryBuilder.is_generic_author(author_clean)
         has_isbn = bool(isbn_clean)
 
         prioritarias = []

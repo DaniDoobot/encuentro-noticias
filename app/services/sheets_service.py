@@ -546,6 +546,33 @@ class SheetsService:
             if k not in existing_tech:
                 tech_ws.append_row([t["Clave"], t["Valor"], t["Descripción"]], value_input_option="USER_ENTERED")
 
+        # Check and update existing technical limits if they are too low
+        try:
+            tech_all = tech_ws.get_all_values()
+            if tech_all:
+                tech_headers = tech_all[0]
+                if "Clave" in tech_headers and "Valor" in tech_headers:
+                    col_clave = tech_headers.index("Clave") + 1
+                    col_valor = tech_headers.index("Valor") + 1
+                    for r_idx, row in enumerate(tech_all[1:], start=2):
+                        if col_clave - 1 < len(row) and col_valor - 1 < len(row):
+                            clave = row[col_clave - 1]
+                            valor_str = row[col_valor - 1]
+                            try:
+                                valor_int = int(valor_str)
+                            except ValueError:
+                                continue
+                            if clave == "MAX_QUERIES_PER_BOOK" and valor_int < 12:
+                                tech_ws.update_cell(r_idx, col_valor, 12)
+                                logger.info(f"Updated MAX_QUERIES_PER_BOOK from {valor_int} to 12 in Config técnica")
+                                logger_service.log("WARNING", "CONFIG_LOW_QUERY_LIMIT_WARNING", f"Actualizado límite bajo de MAX_QUERIES_PER_BOOK ({valor_int} -> 12)", sheet_id=sheet_id)
+                            if clave == "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES" and valor_int < 10:
+                                tech_ws.update_cell(r_idx, col_valor, 10)
+                                logger.info(f"Updated DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES from {valor_int} to 10 in Config técnica")
+                                logger_service.log("WARNING", "CONFIG_LOW_QUERY_LIMIT_WARNING", f"Actualizado límite bajo de DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES ({valor_int} -> 10)", sheet_id=sheet_id)
+        except Exception as e_upd:
+            logger.warning(f"Error checking/updating low query limits in Config técnica: {e_upd}")
+
         # Initialise Fuentes tab with default domains if empty
         fuentes_ws = spreadsheet.worksheet("Fuentes")
         fuentes_rows = fuentes_ws.get_all_records()
