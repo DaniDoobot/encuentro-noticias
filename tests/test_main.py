@@ -1026,3 +1026,45 @@ def test_google_news_resolution_and_fallbacks():
          assert resolved3_url in discard_urls
          assert "Titulo 3" in discard_titles
 
+
+
+def test_ensure_sheet_endpoint_ok():
+    """
+    Regression test for POST /setup/ensure-sheet.
+    Verifies the endpoint returns 200 when ensure_sheet succeeds.
+    Any NameError in ensure_sheet must propagate as HTTP 500.
+    """
+    from unittest.mock import patch
+
+    mock_result = {
+        "success": True,
+        "sheet_id": "fake_sheet_id",
+        "sheet_url": "https://docs.google.com/spreadsheets/d/fake_sheet_id",
+        "created_tabs": []
+    }
+
+    with patch("app.routers.setup.sheets_service.ensure_sheet", return_value=mock_result):
+        response = client.post("/setup/ensure-sheet")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] is True
+    assert "sheet_id" in data
+
+
+def test_ensure_sheet_endpoint_propagates_errors():
+    """
+    Regression test: if ensure_sheet raises a NameError (e.g. 'libros_ws' not defined),
+    the endpoint must return HTTP 500 with a detail message.
+    """
+    from unittest.mock import patch
+
+    with patch(
+        "app.routers.setup.sheets_service.ensure_sheet",
+        side_effect=NameError("name 'libros_ws' is not defined")
+    ):
+        response = client.post("/setup/ensure-sheet")
+
+    assert response.status_code == 500
+    detail = response.json().get("detail", "")
+    assert "libros_ws" in detail or "Google Sheets setup failed" in detail

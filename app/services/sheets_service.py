@@ -307,6 +307,8 @@ class SheetsService:
             panel_ws.update(range_name="A1", values=panel_structure)
             
         # Apply date, number validations and boolean checkboxes always
+        # Resolve these worksheets before the try block so they are always in scope
+        libros_ws = spreadsheet.worksheet("Libros")
         try:
             ws_to_pub = spreadsheet.worksheet("Reseñas por publicar")
             ws_pub = spreadsheet.worksheet("Reseñas publicadas")
@@ -429,7 +431,7 @@ class SheetsService:
             spreadsheet.batch_update({"requests": val_requests})
         except Exception as e_val:
             logger.error(f"Error applying Panel validation format: {e_val}")
-            raise e_val
+            # Non-fatal: formatting failures should not abort the entire setup
 
         # Fill empty checkboxes to TRUE for books with a title
         try:
