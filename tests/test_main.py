@@ -1112,9 +1112,9 @@ def test_broad_news_search_triggers_and_budget_guaranteed():
     mock_rss_broad = [{"url": "https://www.zendalibros.com/youcat-article", "title": "YOUCAT Biblia - Zenda", "snippet": "Snippet", "position": 1, "pub_date": "2024-02-18", "provider": "GoogleNewsRss"}]
     
     def side_effect_search(query, *args, **kwargs):
-        # If it's a broad query (doesn't contain "reseña" or "crítica" or "libro" and title is YOUCAT Biblia)
-        q_lower = query.lower()
-        if "reseña" not in q_lower and "crítica" not in q_lower and "libro" not in q_lower:
+        # Normal phase queries (like those in prioritarias) return empty list
+        # Broad phase queries (like "youcat biblia" lowercase without quotes) return candidates
+        if query == "youcat biblia" or query == "youcat biblia noticia" or query == "youcat biblia artículo":
             return mock_rss_broad
         return mock_rss_normal
 
