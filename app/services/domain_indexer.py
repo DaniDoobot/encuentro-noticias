@@ -362,6 +362,8 @@ class DomainIndexer:
         log_fn: Optional[Callable] = None,
         force_refresh: bool = False,
         on_progress: Optional[Callable[[int, int, int], None]] = None,
+        sheet_id: str = "",
+        run_id: str = ""
     ) -> Dict[str, Any]:
         """
         Index a single domain. Returns stats dict.
@@ -456,6 +458,14 @@ class DomainIndexer:
                             else:
                                 discovery_method = "common_sitemap"
                             _log(f"Sitemap {s_url} succeeded: found {len(items)} URLs")
+                            
+                            # Log SOURCE_SITEMAP_DISCOVERED
+                            from app.services.logger_service import logger_service
+                            logger_service.log(
+                                "INFO", "SOURCE_SITEMAP_DISCOVERED",
+                                f"Sitemap descubierta e indexada para {domain}: {s_url} ({len(items)} URLs encontradas)",
+                                sheet_id=sheet_id, run_id=run_id
+                            )
                             break
                     except Exception as e:
                         last_error_msg = f"Sitemap parse error on {s_url}: {e}"
@@ -485,6 +495,14 @@ class DomainIndexer:
                                 sitemaps_contacted.append(s_url)
                                 discovery_method = "common_sitemap"
                                 _log(f"Common sitemap {s_url} succeeded: found {len(items)} URLs")
+                                
+                                # Log SOURCE_SITEMAP_DISCOVERED
+                                from app.services.logger_service import logger_service
+                                logger_service.log(
+                                    "INFO", "SOURCE_SITEMAP_DISCOVERED",
+                                    f"Sitemap descubierta e indexada para {domain}: {s_url} ({len(items)} URLs encontradas)",
+                                    sheet_id=sheet_id, run_id=run_id
+                                )
                                 break
                         except Exception as e:
                             last_error_msg = f"Sitemap parse error on {s_url}: {e}"
@@ -522,12 +540,50 @@ class DomainIndexer:
                             rss_contacted.append(r_url)
                             discovery_method = "rss"
                             _log(f"RSS feed {r_url} succeeded: found {len(rss_items)} entries")
+                            
+                            # Log SOURCE_RSS_DISCOVERED
+                            from app.services.logger_service import logger_service
+                            logger_service.log(
+                                "INFO", "SOURCE_RSS_DISCOVERED",
+                                f"RSS descubierta e indexada para {domain}: {r_url} ({len(rss_items)} URLs encontradas)",
+                                sheet_id=sheet_id, run_id=run_id
+                            )
                             break
                     except Exception as e:
                         last_error_msg = f"RSS parse error on {r_url}: {e}"
                         errors.append(f"rss_parse_error_{r_url}")
                 else:
                     errors.append(f"rss_not_retrieved_{r_url}")
+
+        # Phase C: WordPress REST API fallback
+        if len(all_items) == 0:
+            _log("Sitemaps and RSS yielded 0 URLs. Trying WordPress REST API...")
+            try:
+                wp_url = f"https://{domain}/wp-json/wp/v2/posts?per_page=100"
+                r_wp = _get(wp_url, timeout=timeout)
+                if r_wp and r_wp.status_code == 200:
+                    data = r_wp.json()
+                    if isinstance(data, list):
+                        wp_items = []
+                        for post in data:
+                            item_url = post.get("link") or post.get("url")
+                            if not item_url:
+                                continue
+                            title_obj = post.get("title")
+                            title_str = title_obj.get("rendered") if isinstance(title_obj, dict) else title_obj
+                            
+                            wp_items.append({
+                                "url": _normalize_url(item_url),
+                                "title": title_str or "",
+                                "pub_date": post.get("date", ""),
+                                "provider": "wordpress_rest"
+                            })
+                        if wp_items:
+                            all_items.extend(wp_items)
+                            discovery_method = "wordpress_rest"
+                            _log(f"WordPress REST API succeeded: found {len(wp_items)} posts")
+            except Exception as e:
+                errors.append(f"wordpress_rest_failed: {e}")
 
         # Deduplicate by URL
         seen: set = set()
@@ -667,8 +723,8 @@ class DomainIndexer:
                 "discovery_method": discovery_method,
                 "last_error": last_error_msg
             }),
-            sheet_id="",
-            run_id=""
+            sheet_id=sheet_id,
+            run_id=run_id
         )
 
         # Store domain status in SQLite domain_status table
@@ -685,6 +741,22 @@ class DomainIndexer:
             )
         except Exception as db_err:
             logger.warning(f"Could not upsert domain status to SQLite for {domain}: {db_err}")
+
+        # Log SOURCE_INDEX_DOMAIN_SUMMARY
+        logger_service.log(
+            level="INFO",
+            action="SOURCE_INDEX_DOMAIN_SUMMARY",
+            message=f"Resumen de indexación para {domain}: encontradas={len(unique_items)}, almacenadas={stored}, enriquecidas={enrich_count}",
+            isbn="",
+            detail=json.dumps({
+                "domain": domain,
+                "found_count": len(unique_items),
+                "stored_count": stored,
+                "enriched_count": enrich_count
+            }),
+            sheet_id=sheet_id,
+            run_id=run_id
+        )
 
         _log(f"Done: {len(unique_items)} URLs found, {stored} new stored, {len(errors)} errors")
         return {
@@ -723,7 +795,9 @@ class DomainIndexer:
                     config,
                     log_fn=log_fn,
                     force_refresh=force_refresh,
-                    on_progress=on_progress
+                    on_progress=on_progress,
+                    sheet_id=sheet_id,
+                    run_id=run_id
                 )
                 stats["last_indexed"] = datetime.datetime.utcnow().isoformat()
                 results.append(stats)

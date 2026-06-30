@@ -11,7 +11,7 @@ from app.config import settings
 from app.services.sheets_service import sheets_service, get_now_madrid_str
 from app.services.query_builder import query_builder
 from app.services.search_service import search_service, is_true
-from app.services.article_extractor import article_extractor
+from app.services.article_extractor import article_extractor, normalize_date
 from app.services.openai_analyzer import openai_analyzer
 from app.services.deduplicator import deduplicator
 from app.services.logger_service import logger_service
@@ -845,6 +845,7 @@ class RunService:
 
                 internal_domains_attempted = len(domains)
                 if domains:
+                    source_by_domain = {s["domain"]: s for s in sources}
                     new_urls_found = 0
                     for domain in domains:
                         self._check_cancellation(run_id)
@@ -854,7 +855,10 @@ class RunService:
                                 title=title,
                                 author=author,
                                 isbn=isbn,
-                                config=config
+                                config=config,
+                                source_info=source_by_domain.get(domain),
+                                sheet_id=sheet_id,
+                                run_id=run_id
                             )
                             if items:
                                 internal_domains_with_results += 1
@@ -1260,8 +1264,31 @@ class RunService:
             # Extract article content
             article_data = {}
             try:
-                article_data = article_extractor.extract(url)
+                article_data = article_extractor.extract(url, provider_item=item)
                 extracted_ok_count += 1
+                
+                # Log METADATA_EXTRACTED
+                meta_extracted_detail = json.dumps({
+                    "url": url,
+                    "article_author": article_data.get("author", ""),
+                    "publication_name": article_data.get("publication_name", ""),
+                    "published_date": article_data.get("date", ""),
+                    "author_source": article_data.get("author_source", "empty"),
+                    "date_source": article_data.get("date_source", "empty")
+                }, ensure_ascii=False)
+                logger_service.log(
+                    "INFO", "METADATA_EXTRACTED", 
+                    f"{log_prefix}Metadatos extraídos para la URL: {url}", 
+                    isbn=isbn, detail=meta_extracted_detail, sheet_id=sheet_id, run_id=run_id
+                )
+                
+                # Log AUTHOR_FALLBACK_TO_EMPTY if empty
+                if not article_data.get("author"):
+                    logger_service.log(
+                        "INFO", "AUTHOR_FALLBACK_TO_EMPTY", 
+                        f"{log_prefix}No se encontró autor real para la URL, se deja vacío: {url}", 
+                        isbn=isbn, sheet_id=sheet_id, run_id=run_id
+                    )
             except Exception as e:
                 err_msg = str(e)
                 reason = "error HTTP" if "error HTTP" in err_msg else "extracción fallida"
@@ -1371,6 +1398,14 @@ class RunService:
             )
 
             try:
+                metadata_detected = {
+                    "article_author": article_data.get("author") or "",
+                    "publication_name": article_data.get("publication_name") or "",
+                    "published_date": article_data.get("date") or "",
+                    "author_source": article_data.get("author_source") or "empty",
+                    "date_source": article_data.get("date_source") or "empty"
+                }
+
                 analysis = openai_analyzer.analyze_article(
                     isbn=isbn,
                     book_title=title,
@@ -1382,7 +1417,8 @@ class RunService:
                     detected_date=article_data.get("date") or "",
                     detected_author=article_data.get("author") or "",
                     detected_medium=article_data.get("publication_name") or "",
-                    model_override=openai_model
+                    model_override=openai_model,
+                    metadata_detected=metadata_detected
                 )
 
                 # Log validation result
@@ -1529,6 +1565,40 @@ class RunService:
                 self._add_in_memory_log(run_id, "INFO", "ARTICLE_ACCEPTED", f"{log_prefix}Aceptada (score={score}): {url}", isbn=isbn)
 
                 if not dry_run:
+                    # Select best metadata
+                    def select_best_author(det_auth: str, ai_auth: str) -> str:
+                        det = str(det_auth or "").strip()
+                        ai = str(ai_auth or "").strip()
+                        invalids = ("titulo web", "título web", "autor web", "autor web ", "redacción", "redaccion", "")
+                        if det and det.lower() not in invalids:
+                            return det
+                        if ai and ai.lower() not in invalids:
+                            return ai
+                        if det.lower() in ("redacción", "redaccion"):
+                            return "Redacción"
+                        if ai.lower() in ("redacción", "redaccion"):
+                            return "Redacción"
+                        return ""
+
+                    def select_best_date(det_dt: str, ai_dt: str) -> str:
+                        det = str(det_dt or "").strip()
+                        ai = str(ai_dt or "").strip()
+                        norm_det = normalize_date(det)
+                        norm_ai = normalize_date(ai)
+                        if norm_det:
+                            return norm_det
+                        if norm_ai:
+                            return norm_ai
+                        if det:
+                            return det
+                        if ai:
+                            return ai
+                        return ""
+
+                    best_author = select_best_author(article_data.get("author"), analysis.get("publication_author"))
+                    best_date = select_best_date(article_data.get("date"), analysis.get("publication_date"))
+                    best_medium = analysis.get("publication_name") or article_data.get("publication_name") or ""
+
                     review_dict = {
                         "¿Publicar?": False,
                         "Estado publicación": "",
@@ -1539,9 +1609,9 @@ class RunService:
                         "Autor del libro": author,
                         "URL": url,
                         "Título para Web": art_title,
-                        "Autor para Web": analysis.get("publication_author") or analysis.get("publication_name") or "",
-                        "Medio de publicación": analysis.get("publication_name", ""),
-                        "Fecha de publicación": analysis.get("publication_date", ""),
+                        "Autor para Web": best_author,
+                        "Medio de publicación": best_medium,
+                        "Fecha de publicación": best_date,
                         "Idioma original": analysis.get("language", ""),
                         "Categoría": analysis.get("category", ""),
                         "Resumen": analysis.get("summary", ""),

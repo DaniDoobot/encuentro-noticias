@@ -408,13 +408,16 @@ def debug_internal_domain_search(req: DebugInternalSearchRequest):
         except Exception:
             config = {}
             
+        active_sources = []
+        try:
+            active_sources = sheets_service.get_active_sources(settings.GOOGLE_SHEET_ID)
+        except Exception:
+            pass
+        source_by_domain = {s["domain"]: s for s in active_sources}
+
         domains = req.domains
         if not domains:
-            try:
-                active_sources = sheets_service.get_active_sources(settings.GOOGLE_SHEET_ID)
-                domains = [s["domain"] for s in active_sources if s.get("active", True) and s.get("domain")]
-            except Exception:
-                domains = []
+            domains = [s["domain"] for s in active_sources if s.get("active", True) and s.get("domain")]
                 
         results = []
         for domain in domains:
@@ -424,7 +427,8 @@ def debug_internal_domain_search(req: DebugInternalSearchRequest):
                     title=req.title,
                     author=req.author or "",
                     isbn=req.isbn or "",
-                    config=config
+                    config=config,
+                    source_info=source_by_domain.get(domain)
                 )
                 for item in items:
                     results.append(DebugInternalSearchResult(
@@ -457,5 +461,35 @@ def debug_internal_domain_search(req: DebugInternalSearchRequest):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Debug internal search failed: {str(e)}"
+        )
+
+@router.post("/sources/defaults/append")
+def post_sources_defaults_append():
+    """
+    Appends default sources (cultural, religious, press) to the sheet, avoiding duplicates.
+    """
+    sheet_id = settings.GOOGLE_SHEET_ID
+    try:
+        count = sheets_service.append_default_sources(sheet_id)
+        
+        # Log this action
+        logger_service.log(
+            level="INFO",
+            action="SOURCES_DEFAULTS_APPEND",
+            message=f"Se añadieron {count} nuevas fuentes por defecto.",
+            sheet_id=sheet_id,
+            detail=json.dumps({"appended_count": count})
+        )
+        logger_service.flush_log_batch(sheet_id)
+        
+        return {
+            "success": True,
+            "appended_count": count,
+            "message": f"Se añadieron {count} nuevas fuentes por defecto."
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to append default sources: {str(e)}"
         )
 

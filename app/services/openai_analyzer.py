@@ -45,7 +45,8 @@ class OpenAIAnalyzer:
         detected_date: str = "",
         detected_author: str = "",
         detected_medium: str = "",
-        model_override: Optional[str] = None
+        model_override: Optional[str] = None,
+        metadata_detected: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Queries OpenAI to validate if the article relates to the specific book.
@@ -68,10 +69,14 @@ class OpenAIAnalyzer:
             "1. 'is_valid' debe ser true cuando hay una mención real del libro en el artículo, por mínima o breve que sea, incluyendo comentarios de pasada, adaptaciones, representaciones, debates o listados comentados. Solo debe ser false si el artículo NO menciona la obra en absoluto, habla de otro libro distinto, habla únicamente de la figura del autor sin nombrar esta obra, o si el libro aparece exclusivamente en un listado automático, índice, catálogo, bibliografía de pie de página o recomendados sin comentarios ni contexto.\n"
             "2. COHERENCIA OBLIGATORIA: Si consideras que el artículo menciona el libro de forma real y el score es >= 1, 'is_valid' DEBE ser true. Si el score es 0, 'is_valid' DEBE ser false. No mezcles 'is_valid: false' con un score mayor a cero.\n"
             "3. NO exijas coincidencia literal del título del libro. Acepta variantes parciales, naturales o reordenadas si el artículo habla inequívocamente de la misma obra.\n"
-            "4. CUIDADO CON TÍTULOS GENÉRICOS: Para títulos muy genéricos o cortos (ej. 'Símbolos', 'Biblia', 'Diario'), exige alguna señal contextual clara de que se refieren al libro buscado para evitar falsos positivos con otros temas homónimos.\n"
+            "4. CUIDADO CON TÍTULOS GENÉRICOS: Para títulos muy genéricos o cortos (ej. 'Símbolos', 'Biblia', 'Diario'), exige alguna señal contextual clara de que se referieren al libro buscado para evitar falsos positivos con otros temas homónimos.\n"
             "5. La categoría ('category') DEBE ser estrictamente una de las siguientes opciones:\n"
             "   - Cultura/Educación, Política, Economía, Historia, Religión, Sociedad, Ciencia, Tecnología, Literatura, Otros.\n"
-            "6. El resumen ('summary') DEBE estar escrito en ESPAÑOL, tener unas 120 palabras y ser una explicación periodística útil que detalle DÓNDE, CÓMO y POR QUÉ se menciona el libro en el artículo, indicando la relación con el libro y justificando detalladamente el score asignado. Evita resúmenes genéricos de todo el artículo.\n\n"
+            "6. El resumen ('summary') DEBE estar escrito en ESPAÑOL, tener unas 120 palabras y ser una explicación periodística útil que detalle DÓNDE, CÓMO y POR QUÉ se menciona el libro en el artículo, indicando la relación con el libro y justificando detalladamente el score asignado. Evita resúmenes genéricos de todo el artículo.\n"
+            "7. EXTRACCIÓN DE METADATOS DE AUTOR Y FECHA (CRÍTICO):\n"
+            "   - NO inventes el autor ('publication_author') ni la fecha ('publication_date').\n"
+            "   - Si no hay un autor de carne y hueso visible en el texto o en metadata_detected, deja 'publication_author' vacío, o usa 'Redacción' únicamente si ese término exacto aparece explícitamente en el texto.\n"
+            "   - Si 'metadata_detected' trae una fecha de publicación ('published_date') fiable, respétala a menos que haya una contradicción evidente en el texto del artículo.\n\n"
             "GUÍA DE PUNTUACIÓN ('match_score') APLICAR LA ESCALA COMPLETA:\n"
             "- 90-100: Reseña/Artículo centrado claramente en el libro.\n"
             "- 70-89: Artículo claramente relevante sobre el libro, aunque no sea una reseña pura.\n"
@@ -93,6 +98,13 @@ class OpenAIAnalyzer:
             f"- Medio detectado: {detected_medium}\n"
             f"- Autor detectado: {detected_author}\n"
             f"- Fecha detectada: {detected_date}\n\n"
+        )
+        if metadata_detected:
+            user_content += (
+                f"METADATOS PREVIAMENTE DETECTADOS DE FORMA DETERMINISTA (metadata_detected):\n"
+                f"{json.dumps(metadata_detected, ensure_ascii=False, indent=2)}\n\n"
+            )
+        user_content += (
             f"CONTENIDO DEL ARTÍCULO:\n"
             f"\"\"\"\n{article_text[:6000]}\n\"\"\"" # Cap at 6000 chars to avoid token inflation
         )

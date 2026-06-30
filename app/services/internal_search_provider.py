@@ -224,13 +224,188 @@ class InternalDomainSearchProvider:
             
         return results
 
+    def search_rss(self, rss_url: str, query: str, timeout: int = 5, sheet_id: str = "", run_id: str = "") -> List[Dict[str, Any]]:
+        results = []
+        try:
+            r = httpx.get(rss_url, headers=HEADERS, timeout=timeout, follow_redirects=True)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, "html.parser")
+                items = soup.find_all("item")
+                if not items:
+                    items = soup.find_all("entry")
+                
+                raw_terms = _filter_stopwords(query).split()
+                query_terms = [t.strip('\'"“”.,()').lower() for t in raw_terms if len(t.strip('\'"“”.,()')) > 2]
+                
+                for item in items:
+                    title_tag = item.find("title")
+                    link_tag = item.find("link") or item.find("link", href=True)
+                    desc_tag = item.find("description") or item.find("summary") or item.find("content")
+                    
+                    title = title_tag.get_text(strip=True) if title_tag else ""
+                    if link_tag:
+                        url = link_tag.get("href") or link_tag.get_text(strip=True)
+                    else:
+                        url = ""
+                    snippet = desc_tag.get_text(strip=True) if desc_tag else ""
+                    
+                    if not url or not title:
+                        continue
+                    
+                    # Filter by query terms
+                    title_lower = title.lower()
+                    snippet_lower = snippet.lower()
+                    url_lower = url.lower()
+                    if query_terms and not any(t in title_lower or t in snippet_lower or t in url_lower for t in query_terms):
+                        continue
+                        
+                    results.append({
+                        "url": url,
+                        "title": title,
+                        "snippet": snippet[:300],
+                        "provider": "rss_search",
+                        "status": "ok",
+                        "error": ""
+                    })
+                
+                if results and sheet_id:
+                    from app.services.logger_service import logger_service
+                    logger_service.log(
+                        "INFO", "SOURCE_RSS_DISCOVERED",
+                        f"Búsqueda interna en feed RSS completada para {rss_url}: {len(results)} resultados encontrados.",
+                        sheet_id=sheet_id, run_id=run_id
+                    )
+        except Exception as e:
+            logger.debug(f"RSS search failed for {rss_url}: {e}")
+        return results
+
+    def search_sitemap(self, sitemap_url: str, query: str, timeout: int = 5, sheet_id: str = "", run_id: str = "") -> List[Dict[str, Any]]:
+        results = []
+        try:
+            r = httpx.get(sitemap_url, headers=HEADERS, timeout=timeout, follow_redirects=True)
+            if r.status_code == 200:
+                soup = BeautifulSoup(r.text, "html.parser")
+                locs = soup.find_all("loc")
+                
+                raw_terms = _filter_stopwords(query).split()
+                query_terms = [t.strip('\'"“”.,()').lower() for t in raw_terms if len(t.strip('\'"“”.,()')) > 2]
+                
+                for loc in locs:
+                    url = loc.get_text(strip=True)
+                    if not url:
+                        continue
+                    
+                    url_lower = url.lower()
+                    if query_terms and all(t in url_lower for t in query_terms):
+                        parsed = urlparse(url)
+                        slug = parsed.path.strip("/").split("/")[-1]
+                        title = slug.replace("-", " ").replace("_", " ").capitalize()
+                        
+                        results.append({
+                            "url": url,
+                            "title": title or "Artículo del Sitemap",
+                            "snippet": f"URL encontrada en el sitemap: {url}",
+                            "provider": "sitemap_search",
+                            "status": "ok",
+                            "error": ""
+                        })
+                
+                if results and sheet_id:
+                    from app.services.logger_service import logger_service
+                    logger_service.log(
+                        "INFO", "SOURCE_SITEMAP_DISCOVERED",
+                        f"Búsqueda interna en Sitemap completada para {sitemap_url}: {len(results)} resultados encontrados.",
+                        sheet_id=sheet_id, run_id=run_id
+                    )
+        except Exception as e:
+            logger.debug(f"Sitemap search failed for {sitemap_url}: {e}")
+        return results
+
+    def search_template(self, template: str, domain: str, query: str, timeout: int = 5, sheet_id: str = "", run_id: str = "") -> List[Dict[str, Any]]:
+        url = template.replace("{query}", quote(query))
+        if not url.startswith("http"):
+            url = f"https://{url}"
+            
+        results = []
+        try:
+            r = httpx.get(url, headers=HEADERS, timeout=timeout, follow_redirects=True)
+            r.raise_for_status()
+            
+            soup = BeautifulSoup(r.text, "html.parser")
+            raw_terms = _filter_stopwords(query).split()
+            query_terms = [t.strip('\'"“”.,()').lower() for t in raw_terms if len(t.strip('\'"“”.,()')) > 2]
+            
+            a_tags = soup.find_all("a", href=True)
+            seen_urls = set()
+            
+            for a in a_tags:
+                href = a["href"]
+                resolved_url = urljoin(url, href)
+                
+                if urlparse(resolved_url).netloc != domain:
+                    continue
+                resolved_url = _normalize_url(resolved_url)
+                
+                if urlparse(resolved_url).path in ("", "/"):
+                    continue
+                if not _is_cultural_url(resolved_url):
+                    continue
+                    
+                anchor = a.get_text(strip=True)
+                if len(anchor) < 6:
+                    continue
+                    
+                anchor_lower = anchor.lower()
+                url_lower = resolved_url.lower()
+                if query_terms and not any(t in anchor_lower or t in url_lower for t in query_terms):
+                    continue
+                    
+                if resolved_url in seen_urls:
+                    continue
+                seen_urls.add(resolved_url)
+                
+                snippet = ""
+                parent = a.find_parent(["article", "div", "li", "section"])
+                if parent:
+                    p_tag = parent.find("p")
+                    if p_tag:
+                        snippet = p_tag.get_text(strip=True)
+                    else:
+                        snippet = parent.get_text(strip=True)
+                        if snippet.startswith(anchor):
+                            snippet = snippet[len(anchor):].strip()
+                snippet = snippet[:300]
+                
+                results.append({
+                    "url": resolved_url,
+                    "title": anchor.capitalize(),
+                    "snippet": snippet,
+                    "provider": "template_search",
+                    "status": "ok",
+                    "error": ""
+                })
+                
+            if results and sheet_id:
+                from app.services.logger_service import logger_service
+                logger_service.log(
+                    "INFO", "SOURCE_INTERNAL_SEARCH_TEMPLATE_USED",
+                    f"Búsqueda interna utilizando plantilla completada para {domain} ({template}): {len(results)} resultados encontrados.",
+                    sheet_id=sheet_id, run_id=run_id
+                )
+        except Exception as e:
+            logger.debug(f"Template search failed for {url}: {e}")
+        return results
+
     def search_domain_for_book(
         self,
         domain: str,
         title: str,
         author: str,
         isbn: str,
-        config: Dict[str, Any] = None
+        config: Dict[str, Any] = None,
+        source_info: Optional[Dict[str, Any]] = None,
+        sheet_id: str = "",
+        run_id: str = ""
     ) -> List[Dict[str, Any]]:
         if not config:
             config = {}
@@ -247,24 +422,46 @@ class InternalDomainSearchProvider:
         
         for q in queries:
             res = []
-            if wp_supported:
+            
+            # 1. Check RSS URL
+            if source_info and source_info.get("rss_url"):
+                rss_res = self.search_rss(source_info["rss_url"], q, timeout=timeout, sheet_id=sheet_id, run_id=run_id)
+                if rss_res:
+                    res.extend(rss_res)
+                    
+            # 2. Check Sitemap URL
+            if source_info and source_info.get("sitemap_url"):
+                sitemap_res = self.search_sitemap(source_info["sitemap_url"], q, timeout=timeout, sheet_id=sheet_id, run_id=run_id)
+                if sitemap_res:
+                    res.extend(sitemap_res)
+                    
+            # 3. Check Buscador interno template
+            if source_info and source_info.get("buscador_interno"):
+                tmpl_res = self.search_template(source_info["buscador_interno"], domain, q, timeout=timeout, sheet_id=sheet_id, run_id=run_id)
+                if tmpl_res:
+                    res.extend(tmpl_res)
+                    
+            # 4. WordPress API (fallback or complement)
+            if not res and wp_supported:
                 try:
-                    res = self.search_wordpress_api(domain, q, timeout=timeout)
+                    wp_res = self.search_wordpress_api(domain, q, timeout=timeout)
+                    if wp_res:
+                        res.extend(wp_res)
                 except httpx.HTTPStatusError as e:
-                    # If REST API returns 401, 403, 404, etc., it is unsupported on this domain
                     if e.response.status_code in (401, 403, 404):
                         wp_supported = False
                     logger.debug(f"WP REST API unsupported for {domain}: {e}")
                 except Exception as e:
-                    # Connection error or timeout -> disable for this domain
                     wp_supported = False
                     logger.debug(f"WP REST API failed for {domain}: {e}")
                     
-            if not res and html_supported:
+            # 5. Default HTML Search (if not template search used)
+            if not res and not (source_info and source_info.get("buscador_interno")) and html_supported:
                 try:
-                    res = self.search_html(domain, q, timeout=timeout)
+                    html_res = self.search_html(domain, q, timeout=timeout)
+                    if html_res:
+                        res.extend(html_res)
                 except Exception as e:
-                    # Connection error or timeout -> disable HTML search for this domain
                     html_supported = False
                     logger.debug(f"HTML search failed for {domain}: {e}")
                     

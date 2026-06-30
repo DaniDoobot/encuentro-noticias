@@ -548,6 +548,7 @@ class SheetsService:
 
         # Check and update existing technical limits if they are too low
         try:
+            from app.services.logger_service import logger_service
             tech_all = tech_ws.get_all_values()
             if tech_all:
                 tech_headers = tech_all[0]
@@ -562,35 +563,27 @@ class SheetsService:
                                 valor_int = int(valor_str)
                             except ValueError:
                                 continue
-                            if clave == "MAX_QUERIES_PER_BOOK" and valor_int < 12:
+                            clave_clean = str(clave).strip()
+                            if clave_clean == "MAX_QUERIES_PER_BOOK" and valor_int < 12:
                                 tech_ws.update_cell(r_idx, col_valor, 12)
                                 logger.info(f"Updated MAX_QUERIES_PER_BOOK from {valor_int} to 12 in Config técnica")
-                                logger_service.log("WARNING", "CONFIG_LOW_QUERY_LIMIT_WARNING", f"Actualizado límite bajo de MAX_QUERIES_PER_BOOK ({valor_int} -> 12)", sheet_id=sheet_id)
-                            if clave == "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES" and valor_int < 10:
+                                logger_service.log("WARNING", "CONFIG_LOW_QUERY_LIMIT_WARNING", f"Advertencia: MAX_QUERIES_PER_BOOK tiene un límite bajo de {valor_int}", sheet_id=sheet_id)
+                                logger_service.log("INFO", "CONFIG_QUERY_LIMITS_AUTO_UPDATED", f"Límites de consulta actualizados automáticamente: MAX_QUERIES_PER_BOOK: {valor_int} -> 12", sheet_id=sheet_id)
+                            if clave_clean == "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES" and valor_int < 10:
                                 tech_ws.update_cell(r_idx, col_valor, 10)
                                 logger.info(f"Updated DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES from {valor_int} to 10 in Config técnica")
-                                logger_service.log("WARNING", "CONFIG_LOW_QUERY_LIMIT_WARNING", f"Actualizado límite bajo de DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES ({valor_int} -> 10)", sheet_id=sheet_id)
+                                logger_service.log("WARNING", "CONFIG_LOW_QUERY_LIMIT_WARNING", f"Advertencia: DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES tiene un límite bajo de {valor_int}", sheet_id=sheet_id)
+                                logger_service.log("INFO", "CONFIG_QUERY_LIMITS_AUTO_UPDATED", f"Límites de consulta actualizados automáticamente: DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES: {valor_int} -> 10", sheet_id=sheet_id)
         except Exception as e_upd:
             logger.warning(f"Error checking/updating low query limits in Config técnica: {e_upd}")
 
-        # Initialise Fuentes tab with default domains if empty
-        fuentes_ws = spreadsheet.worksheet("Fuentes")
-        fuentes_rows = fuentes_ws.get_all_records()
-        if not fuentes_rows:
-            default_sources = [
-                ["revistadelibros.com",  "true", "cultural", "", "", "", "Revista de libros", "", "", ""],
-                ["nueva-revista.net",    "true", "cultural", "", "", "", "Nueva Revista",      "", "", ""],
-                ["aceprensa.com",        "true", "cultural", "", "", "", "Aceprensa",           "", "", ""],
-                ["elcultural.com",       "true", "cultural", "", "", "", "El Cultural",         "", "", ""],
-                ["zendalibros.com",      "true", "cultural", "", "", "", "Zenda Libros",        "", "", ""],
-                ["babelia.elpais.com",   "true", "cultural", "", "", "", "Babelia/El País",     "", "", ""],
-                ["wmagazin.com",         "true", "cultural", "", "", "", "WMagazín",            "", "", ""],
-                ["theobjective.com",     "true", "cultural", "", "", "", "The Objective",       "", "", ""],
-                ["ethic.es",             "true", "cultural", "", "", "", "Ethic",               "", "", ""],
-                ["eldebate.com",         "true", "cultural", "", "", "", "El Debate",           "", "", ""],
-            ]
-            for row in default_sources:
-                fuentes_ws.append_row(row)
+        # Initialise Fuentes tab with default domains append-only
+        try:
+            appended = self.append_default_sources(sheet_id)
+            if appended > 0:
+                logger.info(f"ensure_sheet: Appended {appended} default sources.")
+        except Exception as e_fuentes:
+            logger.warning(f"Error appending default sources in ensure_sheet: {e_fuentes}")
 
         # Cleanup empty/false rows in Reseñas por publicar automatically on ensure_sheet
         try:
@@ -623,7 +616,7 @@ class SheetsService:
                     key = r.get("Clave")
                     val = r.get("Valor")
                     if key and val is not None:
-                        tech_dict[key] = val
+                        tech_dict[str(key).strip()] = val
             except Exception as e_tech:
                 logger.warning(f"Could not read Config técnica tab: {e_tech}")
 
@@ -636,7 +629,7 @@ class SheetsService:
                     key = r.get("Clave")
                     val = r.get("Valor")
                     if key and val is not None:
-                        user_dict[key] = val
+                        user_dict[str(key).strip()] = val
             except Exception as e_user:
                 logger.warning(f"Could not read Config tab: {e_user}")
 
@@ -1032,6 +1025,7 @@ class SheetsService:
                 "tipo": str(row.get("Tipo", "cultural")).strip(),
                 "sitemap_url": str(row.get("Sitemap URL", "")).strip(),
                 "rss_url": str(row.get("RSS URL", "")).strip(),
+                "buscador_interno": str(row.get("Buscador interno", "")).strip(),
                 "row_index": i,
             })
         return sources
@@ -1422,5 +1416,77 @@ class SheetsService:
             "remaining_count": new_count,
             "message": f"Se eliminaron {deleted_count} filas antiguas de Descartes. Quedan {new_count} filas."
         }
+
+    def append_default_sources(self, sheet_id: str) -> int:
+        """
+        Appends default sources (cultural, religious, press) to the Fuentes tab,
+        ensuring no duplicates are created based on clean domain name match.
+        Returns the number of appended sources.
+        """
+        client = self.get_client()
+        spreadsheet = client.open_by_key(sheet_id)
+        fuentes_ws = spreadsheet.worksheet("Fuentes")
+        
+        # Read existing sources to get a set of already present domains
+        records = fuentes_ws.get_all_records()
+        existing_domains = set()
+        for r in records:
+            dom = str(r.get("Dominio") or "").strip().lower()
+            if dom:
+                existing_domains.add(clean_domain_string(dom))
+                
+        # Recommended list:
+        # Columns in sheet: Dominio, Activo, Tipo, Sitemap URL, RSS URL, Buscador interno, Notas, Última indexación, URLs indexadas, Errores
+        recommended = [
+            ("revistadelibros.com", "true", "cultural", "https://www.revistadelibros.com/sitemap.xml", "https://www.revistadelibros.com/feed/", "https://www.revistadelibros.com/?s={query}", "Revista de Libros"),
+            ("nueva-revista.net", "true", "cultural", "https://www.nueva-revista.net/sitemap.xml", "https://www.nueva-revista.net/feed/", "https://www.nueva-revista.net/?s={query}", "Nueva Revista"),
+            ("aceprensa.com", "true", "cultural", "", "https://www.aceprensa.com/feed/", "", "Aceprensa"),
+            ("elcultural.com", "true", "cultural", "", "", "", "El Cultural"),
+            ("zendalibros.com", "true", "cultural", "https://www.zendalibros.com/sitemap.xml", "https://www.zendalibros.com/feed/", "https://www.zendalibros.com/?s={query}", "Zenda Libros"),
+            ("wmagazin.com", "true", "cultural", "", "", "", "WMagazín"),
+            ("theobjective.com", "true", "prensa", "", "", "", "The Objective"),
+            ("ethic.es", "true", "cultural", "", "", "", "Ethic"),
+            ("eldebate.com", "true", "prensa", "", "", "", "El Debate"),
+            ("larazon.es", "true", "prensa", "", "", "", "La Razón"),
+            ("abc.es", "true", "prensa", "", "", "", "ABC"),
+            ("elespanol.com", "true", "prensa", "", "", "", "El Español"),
+            ("librujula.com", "true", "cultural", "", "", "", "Librujula"),
+            ("todostuslibros.com", "true", "libros", "", "", "", "Todos tus libros"),
+            ("todoliteratura.es", "true", "libros", "", "", "", "Todo Literatura"),
+            ("alfayomega.es", "true", "religión", "", "", "", "Alfa y Omega"),
+            ("religionenlibertad.com", "true", "religión", "", "https://www.religionenlibertad.com/rss/", "https://www.religionenlibertad.com/buscar/{query}", "Religión en Libertad"),
+            ("aciprensa.com", "true", "religión", "", "https://www.aciprensa.com/rss/", "https://www.aciprensa.com/buscar/{query}", "ACI Prensa"),
+            ("es.aleteia.org", "true", "religión", "", "", "", "Aleteia"),
+            ("infocatolica.com", "true", "religión", "", "", "", "InfoCatólica"),
+            ("revistaecclesia.es", "true", "religión", "", "", "", "Revista Ecclesia"),
+            ("vidanuevadigital.com", "true", "religión", "", "", "", "Vida Nueva Digital"),
+            ("omnesmag.com", "true", "religión", "", "", "", "Omnes Mag"),
+            ("opusdei.org", "true", "religión", "", "", "", "Opus Dei"),
+            ("clonline.org", "true", "religión", "", "", "", "Comunión y Liberación"),
+            ("catholic.net", "true", "religión", "", "", "", "Catholic.net"),
+            ("religiondigital.org", "true", "religión", "", "", "", "Religión Digital"),
+            ("exaudi.org", "true", "religión", "", "", "", "Exaudi"),
+            ("iglesia.cl", "true", "religión", "", "", "", "Iglesia.cl"),
+            ("acncolombia.org", "true", "religión", "", "", "", "ACN Colombia"),
+            ("romereports.com", "true", "religión", "", "", "", "Rome Reports"),
+            ("elpais.com", "true", "prensa", "", "", "", "El País"),
+            ("elmundo.es", "true", "prensa", "", "", "", "El Mundo"),
+            ("lavanguardia.com", "true", "prensa", "", "", "", "La Vanguardia"),
+            ("elconfidencial.com", "true", "prensa", "", "", "", "El Confidencial"),
+            ("publico.es", "true", "prensa", "", "", "", "Público")
+        ]
+        
+        to_append = []
+        for dom_raw, active, tipo, sitemap, rss, buscador, notas in recommended:
+            cleaned = clean_domain_string(dom_raw)
+            if cleaned and cleaned not in existing_domains:
+                row = [cleaned, active, tipo, sitemap, rss, buscador, notas, "", "", ""]
+                to_append.append(row)
+                existing_domains.add(cleaned)
+                
+        if to_append:
+            fuentes_ws.append_rows(to_append, value_input_option="USER_ENTERED")
+            
+        return len(to_append)
 
 sheets_service = SheetsService()

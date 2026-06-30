@@ -149,6 +149,7 @@ class SearchService:
                     if log_callback:
                         log_callback(run_id, "INFO", "SEARCH_PROVIDER_USED", f"Buscando libro de forma interna en {len(domains)} dominios", isbn, f"Domains: {domains}")
                     
+                    source_by_domain = {s["domain"]: s for s in sources}
                     new_urls_found = 0
                     for domain in domains:
                         try:
@@ -157,7 +158,10 @@ class SearchService:
                                 title=title or query,
                                 author=author,
                                 isbn=isbn,
-                                config=config
+                                config=config,
+                                source_info=source_by_domain.get(domain),
+                                sheet_id=sheet_id,
+                                run_id=run_id
                             )
                             for item in items:
                                 url = item["url"]

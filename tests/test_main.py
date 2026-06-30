@@ -945,7 +945,7 @@ def test_google_news_resolution_and_fallbacks():
             return {"status": True, "decoded_url": resolved3_url}
         return {"status": False}
 
-    def mock_extract(url):
+    def mock_extract(url, *args, **kwargs):
         if url == resolved1_url:
             return {"title": "Titulo Real 1", "text": "Reseña literaria sobre San Manuel Bueno martir.", "date": "2024-02-18"}
         elif url == resolved3_url:
@@ -1250,3 +1250,341 @@ def test_debug_google_news_endpoint():
     assert data["parsed_results_count"] == 1
     assert data["results"][0]["source"] == "Zenda"
     assert data["results"][0]["url"] == "https://www.zendalibros.com/youcat-article"
+
+
+# --- REGRESSION TESTS FOR METADATA AND SOURCES ---
+
+def test_extract_author_jsonld():
+    from app.services.article_extractor import article_extractor
+    html = """
+    <html>
+      <head>
+        <script type="application/ld+json">
+        {
+          "@context": "https://schema.org",
+          "@type": "NewsArticle",
+          "author": {
+            "@type": "Person",
+            "name": "Juan Carlos Pérez"
+          }
+        }
+        </script>
+      </head>
+      <body>
+        <p>Este es el texto del artículo con más de cien caracteres para pasar la validación de texto insuficiente de BeautifulSoup.</p>
+      </body>
+    </html>
+    """
+    res = article_extractor.extract_article_metadata("https://www.ejemplo.com/articulo", html)
+    assert res["article_author"] == "Juan Carlos Pérez"
+    assert res["author_source"] == "jsonld"
+
+
+def test_extract_author_meta():
+    from app.services.article_extractor import article_extractor
+    html = """
+    <html>
+      <head>
+        <meta name="author" content="María de la O" />
+      </head>
+      <body>
+        <p>Este es el texto del artículo con más de cien caracteres para pasar la validación de texto insuficiente de BeautifulSoup.</p>
+      </body>
+    </html>
+    """
+    res = article_extractor.extract_article_metadata("https://www.ejemplo.com/articulo", html)
+    assert res["article_author"] == "María de la O"
+    assert res["author_source"] == "meta"
+
+
+def test_extract_author_byline():
+    from app.services.article_extractor import article_extractor
+    html = """
+    <html>
+      <body>
+        <div class="author">Por Pedro Gómez</div>
+        <p>Este es el texto del artículo con más de cien caracteres para pasar la validación de texto insuficiente de BeautifulSoup.</p>
+      </body>
+    </html>
+    """
+    res = article_extractor.extract_article_metadata("https://www.ejemplo.com/articulo", html)
+    assert res["article_author"] == "Pedro Gómez"
+    assert res["author_source"] == "selector"
+
+
+def test_extract_author_no_medium_fallback():
+    from app.services.article_extractor import article_extractor
+    html = """
+    <html>
+      <head>
+        <meta name="author" content="ejemplo.com" />
+      </head>
+      <body>
+        <p>Este es el texto del artículo con más de cien caracteres para pasar la validación de texto insuficiente de BeautifulSoup.</p>
+      </body>
+    </html>
+    """
+    res = article_extractor.extract_article_metadata("https://www.ejemplo.com/articulo", html)
+    assert res["article_author"] == ""
+    assert res["author_source"] == "empty"
+
+
+def test_extract_date_jsonld():
+    from app.services.article_extractor import article_extractor
+    html = """
+    <html>
+      <head>
+        <script type="application/ld+json">
+        {
+          "@context": "https://schema.org",
+          "@type": "Article",
+          "datePublished": "2024-07-23T14:30:00Z"
+        }
+        </script>
+      </head>
+      <body>
+        <p>Este es el texto del artículo con más de cien caracteres para pasar la validación de texto insuficiente de BeautifulSoup.</p>
+      </body>
+    </html>
+    """
+    res = article_extractor.extract_article_metadata("https://www.ejemplo.com/articulo", html)
+    assert res["published_date"] == "2024-07-23"
+    assert res["date_source"] == "jsonld"
+
+
+def test_extract_date_meta():
+    from app.services.article_extractor import article_extractor
+    html = """
+    <html>
+      <head>
+        <meta property="article:published_time" content="2024/05/12" />
+      </head>
+      <body>
+        <p>Este es el texto del artículo con más de cien caracteres para pasar la validación de texto insuficiente de BeautifulSoup.</p>
+      </body>
+    </html>
+    """
+    res = article_extractor.extract_article_metadata("https://www.ejemplo.com/articulo", html)
+    assert res["published_date"] == "2024-05-12"
+    assert res["date_source"] == "meta"
+
+
+def test_extract_date_time_tag():
+    from app.services.article_extractor import article_extractor
+    html = """
+    <html>
+      <body>
+        <time datetime="2023-11-09T08:00:00+02:00">9 de Noviembre</time>
+        <p>Este es el texto del artículo con más de cien caracteres para pasar la validación de texto insuficiente de BeautifulSoup.</p>
+      </body>
+    </html>
+    """
+    res = article_extractor.extract_article_metadata("https://www.ejemplo.com/articulo", html)
+    assert res["published_date"] == "2023-11-09"
+    assert res["date_source"] == "time_tag"
+
+
+def test_extract_date_provider_fallback():
+    from app.services.article_extractor import article_extractor
+    html = """
+    <html>
+      <body>
+        <p>Este es el texto del artículo con más de cien caracteres para pasar la validación de texto insuficiente de BeautifulSoup.</p>
+      </body>
+    </html>
+    """
+    provider_item = {"pub_date": "2024-03-15"}
+    res = article_extractor.extract_article_metadata("https://www.ejemplo.com/articulo", html, provider_item=provider_item)
+    assert res["published_date"] == "2024-03-15"
+    assert res["date_source"] == "provider_pub_date"
+
+
+def test_extract_date_url_inferred():
+    from app.services.article_extractor import article_extractor
+    html = """
+    <html>
+      <body>
+        <p>Este es el texto del artículo con más de cien caracteres para pasar la validación de texto insuficiente de BeautifulSoup.</p>
+      </body>
+    </html>
+    """
+    res = article_extractor.extract_article_metadata("https://www.ejemplo.com/2022/10/05/articulo", html)
+    assert res["published_date"] == "2022-10-05"
+    assert res["date_source"] == "url"
+
+
+def test_author_medium_distinct():
+    from app.services.article_extractor import article_extractor
+    html = """
+    <html>
+      <head>
+        <meta name="author" content="ACI Prensa" />
+      </head>
+      <body>
+        <p>Este es el texto del artículo con más de cien caracteres para pasar la validación de texto insuficiente de BeautifulSoup.</p>
+      </body>
+    </html>
+    """
+    # ACI Prensa is the medium / domain, so it should be discarded if matched against domain
+    res = article_extractor.extract_article_metadata("https://www.aciprensa.com/youcat", html)
+    assert res["article_author"] == ""
+    assert res["author_source"] == "empty"
+
+
+def test_author_empty_or_redaccion():
+    from app.services.article_extractor import article_extractor
+    html = """
+    <html>
+      <body>
+        <p>Este artículo fue elaborado por la redacción del periódico hace unos días...</p>
+      </body>
+    </html>
+    """
+    res = article_extractor.extract_article_metadata("https://www.ejemplo.com/articulo", html)
+    assert res["article_author"] == "Redacción"
+    assert res["author_source"] == "pattern"
+
+
+def test_sources_append_no_duplicates():
+    from app.services.sheets_service import sheets_service
+    
+    mock_records = [
+        {"Dominio": "revistadelibros.com", "Activo": "true", "Tipo": "cultural"},
+        {"Dominio": "nueva-revista.net", "Activo": "true", "Tipo": "cultural"}
+    ]
+    
+    class FakeWorksheet:
+        def __init__(self):
+            self.appended = []
+        def get_all_records(self):
+            return mock_records
+        def append_rows(self, rows, value_input_option=None):
+            self.appended.extend(rows)
+            
+    fake_ws = FakeWorksheet()
+    
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
+        mock_spreadsheet = MagicMock()
+        mock_spreadsheet.worksheet.return_value = fake_ws
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+        
+        appended_count = sheets_service.append_default_sources("some_sheet_id")
+        
+        # Total recommended: 36. 2 already exist, so 34 should be appended.
+        assert appended_count == 34
+        assert len(fake_ws.appended) == 34
+        # Verify revistadelibros.com was skipped
+        for row in fake_ws.appended:
+            assert row[0] != "revistadelibros.com"
+
+
+def test_internal_search_utilizes_rss_sitemap_template():
+    from app.services.internal_search_provider import internal_search_provider
+    
+    source_info = {
+        "domain": "revistadelibros.com",
+        "rss_url": "https://www.revistadelibros.com/feed/",
+        "sitemap_url": "https://www.revistadelibros.com/sitemap.xml",
+        "buscador_interno": "https://www.revistadelibros.com/?s={query}"
+    }
+    
+    mock_rss_res = [{"url": "https://www.revistadelibros.com/r1", "title": "R1", "snippet": "RSS"}]
+    mock_sitemap_res = [{"url": "https://www.revistadelibros.com/s1", "title": "S1", "snippet": "Sitemap"}]
+    mock_template_res = [{"url": "https://www.revistadelibros.com/t1", "title": "T1", "snippet": "Template"}]
+    
+    with patch("app.services.internal_search_provider.InternalDomainSearchProvider.search_rss", return_value=mock_rss_res) as mock_rss, \
+         patch("app.services.internal_search_provider.InternalDomainSearchProvider.search_sitemap", return_value=mock_sitemap_res) as mock_sitemap, \
+         patch("app.services.internal_search_provider.InternalDomainSearchProvider.search_template", return_value=mock_template_res) as mock_template:
+         
+         results = internal_search_provider.search_domain_for_book(
+             domain="revistadelibros.com",
+             title="El infinito en un junco",
+             author="Irene Vallejo",
+             isbn="123",
+             source_info=source_info
+         )
+         
+         assert mock_rss.called
+         assert mock_sitemap.called
+         assert mock_template.called
+         assert len(results) == 3
+
+
+def test_ensure_sheet_updates_low_limits():
+    from app.services.sheets_service import sheets_service
+    
+    class FakeTechWorksheet:
+        def __init__(self):
+            self.values = [
+                ["Clave", "Valor", "Descripción"],
+                ["MAX_QUERIES_PER_BOOK", "3", "Description"],
+                ["DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", "3", "Description"]
+            ]
+            self.updated = {}
+        def get_all_values(self):
+            return self.values
+        def get_all_records(self):
+            records = []
+            headers = self.values[0]
+            for row in self.values[1:]:
+                rec = {}
+                for idx, val in enumerate(row):
+                    if idx < len(headers):
+                        rec[headers[idx]] = val
+                records.append(rec)
+            return records
+        def update_cell(self, row, col, val):
+            self.updated[(row, col)] = val
+            self.values[row - 1][col - 1] = str(val)
+        def append_row(self, row, value_input_option=None):
+            pass
+            
+    fake_tech_ws = FakeTechWorksheet()
+    
+    class FakeWorksheet:
+        def __init__(self):
+            self.id = 12345
+        def get_all_records(self):
+            return []
+        def get_all_values(self):
+            return []
+        def row_values(self, index):
+            return []
+        def append_row(self, row, value_input_option=None):
+            pass
+        def append_rows(self, rows, value_input_option=None):
+            pass
+        def clear(self):
+            pass
+        def resize(self, rows=None, cols=None):
+            pass
+        def update(self, range_name, values=None, **kwargs):
+            pass
+            
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client, \
+         patch("app.services.logger_service.logger_service.log") as mock_logger:
+        
+        mock_spreadsheet = MagicMock()
+        def get_ws(name):
+            if name == "Config técnica":
+                return fake_tech_ws
+            return FakeWorksheet()
+            
+        mock_spreadsheet.worksheet.side_effect = get_ws
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+        
+        # Run ensure_sheet
+        sheets_service.ensure_sheet("some_sheet_id")
+        
+        # Verify MAX_QUERIES_PER_BOOK (row 2, col 2) updated to 12
+        assert fake_tech_ws.updated.get((2, 2)) == 12
+        # Verify DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES (row 3, col 2) updated to 10
+        assert fake_tech_ws.updated.get((3, 2)) == 10
+        
+        # Check logs emitted
+        warning_calls = [c for c in mock_logger.call_args_list if c[0][0] == "WARNING"]
+        info_calls = [c for c in mock_logger.call_args_list if c[0][0] == "INFO"]
+        
+        assert any("CONFIG_LOW_QUERY_LIMIT_WARNING" in str(c) for c in warning_calls)
+        assert any("CONFIG_QUERY_LIMITS_AUTO_UPDATED" in str(c) for c in info_calls)
+
