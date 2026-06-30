@@ -1128,7 +1128,11 @@ class SheetsService:
         """
         from app.services.logger_service import logger_service
         from app.services.cache_service import cache_service
+        from app.config import settings
         import json
+
+        # Ensure SQLite database is initialized
+        cache_service.init_db(settings.DOMAIN_INDEX_DB_PATH)
 
         try:
             total_urls = cache_service.get_total_urls()

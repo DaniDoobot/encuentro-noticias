@@ -1731,3 +1731,67 @@ def test_background_job_updates_realtime():
          )
 
 
+def test_sync_sources_status_initialises_cache_service():
+    from app.services.sheets_service import sheets_service
+    from app.services.cache_service import cache_service
+    
+    mock_records = [
+        {"Dominio": "religionenlibertad.com", "Última indexación": "", "URLs indexadas": "", "Errores": ""}
+    ]
+    
+    class FakeFuentesWorksheet:
+        def get_all_records(self):
+            return mock_records
+        def update_cells(self, cells, **kwargs):
+            pass
+            
+    fake_ws = FakeFuentesWorksheet()
+    
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client, \
+         patch("app.services.cache_service.cache_service.init_db") as mock_init_db, \
+         patch("app.services.cache_service.cache_service.get_total_urls", return_value=100), \
+         patch("app.services.cache_service.cache_service.get_all_domain_statuses", return_value=[]), \
+         patch("app.services.cache_service.cache_service.get_all_domains_stats", return_value=[]):
+         
+        mock_spreadsheet = MagicMock()
+        mock_spreadsheet.worksheet.return_value = fake_ws
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+        
+        result = sheets_service.sync_sources_status("some_sheet_id")
+        
+        assert mock_init_db.called
+        assert result["success"] is True
+
+
+def test_sync_status_endpoint_initialization():
+    from app.config import settings
+    
+    mock_records = [
+        {"Dominio": "religionenlibertad.com", "Última indexación": "", "URLs indexadas": "", "Errores": ""}
+    ]
+    
+    class FakeFuentesWorksheet:
+        def get_all_records(self):
+            return mock_records
+        def update_cells(self, cells, **kwargs):
+            pass
+            
+    fake_ws = FakeFuentesWorksheet()
+    
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client, \
+         patch("app.services.cache_service.cache_service.init_db") as mock_init_db, \
+         patch("app.services.cache_service.cache_service.get_total_urls", return_value=100), \
+         patch("app.services.cache_service.cache_service.get_all_domain_statuses", return_value=[]), \
+         patch("app.services.cache_service.cache_service.get_all_domains_stats", return_value=[]):
+         
+        mock_spreadsheet = MagicMock()
+        mock_spreadsheet.worksheet.return_value = fake_ws
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+        
+        response = client.post("/sources/sync-status", headers={"X-Admin-Token": settings.ADMIN_TOKEN})
+        
+        assert response.status_code == 200
+        assert "CacheService not initialised" not in response.text
+
+
+

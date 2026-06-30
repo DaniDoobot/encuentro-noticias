@@ -520,6 +520,7 @@ def post_sources_sync_status():
             sheet_id=sheet_id
         )
         
+        cache_service.init_db(settings.DOMAIN_INDEX_DB_PATH)
         result = sheets_service.sync_sources_status(sheet_id)
         
         # Log SOURCE_SHEET_UPDATE_COMPLETED
