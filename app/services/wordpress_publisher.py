@@ -210,30 +210,26 @@ class WordPressPublisher:
         author_web = clean_val(review.get("Autor para Web"))
         author_ia = clean_val(review.get("Autor del libro detectado por IA"))
 
-        # wordpress title: priority is title_libro, title_web, title_ia, title_art, "Reseña"
-        post_title = (
-            title_libro
-            or title_web
-            or title_ia
-            or title_art
-            or "Reseña"
-        ).strip()
+        # wordpress title: priority is title_web (Título para Web), fallback to title_libro (Título del libro)
+        post_title = (title_web or title_libro or "Reseña").strip()
 
         # used for content layout
-        title_book = title_web or title_libro or title_ia or "Sin título"
-        author_book = author_web or author_libro or author_ia or "Sin autor"
+        title_book = title_libro or "Sin título"
+        author_book = author_libro or "Sin autor"
 
         summary = review.get("Resumen", "")
         original_url = review.get("URL", "")
         medium = review.get("Medio de publicación", "")
-        pub_author = review.get("Autor de la publicación", "")
         pub_date = review.get("Fecha de publicación", "")
         content_type = review.get("Tipo de contenido", "reseña")
+        
+        # Author para Web representará el autor de la reseña. Si no, fallback a medio.
+        author_review = author_web or review.get("Autor de la publicación") or medium or ""
         
         post_content = f"""<p><strong>Libro:</strong> {title_book}</p>
 <p><strong>Autor del libro:</strong> {author_book}</p>
 <p><strong>Medio de origen:</strong> {medium}</p>
-{f"<p><strong>Autor de la reseña:</strong> {pub_author}</p>" if pub_author else ""}
+{f"<p><strong>Autor de la reseña:</strong> {author_review}</p>" if author_review else ""}
 {f"<p><strong>Fecha de la publicación original:</strong> {pub_date}</p>" if pub_date else ""}
 <p><strong>Tipo de contenido:</strong> {content_type}</p>
 <hr />

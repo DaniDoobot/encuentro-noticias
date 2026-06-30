@@ -71,11 +71,23 @@ def execute_publication_sync(publish_id: Optional[str], sheet_id: str, dry_run: 
 
     try:
         records = ws_to_pub.get_all_records()
+        headers_to_pub = ws_to_pub.row_values(1)
+        headers_pub = ws_pub.row_values(1)
     except Exception as e_read:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error reading reviews from sheet: {str(e_read)}"
+            detail=f"Error reading headers or reviews from sheet: {str(e_read)}"
         )
+
+    def get_col_index(header_name: str) -> Optional[int]:
+        try:
+            return headers_to_pub.index(header_name) + 1
+        except ValueError:
+            return None
+
+    col_status = get_col_index("Estado publicación") or 2
+    col_attempt = get_col_index("Fecha intento publicación") or 3
+    col_error = get_col_index("Error publicación") or 4
 
     published_count = 0
     errors_count = 0
@@ -118,7 +130,7 @@ def execute_publication_sync(publish_id: Optional[str], sheet_id: str, dry_run: 
         
         # Capture first 5 debug examples
         if len(debug_examples) < 5:
-            book_t = row.get("Título del libro") or row.get("Título del artículo") or "Sin título"
+            book_t = row.get("Título del libro") or row.get("Título para Web") or "Sin título"
             is_marked_t = str(row.get("¿Publicar?", "")).strip().upper() in ("TRUE", "1") or row.get("¿Publicar?") is True
             debug_examples.append(f"Row {row_idx}: {book_t} (¿Publicar?: {is_marked_t})")
             
@@ -139,12 +151,9 @@ def execute_publication_sync(publish_id: Optional[str], sheet_id: str, dry_run: 
             unselected_count += 1
             # Mark as "No publicada" if it wasn't already
             if str(row.get("Estado publicación", "")).strip() != "No publicada":
-                cells_to_update.append(gspread.Cell(row=row_idx, col=2, value="No publicada"))
-                cells_to_update.append(gspread.Cell(row=row_idx, col=3, value=""))
-                cells_to_update.append(gspread.Cell(row=row_idx, col=4, value=""))
-                cells_to_update.append(gspread.Cell(row=row_idx, col=5, value=""))
-                cells_to_update.append(gspread.Cell(row=row_idx, col=6, value=""))
-                cells_to_update.append(gspread.Cell(row=row_idx, col=7, value=""))
+                cells_to_update.append(gspread.Cell(row=row_idx, col=col_status, value="No publicada"))
+                cells_to_update.append(gspread.Cell(row=row_idx, col=col_attempt, value=""))
+                cells_to_update.append(gspread.Cell(row=row_idx, col=col_error, value=""))
             continue
             
         # Attempt WordPress publication
@@ -157,46 +166,34 @@ def execute_publication_sync(publish_id: Optional[str], sheet_id: str, dry_run: 
             
             if dry_run:
                 # Update in place for dry_run
-                cells_to_update.append(gspread.Cell(row=row_idx, col=2, value="Publicada"))
-                cells_to_update.append(gspread.Cell(row=row_idx, col=3, value=now_str))
-                cells_to_update.append(gspread.Cell(row=row_idx, col=4, value=now_str))
-                cells_to_update.append(gspread.Cell(row=row_idx, col=5, value=wpid))
-                cells_to_update.append(gspread.Cell(row=row_idx, col=6, value=wpurl))
-                cells_to_update.append(gspread.Cell(row=row_idx, col=7, value=""))
+                cells_to_update.append(gspread.Cell(row=row_idx, col=col_status, value="Publicada"))
+                cells_to_update.append(gspread.Cell(row=row_idx, col=col_attempt, value=now_str))
+                cells_to_update.append(gspread.Cell(row=row_idx, col=col_error, value=""))
             else:
                 # Add to published tab and collect index to delete
-                headers_ordered = [
-                    "¿Publicar?", "Estado publicación", "Fecha intento publicación", "Fecha publicación",
-                    "WordPress ID", "WordPress URL", "Error publicación", "ISBN", "Título del libro",
-                    "Autor del libro", "Query", "URL", "URL normalizada", "Título del artículo",
-                    "Título para Web", "Autor para Web",
-                    "Medio de publicación", "Autor de la publicación", "Fecha de publicación",
-                    "Idioma original", "Categoría", "Resumen", "Score de coincidencia",
-                    "Tipo de contenido", "Fecha de extracción", "Hash deduplicación", "Estado"
-                ]
                 row_vals = []
-                for h in headers_ordered:
-                    if h == "¿Publicar?":
-                        row_vals.append(True)
-                    elif h == "Estado publicación":
-                        row_vals.append("Publicada")
-                    elif h == "Fecha intento publicación":
-                        row_vals.append(now_str)
-                    elif h == "Fecha publicación":
+                for h in headers_pub:
+                    if h == "Fecha publicación":
                         row_vals.append(now_str)
                     elif h == "WordPress ID":
                         row_vals.append(wpid)
                     elif h == "WordPress URL":
                         row_vals.append(wpurl)
+                    elif h == "Estado publicación":
+                        row_vals.append("Publicada")
+                    elif h == "Fecha intento publicación":
+                        row_vals.append(now_str)
                     elif h == "Error publicación":
                         row_vals.append("")
                     else:
                         val = row.get(h)
                         if val is None:
+                            # Try fallbacks for renamed fields
                             if h == "Título para Web":
-                                val = row.get("Título del libro detectado por IA")
+                                val = row.get("Título del libro detectado por IA") or row.get("Título del artículo")
                             elif h == "Autor para Web":
-                                val = row.get("Autor del libro detectado por IA")
+                                val = row.get("Autor del libro detectado por IA") or row.get("Autor de la publicación")
+                        
                         val_str = str(val or "").strip()
                         if val_str.lower() in ("titulo web", "título web", "autor web", "autor web "):
                             val_str = ""
@@ -207,12 +204,9 @@ def execute_publication_sync(publish_id: Optional[str], sheet_id: str, dry_run: 
         else:
             errors_count += 1
             err_msg = pub_res.get("error", "Error al publicar")
-            cells_to_update.append(gspread.Cell(row=row_idx, col=2, value="Error"))
-            cells_to_update.append(gspread.Cell(row=row_idx, col=3, value=now_str))
-            cells_to_update.append(gspread.Cell(row=row_idx, col=4, value=""))
-            cells_to_update.append(gspread.Cell(row=row_idx, col=5, value=""))
-            cells_to_update.append(gspread.Cell(row=row_idx, col=6, value=""))
-            cells_to_update.append(gspread.Cell(row=row_idx, col=7, value=err_msg))
+            cells_to_update.append(gspread.Cell(row=row_idx, col=col_status, value="Error"))
+            cells_to_update.append(gspread.Cell(row=row_idx, col=col_attempt, value=now_str))
+            cells_to_update.append(gspread.Cell(row=row_idx, col=col_error, value=err_msg))
 
     # Commit cell updates
     if cells_to_update:

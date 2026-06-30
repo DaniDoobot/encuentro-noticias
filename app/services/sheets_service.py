@@ -29,6 +29,14 @@ def is_row_real(row: dict) -> bool:
             return True
     return False
 
+def col_num_to_letter(n: int) -> str:
+    string = ""
+    while n > 0:
+        n, remainder = divmod(n - 1, 26)
+        string = chr(65 + remainder) + string
+    return string
+
+
 def clean_domain_string(domain: str) -> str:
     s = str(domain).strip().lower()
     if s.startswith("http://"):
@@ -123,26 +131,22 @@ class SheetsService:
         # Tab schemas definition
         tabs = {
             "Libros": [
-                "ISBN", "Título del libro", "Autor del libro", 
+                "¿Incluir en búsqueda?", "ISBN", "Título del libro", "Autor del libro", 
                 "Estado", "Última ejecución", "Reseñas encontradas", "Observaciones"
             ],
             "Reseñas por publicar": [
-                "¿Publicar?", "Estado publicación", "Fecha intento publicación", "Fecha publicación",
-                "WordPress ID", "WordPress URL", "Error publicación", "ISBN", "Título del libro",
-                "Autor del libro", "Query", "URL", "URL normalizada", "Título del artículo",
-                "Título para Web", "Autor para Web",
-                "Medio de publicación", "Autor de la publicación", "Fecha de publicación",
+                "¿Publicar?", "Estado publicación", "Fecha intento publicación", "Error publicación", "ISBN", "Título del libro",
+                "Autor del libro", "URL", "Título para Web", "Autor para Web",
+                "Medio de publicación", "Fecha de publicación",
                 "Idioma original", "Categoría", "Resumen", "Score de coincidencia",
-                "Tipo de contenido", "Fecha de extracción", "Hash deduplicación", "Estado"
+                "Tipo de contenido", "Fecha de extracción", "Estado", "URL normalizada", "Hash deduplicación", "Query"
             ],
             "Reseñas publicadas": [
-                "¿Publicar?", "Estado publicación", "Fecha intento publicación", "Fecha publicación",
-                "WordPress ID", "WordPress URL", "Error publicación", "ISBN", "Título del libro",
-                "Autor del libro", "Query", "URL", "URL normalizada", "Título del artículo",
-                "Título para Web", "Autor para Web",
-                "Medio de publicación", "Autor de la publicación", "Fecha de publicación",
+                "Fecha publicación", "WordPress ID", "WordPress URL", "ISBN", "Título del libro",
+                "Autor del libro", "URL", "Título para Web", "Autor para Web",
+                "Medio de publicación", "Fecha de publicación",
                 "Idioma original", "Categoría", "Resumen", "Score de coincidencia",
-                "Tipo de contenido", "Fecha de extracción", "Hash deduplicación", "Estado"
+                "Tipo de contenido", "Fecha de extracción", "Estado", "URL normalizada", "Hash deduplicación", "Query"
             ],
             "Descartes": [
                 "ISBN", "Título del libro", "Autor del libro", "Query", "URL", 
@@ -156,6 +160,9 @@ class SheetsService:
                 "Run ID", "Fecha", "Nivel", "ISBN", "Acción", "Mensaje", "Detalle"
             ],
             "Config": [
+                "Clave", "Valor", "Descripción"
+            ],
+            "Config técnica": [
                 "Clave", "Valor", "Descripción"
             ]
         }
@@ -171,8 +178,39 @@ class SheetsService:
                 worksheet.insert_row(headers, index=1)
                 continue
 
-            # Ensure headers are correct and run safe migrator if order/columns mismatch for Reseñas tabs
-            if tab_name in ("Reseñas por publicar", "Reseñas publicadas"):
+            # Ensure headers are correct and run safe migrator if order/columns mismatch
+            if tab_name == "Libros":
+                try:
+                    existing_headers = worksheet.row_values(1)
+                    if existing_headers and "¿Incluir en búsqueda?" not in existing_headers:
+                        logger.info("Migrating 'Libros' to add '¿Incluir en búsqueda?' checkbox column...")
+                        all_rows = worksheet.get_all_values()
+                        data_rows = all_rows[1:] if len(all_rows) > 1 else []
+                        
+                        new_rows = []
+                        for row in data_rows:
+                            row_dict = {}
+                            for i, val in enumerate(row):
+                                if i < len(existing_headers):
+                                    row_dict[existing_headers[i]] = val
+                            
+                            new_row = []
+                            for h in headers:
+                                if h == "¿Incluir en búsqueda?":
+                                    title_val = row_dict.get("Título del libro", "").strip()
+                                    new_row.append(True if title_val else "")
+                                else:
+                                    new_row.append(row_dict.get(h, ""))
+                            new_rows.append(new_row)
+                            
+                        worksheet.clear()
+                        worksheet.resize(rows=max(1000, len(new_rows) + 50), cols=len(headers) + 5)
+                        worksheet.update("A1", [headers] + new_rows)
+                        logger.info("Worksheet 'Libros' successfully migrated.")
+                except Exception as e_libros:
+                    logger.error(f"Could not migrate 'Libros': {e_libros}")
+
+            elif tab_name in ("Reseñas por publicar", "Reseñas publicadas"):
                 try:
                     existing_headers = worksheet.row_values(1)
                     if existing_headers and existing_headers != headers:
@@ -189,15 +227,24 @@ class SheetsService:
                             if not is_row_real(row_dict):
                                 continue
                                 
+                            # Safe copies
+                            title_web_val = row_dict.get("Título para Web", "")
+                            if not title_web_val or str(title_web_val).strip().lower() in ("titulo web", "título web"):
+                                title_web_val = row_dict.get("Título del artículo") or row_dict.get("Título del libro detectado por IA") or ""
+                            
+                            author_web_val = row_dict.get("Autor para Web", "")
+                            if not author_web_val or str(author_web_val).strip().lower() in ("autor web", "autor web "):
+                                author_web_val = row_dict.get("Autor de la publicación") or row_dict.get("Autor del libro detectado por IA") or ""
+                                
                             new_row = []
                             for h in headers:
-                                raw_val = row_dict.get(h) if h in row_dict else None
-                                if h not in row_dict:
-                                    if h == "Título para Web":
-                                        raw_val = row_dict.get("Título del libro detectado por IA")
-                                    elif h == "Autor para Web":
-                                        raw_val = row_dict.get("Autor del libro detectado por IA")
-                                        
+                                if h == "Título para Web":
+                                    raw_val = title_web_val
+                                elif h == "Autor para Web":
+                                    raw_val = author_web_val
+                                else:
+                                    raw_val = row_dict.get(h)
+                                    
                                 if raw_val is not None:
                                     if isinstance(raw_val, str):
                                         s = raw_val.strip()
@@ -214,13 +261,12 @@ class SheetsService:
                             
                         # Overwrite sheet with new schema and reordered values
                         worksheet.clear()
-                        # Make sure we have enough columns for headers list
-                        if worksheet.col_count < len(headers):
-                            worksheet.resize(rows=max(1000, len(new_rows) + 50), cols=len(headers) + 5)
+                        worksheet.resize(rows=max(1000, len(new_rows) + 50), cols=len(headers) + 5)
                         worksheet.update("A1", [headers] + new_rows)
                         logger.info(f"Worksheet '{tab_name}' successfully migrated with {len(new_rows)} rows.")
                 except Exception as e_hdr:
                     logger.error(f"Could not migrate headers/rows for {tab_name}: {e_hdr}")
+
             elif worksheet.col_count < len(headers):
                 try:
                     existing_headers = worksheet.row_values(1)
@@ -229,6 +275,7 @@ class SheetsService:
                             worksheet.update_cell(1, i + 1, header)
                 except Exception as e_hdr:
                     logger.warning(f"Could not verify headers for {tab_name}: {e_hdr}")
+
 
         # Ensure Panel worksheet exists and has the correct layout
         if "Panel" in existing_sheets:
@@ -360,11 +407,11 @@ class SheetsService:
                         }
                     }
                 },
-                # Checkbox validation for Reseñas publicadas Column A (index 0)
+                # Checkbox validation for Libros Column A (index 0)
                 {
                     "setDataValidation": {
                         "range": {
-                            "sheetId": ws_pub.id,
+                            "sheetId": libros_ws.id,
                             "startRowIndex": 1,
                             "endRowIndex": 1000,
                             "startColumnIndex": 0,
@@ -384,17 +431,46 @@ class SheetsService:
             logger.error(f"Error applying Panel validation format: {e_val}")
             raise e_val
 
-        # Initialize Config defaults if empty
+        # Fill empty checkboxes to TRUE for books with a title
+        try:
+            existing_headers = libros_ws.row_values(1)
+            idx_incluir = existing_headers.index("¿Incluir en búsqueda?") if "¿Incluir en búsqueda?" in existing_headers else -1
+            idx_title = existing_headers.index("Título del libro") if "Título del libro" in existing_headers else -1
+            if idx_incluir != -1 and idx_title != -1:
+                all_rows = libros_ws.get_all_values()
+                updates = []
+                for r_idx, row in enumerate(all_rows[1:], start=2):
+                    title_val = row[idx_title].strip() if idx_title < len(row) else ""
+                    incluir_val = row[idx_incluir].strip() if idx_incluir < len(row) else ""
+                    if title_val and incluir_val == "":
+                        updates.append(gspread.Cell(row=r_idx, col=idx_incluir + 1, value=True))
+                if updates:
+                    libros_ws.update_cells(updates)
+                    logger.info(f"Updated {len(updates)} empty checkboxes to TRUE in 'Libros'.")
+        except Exception as e_chk:
+            logger.warning(f"Error checking/updating empty checkboxes in 'Libros': {e_chk}")
+
+        # Initialize Config & Config técnica defaults
         config_ws = spreadsheet.worksheet("Config")
         config_rows = config_ws.get_all_records()
-        existing_keys = {row["Clave"] for row in config_rows if "Clave" in row}
+        existing_basic = {row["Clave"]: row for row in config_rows if "Clave" in row}
+
+        tech_ws = spreadsheet.worksheet("Config técnica")
+        tech_rows = tech_ws.get_all_records()
+        existing_tech = {row["Clave"]: row for row in tech_rows if "Clave" in row}
         
-        default_configs = [
+        basic_defaults = [
             {"Clave": "MAX_BOOKS_PER_RUN", "Valor": settings.MAX_BOOKS_PER_RUN, "Descripción": "Cantidad máxima de libros a procesar por ejecución"},
-            {"Clave": "MAX_SEARCH_PAGES_PER_QUERY", "Valor": settings.MAX_SEARCH_PAGES_PER_QUERY, "Descripción": "Páginas máximas del buscador a escanear por query"},
             {"Clave": "MAX_CANDIDATES_PER_BOOK", "Valor": settings.MAX_CANDIDATES_PER_BOOK, "Descripción": "Cantidad máxima de URLs candidatas a evaluar por libro"},
-            {"Clave": "MIN_MATCH_SCORE", "Valor": settings.MIN_MATCH_SCORE, "Descripción": "Score mínimo de validación de OpenAI para aceptar una reseña (0-100)"},
+            {"Clave": "MIN_MATCH_SCORE", "Valor": 1, "Descripción": "Score mínimo de validación de OpenAI para aceptar una reseña (0-100)"},
             {"Clave": "OPENAI_MODEL", "Valor": settings.OPENAI_MODEL, "Descripción": "Modelo de OpenAI a usar para análisis"},
+            {"Clave": "WORDPRESS_POST_STATUS", "Valor": settings.WORDPRESS_POST_STATUS, "Descripción": "Estado por defecto para posts creados (draft, publish)"},
+            {"Clave": "LOG_MAX_ROWS", "Valor": settings.LOG_MAX_ROWS, "Descripción": "Cantidad máxima de filas a mantener en la pestaña Logs"},
+            {"Clave": "DESCARTES_MAX_ROWS", "Valor": getattr(settings, "DESCARTES_MAX_ROWS", 1000), "Descripción": "Cantidad máxima de descartes a mantener en la pestaña Descartes"}
+        ]
+
+        technical_defaults = [
+            {"Clave": "MAX_SEARCH_PAGES_PER_QUERY", "Valor": settings.MAX_SEARCH_PAGES_PER_QUERY, "Descripción": "Páginas máximas del buscador a escanear por query"},
             {"Clave": "REVIEW_DOMAINS", "Valor": "revistadelibros.com,nueva-revista.net,aceprensa.com,elcultural.com,zendalibros.com,babelia.elpais.com", "Descripción": "Dominios culturales/literarios recomendados para búsquedas específicas (separados por coma)"},
             {"Clave": "SEARCH_DELAY_SECONDS", "Valor": settings.SEARCH_DELAY_SECONDS, "Descripción": "Espera en segundos entre cada búsqueda para evitar bloqueos"},
             {"Clave": "SEARCH_BACKOFF_SECONDS", "Valor": settings.SEARCH_BACKOFF_SECONDS, "Descripción": "Espera de enfriamiento en segundos si se detecta rate limit o error"},
@@ -436,18 +512,37 @@ class SheetsService:
             {"Clave": "ADMIN_TOKEN", "Valor": settings.ADMIN_TOKEN or "secret_admin_token", "Descripción": "Token de administración secreto para Apps Script (cabecera X-Admin-Token)"},
             {"Clave": "WORDPRESS_BASE_URL", "Valor": settings.WORDPRESS_BASE_URL or "", "Descripción": "URL base de WordPress (ej. https://miweb.com)"},
             {"Clave": "WORDPRESS_USERNAME", "Valor": settings.WORDPRESS_USERNAME or "", "Descripción": "Usuario administrador/editor de WordPress"},
-            {"Clave": "WORDPRESS_POST_STATUS", "Valor": settings.WORDPRESS_POST_STATUS, "Descripción": "Estado por defecto para posts creados (draft, publish)"},
             {"Clave": "WORDPRESS_POST_TYPE", "Valor": settings.WORDPRESS_POST_TYPE, "Descripción": "Tipo de post en WordPress (posts, pages)"},
             {"Clave": "WORDPRESS_DEFAULT_CATEGORY_ID", "Valor": settings.WORDPRESS_DEFAULT_CATEGORY_ID or "", "Descripción": "ID de categoría de WordPress por defecto (opcional)"},
             {"Clave": "LOG_RETENTION_DAYS", "Valor": settings.LOG_RETENTION_DAYS, "Descripción": "Días de retención de logs en la pestaña Logs"},
-            {"Clave": "LOG_MAX_ROWS", "Valor": settings.LOG_MAX_ROWS, "Descripción": "Cantidad máxima de filas a mantener en la pestaña Logs"},
-            {"Clave": "DESCARTES_RETENTION_DAYS", "Valor": getattr(settings, "DESCARTES_RETENTION_DAYS", 30), "Descripción": "Días de retención de descartes en la pestaña Descartes"},
-            {"Clave": "DESCARTES_MAX_ROWS", "Valor": getattr(settings, "DESCARTES_MAX_ROWS", 1000), "Descripción": "Cantidad máxima de descartes a mantener en la pestaña Descartes"}
+            {"Clave": "DESCARTES_RETENTION_DAYS", "Valor": getattr(settings, "DESCARTES_RETENTION_DAYS", 30), "Descripción": "Días de retención de descartes en la pestaña Descartes"}
         ]
 
-        for config in default_configs:
-            if config["Clave"] not in existing_keys:
-                config_ws.append_row([config["Clave"], config["Valor"], config["Descripción"]], value_input_option="USER_ENTERED")
+        # 1. Move technical keys currently in Config to Config técnica
+        basic_keys_set = {b["Clave"] for b in basic_defaults}
+        for row in config_rows:
+            k = row.get("Clave")
+            v = row.get("Valor")
+            d = row.get("Descripción", "")
+            if k and k not in basic_keys_set:
+                if k not in existing_tech:
+                    tech_ws.append_row([k, v, d], value_input_option="USER_ENTERED")
+                    existing_tech[k] = {"Clave": k, "Valor": v, "Descripción": d}
+
+        # 2. Re-write Config keeping only basic keys
+        config_ws.clear()
+        config_ws.append_row(["Clave", "Valor", "Descripción"])
+        for b in basic_defaults:
+            k = b["Clave"]
+            val = existing_basic[k]["Valor"] if k in existing_basic else b["Valor"]
+            desc = existing_basic[k]["Descripción"] if k in existing_basic else b["Descripción"]
+            config_ws.append_row([k, val, desc], value_input_option="USER_ENTERED")
+
+        # 3. Ensure all technical defaults exist in Config técnica
+        for t in technical_defaults:
+            k = t["Clave"]
+            if k not in existing_tech:
+                tech_ws.append_row([t["Clave"], t["Valor"], t["Descripción"]], value_input_option="USER_ENTERED")
 
         # Initialise Fuentes tab with default domains if empty
         fuentes_ws = spreadsheet.worksheet("Fuentes")
@@ -484,20 +579,41 @@ class SheetsService:
 
     def get_config_dict(self, sheet_id: str) -> Dict[str, Any]:
         """
-        Reads configurations from Config tab, falls back to env settings.
+        Reads configurations from Config técnica first, then Config (user override), falls back to env settings.
         """
         client = self.get_client()
         try:
             spreadsheet = client.open_by_key(sheet_id)
-            worksheet = spreadsheet.worksheet("Config")
-            records = worksheet.get_all_records()
             
-            config_dict = {}
-            for r in records:
-                key = r.get("Clave")
-                val = r.get("Valor")
-                if key and val is not None:
-                    config_dict[key] = val
+            # 1. Read technical configs
+            tech_dict = {}
+            try:
+                tech_ws = spreadsheet.worksheet("Config técnica")
+                tech_records = tech_ws.get_all_records()
+                for r in tech_records:
+                    key = r.get("Clave")
+                    val = r.get("Valor")
+                    if key and val is not None:
+                        tech_dict[key] = val
+            except Exception as e_tech:
+                logger.warning(f"Could not read Config técnica tab: {e_tech}")
+
+            # 2. Read basic config (takes priority on duplicates)
+            user_dict = {}
+            try:
+                config_ws = spreadsheet.worksheet("Config")
+                config_records = config_ws.get_all_records()
+                for r in config_records:
+                    key = r.get("Clave")
+                    val = r.get("Valor")
+                    if key and val is not None:
+                        user_dict[key] = val
+            except Exception as e_user:
+                logger.warning(f"Could not read Config tab: {e_user}")
+
+            # Combine them: user_dict overwrites tech_dict
+            config_dict = {**tech_dict, **user_dict}
+            logger.info(f"CONFIG_LOADED: merged {len(config_dict)} total keys (User keys: {len(user_dict)}, Tech keys: {len(tech_dict)})")
 
             return {
                 "MAX_BOOKS_PER_RUN": parse_int(config_dict.get("MAX_BOOKS_PER_RUN"), settings.MAX_BOOKS_PER_RUN),
@@ -604,18 +720,7 @@ class SheetsService:
         limit: int = 10
     ) -> Dict[str, Any]:
         """
-        Reads Libros tab. A row is eligible to process if it has a non-empty title.
-        ISBN and author are optional. Previous status (sin_resultados, completado, error)
-        does NOT block reprocessing - every run is independent.
-
-        Only explicitly excluded statuses (e.g. 'no buscar') would block a row.
-
-        Returns a dict with:
-          - 'books': list of eligible book dicts
-          - 'books_rows_read': total non-empty rows read
-          - 'books_pending_detected': rows accepted for processing
-          - 'books_skipped_missing_title': rows skipped due to missing title
-          - 'books_skipped_non_pending_status': always 0 (kept for API compatibility)
+        Reads Libros tab. A row is eligible to process if it has a non-empty title and ¿Incluir en búsqueda? is True/empty.
         """
         client = self.get_client()
         spreadsheet = client.open_by_key(sheet_id)
@@ -625,8 +730,9 @@ class SheetsService:
         books = []
         rows_read = 0
         skipped_missing_title = 0
+        skipped_not_included = 0
+        skipped_blocked_status = 0
 
-        # Statuses that explicitly block processing (reserved for future use)
         BLOCKED_STATUSES = {"no buscar"}
 
         for index, row in enumerate(records, start=2):  # Headers are row 1
@@ -645,8 +751,19 @@ class SheetsService:
                 skipped_missing_title += 1
                 continue
 
+            # Check inclusion checkbox (empty/blank is treated as TRUE by default)
+            incluir_raw = str(row.get("¿Incluir en búsqueda?", "")).strip().lower()
+            if incluir_raw == "":
+                incluir_raw = "true"
+            is_included = incluir_raw != "false"
+
+            if not is_included:
+                skipped_not_included += 1
+                continue
+
             # Skip only explicitly blocked statuses
             if status in BLOCKED_STATUSES:
+                skipped_blocked_status += 1
                 continue
 
             books.append({
@@ -665,8 +782,10 @@ class SheetsService:
             "books_rows_read": rows_read,
             "books_pending_detected": len(books),
             "books_skipped_missing_title": skipped_missing_title,
-            "books_skipped_non_pending_status": 0  # kept for API compat
+            "books_skipped_not_included": skipped_not_included,
+            "books_skipped_blocked_status": skipped_blocked_status
         }
+
 
     def get_book_by_isbn(self, sheet_id: str, isbn: str) -> Optional[Dict[str, Any]]:
         """
@@ -693,20 +812,36 @@ class SheetsService:
     def update_book_status(self, sheet_id: str, row_index: int, status: str, last_run: str, reviews_found: int, observations: str):
         """
         Updates the status fields of a book row in Libros tab.
-        Uses a range update to do this in a single API call.
+        Uses a range update if contiguous, otherwise falls back to individual cell updates.
         """
         client = self.get_client()
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.worksheet("Libros")
         
-        # Cols mapping:
-        # Col D (4): Estado
-        # Col E (5): Última ejecución
-        # Col F (6): Reseñas encontradas
-        # Col G (7): Observaciones
-        range_name = f"D{row_index}:G{row_index}"
-        values = [[status, last_run, reviews_found, observations]]
-        worksheet.update(range_name, values)
+        headers = worksheet.row_values(1)
+        
+        def get_col_index(name: str) -> Optional[int]:
+            try:
+                return headers.index(name) + 1
+            except ValueError:
+                return None
+
+        col_estado = get_col_index("Estado") or 5
+        col_last_run = get_col_index("Última ejecución") or 6
+        col_reviews = get_col_index("Reseñas encontradas") or 7
+        col_obs = get_col_index("Observaciones") or 8
+
+        if col_last_run == col_estado + 1 and col_reviews == col_estado + 2 and col_obs == col_estado + 3:
+            col_start_letter = col_num_to_letter(col_estado)
+            col_end_letter = col_num_to_letter(col_obs)
+            range_name = f"{col_start_letter}{row_index}:{col_end_letter}{row_index}"
+            values = [[status, last_run, reviews_found, observations]]
+            worksheet.update(range_name, values)
+        else:
+            worksheet.update_cell(row_index, col_estado, status)
+            worksheet.update_cell(row_index, col_last_run, last_run)
+            worksheet.update_cell(row_index, col_reviews, reviews_found)
+            worksheet.update_cell(row_index, col_obs, observations)
 
     def get_books_status_summary(self, sheet_id: str) -> Dict[str, int]:
         """
@@ -735,7 +870,6 @@ class SheetsService:
                 elif status in counts:
                     counts[status] += 1
                 else:
-                    # Treat unexpected status as pendiente or error? Treat as pendiente if empty, otherwise count it as error/other
                     counts["pendiente"] += 1
 
         counts["total"] = total
@@ -750,16 +884,14 @@ class SheetsService:
         worksheet = spreadsheet.worksheet("Reseñas por publicar")
         return worksheet.get_all_records()
 
-    def add_review(self, sheet_id: str, review_data: List[Any]):
+    def add_review(self, sheet_id: str, review_dict: Dict[str, Any]):
         """
-        Appends a row to Reseñas por publicar, or overwrites the first empty/false row if found.
-        Handles prepending control columns if the new layout is active.
+        Appends or overwrites a row in Reseñas por publicar using header names.
         """
         client = self.get_client()
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.worksheet("Reseñas por publicar")
         
-        # Clean placeholders from review_data: "Titulo Web", "Autor Web"
         def clean_val(val: Any) -> Any:
             if isinstance(val, str):
                 s = val.strip()
@@ -767,17 +899,18 @@ class SheetsService:
                     return ""
                 return s
             return val
-        review_data = [clean_val(item) for item in review_data]
-        
-        # Check if the worksheet uses the new layout
+
         headers = worksheet.row_values(1)
-        if headers and headers[0] == "¿Publicar?":
-            # Prepend 7 empty fields: ¿Publicar? = False, Estado publicación = "" (empty), ...
-            full_row = [False, "", "", "", "", "", ""] + review_data
-        else:
-            full_row = review_data
+        full_row = []
+        for h in headers:
+            val = review_dict.get(h)
+            if val is None:
+                if h == "¿Publicar?":
+                    val = False
+                else:
+                    val = ""
+            full_row.append(clean_val(val))
             
-        # Read records to find the first non-real row index to overwrite
         records = worksheet.get_all_records()
         overwrite_row_index = None
         for idx, row in enumerate(records):
@@ -789,6 +922,7 @@ class SheetsService:
             worksheet.update(range_name=f"A{overwrite_row_index}", values=[full_row])
         else:
             worksheet.append_row(full_row)
+
 
     def add_descarte(self, sheet_id: str, descarte_data: List[Any]):
         """

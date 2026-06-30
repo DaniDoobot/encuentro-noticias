@@ -18,19 +18,31 @@ function onOpen() {
     .addToUi();
 }
 
-/**
- * Obtiene el valor de una clave de configuración desde la pestaña 'Config'.
- */
 function getConfigValue(key) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // Try Config first
   var configSheet = ss.getSheetByName("Config");
-  if (!configSheet) return null;
-  var data = configSheet.getDataRange().getValues();
-  for (var i = 1; i < data.length; i++) {
-    if (data[i][0] === key) {
-      return data[i][1];
+  if (configSheet) {
+    var data = configSheet.getDataRange().getValues();
+    for (var i = 1; i < data.length; i++) {
+      if (data[i][0] === key) {
+        return data[i][1];
+      }
     }
   }
+  
+  // Try Config técnica fallback
+  var techSheet = ss.getSheetByName("Config técnica");
+  if (techSheet) {
+    var dataTech = techSheet.getDataRange().getValues();
+    for (var j = 1; j < dataTech.length; j++) {
+      if (dataTech[j][0] === key) {
+        return dataTech[j][1];
+      }
+    }
+  }
+  
   return null;
 }
 

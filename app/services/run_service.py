@@ -2,6 +2,7 @@ import uuid
 import datetime
 import json
 import time
+import logging
 from typing import Dict, Any, List, Optional, Set, Tuple
 import threading
 from urllib.parse import urlparse
@@ -180,21 +181,24 @@ class RunService:
             books_rows_read = books_result["books_rows_read"]
             books_pending_detected = books_result["books_pending_detected"]
             books_skipped_missing_title = books_result["books_skipped_missing_title"]
-            books_skipped_non_pending_status = books_result["books_skipped_non_pending_status"]
+            books_skipped_not_included = books_result.get("books_skipped_not_included", 0)
+            books_skipped_blocked_status = books_result.get("books_skipped_blocked_status", 0)
 
             current_runs[run_id]["books_rows_read"] = books_rows_read
             current_runs[run_id]["books_pending_detected"] = books_pending_detected
             current_runs[run_id]["books_skipped_missing_title"] = books_skipped_missing_title
-            current_runs[run_id]["books_skipped_non_pending_status"] = books_skipped_non_pending_status
+            current_runs[run_id]["books_skipped_not_included"] = books_skipped_not_included
+            current_runs[run_id]["books_skipped_blocked_status"] = books_skipped_blocked_status
 
             total_books = len(pending_books)
             current_runs[run_id]["books_total"] = total_books
 
             detection_summary = (
-                f"Detección libros pendientes: leidas={books_rows_read}, "
-                f"pendientes={books_pending_detected}, "
+                f"Detección libros: leidas={books_rows_read}, "
+                f"incluidas_en_busqueda={books_pending_detected}, "
+                f"omitidas_no_marcadas={books_skipped_not_included}, "
                 f"omitidas_sin_título={books_skipped_missing_title}, "
-                f"omitidas_estado={books_skipped_non_pending_status}"
+                f"omitidas_estado={books_skipped_blocked_status}"
             )
             logger_service.log("INFO", "BOOKS_DETECTION_SUMMARY", f"{log_prefix}{detection_summary}", sheet_id=sheet_id, run_id=run_id)
             self._add_in_memory_log(run_id, "INFO", "BOOKS_DETECTION_SUMMARY", detection_summary)
@@ -1340,6 +1344,15 @@ class RunService:
             score = analysis.get("match_score", 0)
             openai_reason = analysis.get("reason", "")
             
+            # Normalise inconsistency: score >= 1 should imply is_valid = True.
+            # score == 0 should imply is_valid = False.
+            if score >= 1 and not is_valid:
+                logger_service.log("WARNING", "OPENAI_COHERENCE_FIX", f"{log_prefix}Incoherencia OpenAI: is_valid=False pero score={score}. Se fuerza is_valid=True. URL: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                is_valid = True
+            elif score == 0 and is_valid:
+                logger_service.log("WARNING", "OPENAI_COHERENCE_FIX", f"{log_prefix}Incoherencia OpenAI: is_valid=True pero score=0. Se fuerza is_valid=False. URL: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                is_valid = False
+            
             # Map OpenAI reason or scores to descarte categories
             descarte_reason = ""
             if not is_valid:
@@ -1368,28 +1381,31 @@ class RunService:
                 self._add_in_memory_log(run_id, "INFO", "ARTICLE_ACCEPTED", f"{log_prefix}Aceptada (score={score}): {url}", isbn=isbn)
 
                 if not dry_run:
-                    sheets_service.add_review(sheet_id, [
-                        isbn,
-                        title,
-                        author,
-                        origin_query,
-                        url,
-                        norm_url,
-                        art_title,
-                        analysis.get("detected_book_title", ""),
-                        analysis.get("detected_book_author", ""),
-                        analysis.get("publication_name", ""),
-                        analysis.get("publication_author", ""),
-                        analysis.get("publication_date", ""),
-                        analysis.get("language", ""),
-                        analysis.get("category", ""),
-                        analysis.get("summary", ""),
-                        score,
-                        analysis.get("content_type", ""),
-                        get_now_madrid_str(),
-                        prim_hash,
-                        "pendiente"
-                    ])
+                    review_dict = {
+                        "¿Publicar?": False,
+                        "Estado publicación": "",
+                        "Fecha intento publicación": "",
+                        "Error publicación": "",
+                        "ISBN": isbn,
+                        "Título del libro": title,
+                        "Autor del libro": author,
+                        "URL": url,
+                        "Título para Web": art_title,
+                        "Autor para Web": analysis.get("publication_author") or analysis.get("publication_name") or "",
+                        "Medio de publicación": analysis.get("publication_name", ""),
+                        "Fecha de publicación": analysis.get("publication_date", ""),
+                        "Idioma original": analysis.get("language", ""),
+                        "Categoría": analysis.get("category", ""),
+                        "Resumen": analysis.get("summary", ""),
+                        "Score de coincidencia": score,
+                        "Tipo de contenido": analysis.get("content_type", ""),
+                        "Fecha de extracción": get_now_madrid_str(),
+                        "Estado": "pendiente",
+                        "URL normalizada": norm_url,
+                        "Hash deduplicación": prim_hash,
+                        "Query": origin_query
+                    }
+                    sheets_service.add_review(sheet_id, review_dict)
                     existing_hashes.add(prim_hash)
                     existing_secondary_keys.add(sec_key)
                 

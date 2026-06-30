@@ -1006,7 +1006,9 @@ def test_google_news_resolution_and_fallbacks():
          
          # Verification 2: add_review is called with the resolved URL
          assert mock_add_review.call_count == 1
-         assert mock_add_review.call_args[0][1][4] == resolved1_url
+         # add_review now receives (sheet_id, review_dict) where review_dict is a dict
+         review_arg = mock_add_review.call_args[0][1]
+         assert review_arg.get("URL") == resolved1_url
          
          # Verification 3: add_descarte is called for failed resolution and cookie pages
          assert mock_add_descarte.call_count >= 2
