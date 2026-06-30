@@ -74,6 +74,28 @@ def execute_indexing_job(job_id: str, limit_domains: int, force_refresh: bool, s
                     job["domains_completed"] += 1
                     if stats.get("errors"):
                         job["errors"].extend(stats["errors"])
+            
+            # Immediately update status in Google Sheets in real-time
+            domain = stats.get("domain")
+            if domain:
+                skipped = stats.get("skipped", False)
+                if not skipped:
+                    try:
+                        db_stats = cache_service.get_domain_stats(domain)
+                        urls_count = db_stats.get("urls", 0)
+                    except Exception:
+                        urls_count = stats.get("urls_found", 0)
+                    
+                    errs_list = stats.get("errors", [])
+                    last_idx = stats.get("last_indexed") or datetime.datetime.utcnow().isoformat()
+                    
+                    sheets_service.update_source_index_status(
+                        sheet_id=sheet_id,
+                        domain=domain,
+                        last_indexed=last_idx,
+                        urls_indexed=urls_count,
+                        errors=errs_list
+                    )
 
         def on_progress(found_inc: int, stored_inc: int, enriched_inc: int):
             with job_registry_lock:
@@ -137,18 +159,8 @@ def execute_indexing_job(job_id: str, limit_domains: int, force_refresh: bool, s
                 "errors": errs_list
             })
 
-            # Update Sheets if not skipped
-            if not skipped:
-                errs_str = ", ".join(errs_list) if errs_list else ""
-                last_idx = res.get("last_indexed", datetime.datetime.utcnow().isoformat())
-                
-                sheets_service.update_source_stats(
-                    sheet_id=sheet_id,
-                    domain=domain,
-                    last_indexed=last_idx,
-                    urls_indexed=urls_count,
-                    errors=errs_str
-                )
+            # Sheets are already updated in real-time inside on_domain_complete
+            pass
 
         logger_service.log(
             level="INFO",
@@ -491,5 +503,47 @@ def post_sources_defaults_append():
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to append default sources: {str(e)}"
+        )
+
+@router.post("/sources/sync-status")
+def post_sources_sync_status():
+    """
+    Synchronizes the SQLite cache stats with the Fuentes sheet in Google Sheets.
+    """
+    sheet_id = settings.GOOGLE_SHEET_ID
+    try:
+        # Log SOURCE_SHEET_UPDATE_STARTED
+        logger_service.log(
+            level="INFO",
+            action="SOURCE_SHEET_UPDATE_STARTED",
+            message="Iniciando sincronización masiva de la pestaña Fuentes",
+            sheet_id=sheet_id
+        )
+        
+        result = sheets_service.sync_sources_status(sheet_id)
+        
+        # Log SOURCE_SHEET_UPDATE_COMPLETED
+        logger_service.log(
+            level="INFO",
+            action="SOURCE_SHEET_UPDATE_COMPLETED",
+            message=f"Sincronización masiva de Fuentes completada. Fuentes actualizadas: {result['sources_updated']}",
+            sheet_id=sheet_id,
+            detail=f"Total URLs en cache: {result['total_urls']}"
+        )
+        logger_service.flush_log_batch(sheet_id)
+        
+        return result
+    except Exception as e:
+        # Log SOURCE_SHEET_UPDATE_FAILED
+        logger_service.log(
+            level="ERROR",
+            action="SOURCE_SHEET_UPDATE_FAILED",
+            message=f"Error en sincronización masiva de Fuentes: {str(e)}",
+            sheet_id=sheet_id
+        )
+        logger_service.flush_log_batch(sheet_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Sincronización fallida: {str(e)}"
         )
 

@@ -1588,3 +1588,146 @@ def test_ensure_sheet_updates_low_limits():
         assert any("CONFIG_LOW_QUERY_LIMIT_WARNING" in str(c) for c in warning_calls)
         assert any("CONFIG_QUERY_LIMITS_AUTO_UPDATED" in str(c) for c in info_calls)
 
+
+# --- ADDITIONAL SOURCES SYNC REGRESSION TESTS ---
+
+def test_domain_comparison_normalizes_properly():
+    from app.services.sheets_service import clean_domain_string
+    assert clean_domain_string("HTTPS://WWW.RELIGIONENLIBERTAD.COM/") == "religionenlibertad.com"
+    assert clean_domain_string("http://abc.es/noticias") == "abc.es"
+    assert clean_domain_string("   WwW.ALFAYOMEGA.ES  ") == "alfayomega.es"
+
+
+def test_update_source_index_status_updates_sheet():
+    from app.services.sheets_service import sheets_service
+    
+    mock_records = [
+        {"Dominio": "religionenlibertad.com", "Última indexación": "", "URLs indexadas": "", "Errores": ""},
+        {"Dominio": "abc.es", "Última indexación": "", "URLs indexadas": "", "Errores": ""}
+    ]
+    
+    class FakeFuentesWorksheet:
+        def __init__(self):
+            self.updated_range = None
+            self.updated_values = None
+        def get_all_records(self):
+            return mock_records
+        def update(self, range_name, values, **kwargs):
+            self.updated_range = range_name
+            self.updated_values = values
+            
+    fake_ws = FakeFuentesWorksheet()
+    
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
+        mock_spreadsheet = MagicMock()
+        mock_spreadsheet.worksheet.return_value = fake_ws
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+        
+        sheets_service.update_source_index_status(
+            sheet_id="some_sheet",
+            domain="https://www.religionenlibertad.com/",
+            last_indexed="2026-06-30T17:20:40",
+            urls_indexed=989,
+            errors=[]
+        )
+        
+        # Row 2 (first domain in mock_records) should be updated
+        assert fake_ws.updated_range == "H2:J2"
+        assert fake_ws.updated_values == [["2026-06-30T17:20:40", 989, ""]]
+
+
+def test_update_status_even_with_partial_errors():
+    from app.services.sheets_service import sheets_service
+    
+    mock_records = [
+        {"Dominio": "abc.es", "Última indexación": "", "URLs indexadas": "", "Errores": ""}
+    ]
+    
+    class FakeFuentesWorksheet:
+        def __init__(self):
+            self.updated_values = None
+        def get_all_records(self):
+            return mock_records
+        def update(self, range_name, values, **kwargs):
+            self.updated_values = values
+            
+    fake_ws = FakeFuentesWorksheet()
+    
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
+        mock_spreadsheet = MagicMock()
+        mock_spreadsheet.worksheet.return_value = fake_ws
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+        
+        # Even with urls_indexed > 0 and errors list, it should write them
+        sheets_service.update_source_index_status(
+            sheet_id="some_sheet",
+            domain="abc.es",
+            last_indexed="2026-06-30T16:55:21",
+            urls_indexed=541,
+            errors=["sitemap_parse_error", "timeout"]
+        )
+        
+        assert fake_ws.updated_values == [["2026-06-30T16:55:21", 541, "sitemap_parse_error, timeout"]]
+
+
+def test_sync_status_endpoint():
+    from app.config import settings
+    mock_sync_result = {
+        "success": True,
+        "sources_updated": 3,
+        "total_urls": 2030
+    }
+    
+    with patch("app.services.sheets_service.sheets_service.sync_sources_status", return_value=mock_sync_result):
+        response = client.post("/sources/sync-status", headers={"X-Admin-Token": settings.ADMIN_TOKEN})
+        
+    assert response.status_code == 200
+    assert response.json() == mock_sync_result
+
+
+def test_background_job_updates_realtime():
+    from unittest.mock import ANY
+    from app.routers.sources import execute_indexing_job
+    
+    mock_sources = [
+        {"domain": "religionenlibertad.com", "active": True}
+    ]
+    
+    mock_index_results = [
+        {"domain": "religionenlibertad.com", "urls_found": 12, "errors": ["some_error"], "skipped": False}
+    ]
+    
+    # We want to check that executing indexing job triggers update_source_index_status for religionenlibertad.com
+    with patch("app.services.sheets_service.sheets_service.get_config_dict", return_value={}), \
+         patch("app.services.sheets_service.sheets_service.get_active_sources", return_value=mock_sources), \
+         patch("app.services.cache_service.cache_service.get_domain_stats", return_value={"urls": 12}), \
+         patch("app.services.domain_indexer.domain_indexer.index_all", return_value=mock_index_results) as mock_index, \
+         patch("app.services.sheets_service.sheets_service.update_source_index_status") as mock_update:
+         
+         # Stub index_all to trigger on_domain_complete manually
+         def fake_index_all(*args, **kwargs):
+             on_complete = kwargs.get("on_domain_complete")
+             if on_complete:
+                 on_complete(mock_index_results[0])
+             return mock_index_results
+             
+         mock_index.side_effect = fake_index_all
+         
+         execute_indexing_job(
+             job_id="job_123",
+             limit_domains=1,
+             force_refresh=False,
+             sheet_id="sheet_id"
+         )
+         
+         # update_source_index_status should have been called in real-time
+         assert mock_update.called
+         mock_update.assert_called_with(
+             sheet_id="sheet_id",
+             domain="religionenlibertad.com",
+             last_indexed=ANY,
+             urls_indexed=12,
+             errors=["some_error"]
+         )
+
+

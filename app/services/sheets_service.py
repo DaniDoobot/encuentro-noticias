@@ -43,6 +43,8 @@ def clean_domain_string(domain: str) -> str:
         s = s[7:]
     elif s.startswith("https://"):
         s = s[8:]
+    if s.startswith("www."):
+        s = s[4:]
     if "/" in s:
         s = s.split("/")[0]
     return s.strip()
@@ -1030,31 +1032,187 @@ class SheetsService:
             })
         return sources
 
-    def update_source_stats(
+    def update_source_index_status(
         self,
         sheet_id: str,
         domain: str,
         last_indexed: str,
         urls_indexed: int,
-        errors: str,
-    ):
+        errors: Any,
+    ) -> None:
         """
         Updates Última indexación, URLs indexadas, Errores columns for a domain in Fuentes tab.
         Columns: H=Última indexación, I=URLs indexadas, J=Errores
         """
+        from app.services.logger_service import logger_service
+        import json
+
+        # Log SOURCE_SHEET_UPDATE_STARTED
+        logger_service.log(
+            level="INFO",
+            action="SOURCE_SHEET_UPDATE_STARTED",
+            message=f"Iniciando actualización de hoja Fuentes para el dominio: {domain}",
+            sheet_id=sheet_id,
+            detail=json.dumps({
+                "domain": domain,
+                "last_indexed": last_indexed,
+                "urls_indexed": urls_indexed,
+                "errors": errors
+            })
+        )
+
         try:
+            if isinstance(errors, list):
+                errors_str = ", ".join(str(e) for e in errors)
+            else:
+                errors_str = str(errors or "")
+
             client = self.get_client()
             spreadsheet = client.open_by_key(sheet_id)
             worksheet = spreadsheet.worksheet("Fuentes")
             records = worksheet.get_all_records()
+
+            updated = False
             for i, row in enumerate(records, start=2):
                 row_dom_raw = str(row.get("Dominio", "")).strip()
                 if clean_domain_string(row_dom_raw) == clean_domain_string(domain):
-                    worksheet.update(f"H{i}:J{i}", [[last_indexed, urls_indexed, errors]])
+                    worksheet.update(f"H{i}:J{i}", [[last_indexed, urls_indexed, errors_str]])
+                    updated = True
+
+                    # Log SOURCE_SHEET_UPDATE_ROW
+                    logger_service.log(
+                        level="INFO",
+                        action="SOURCE_SHEET_UPDATE_ROW",
+                        message=f"Fila {i} actualizada en la pestaña Fuentes para el dominio {domain}",
+                        sheet_id=sheet_id,
+                        detail=json.dumps({
+                            "domain": domain,
+                            "row": i,
+                            "last_indexed": last_indexed,
+                            "urls_indexed": urls_indexed,
+                            "errors_count": len(errors) if isinstance(errors, list) else (1 if errors else 0)
+                        })
+                    )
                     break
+
+            if not updated:
+                logger_service.log(
+                    level="WARNING",
+                    action="SOURCE_SHEET_UPDATE_FAILED",
+                    message=f"No se encontró el dominio {domain} en la pestaña Fuentes",
+                    sheet_id=sheet_id
+                )
+            else:
+                # Log SOURCE_SHEET_UPDATE_COMPLETED
+                logger_service.log(
+                    level="INFO",
+                    action="SOURCE_SHEET_UPDATE_COMPLETED",
+                    message=f"Actualización completada para el dominio {domain}",
+                    sheet_id=sheet_id
+                )
+
+        except Exception as e:
+            # Log SOURCE_SHEET_UPDATE_FAILED
+            logger_service.log(
+                level="ERROR",
+                action="SOURCE_SHEET_UPDATE_FAILED",
+                message=f"Error actualizando el dominio {domain} en la pestaña Fuentes: {str(e)}",
+                sheet_id=sheet_id
+            )
+            import logging
+            logging.getLogger("encuentro-noticias").warning(f"update_source_index_status error: {e}")
+
+    def sync_sources_status(self, sheet_id: str) -> Dict[str, Any]:
+        """
+        Reads all domain statuses from SQLite and updates the entire Fuentes sheet in a single batch.
+        """
+        from app.services.logger_service import logger_service
+        from app.services.cache_service import cache_service
+        import json
+
+        try:
+            total_urls = cache_service.get_total_urls()
+            db_statuses = cache_service.get_all_domain_statuses()
+            db_statuses_map = {clean_domain_string(s["domain"]): s for s in db_statuses}
+
+            db_stats = cache_service.get_all_domains_stats()
+            db_stats_map = {clean_domain_string(d["domain"]): d for d in db_stats}
+
+            client = self.get_client()
+            spreadsheet = client.open_by_key(sheet_id)
+            worksheet = spreadsheet.worksheet("Fuentes")
+            records = worksheet.get_all_records()
+
+            cells_to_update = []
+            updated_count = 0
+
+            for i, row in enumerate(records, start=2):
+                row_dom_raw = str(row.get("Dominio", "")).strip()
+                if not row_dom_raw:
+                    continue
+                dom_clean = clean_domain_string(row_dom_raw)
+
+                # Retrieve stats
+                status = db_statuses_map.get(dom_clean, {})
+                stats_grp = db_stats_map.get(dom_clean, {})
+
+                urls = status.get("urls_count")
+                if urls is None:
+                    urls = stats_grp.get("cnt", 0)
+
+                last_indexed = status.get("last_indexed")
+                if not last_indexed:
+                    last_indexed = stats_grp.get("last_indexed", "")
+
+                errors = status.get("errors_count", 0)
+                last_error = status.get("last_error", "")
+
+                # Format errors string
+                errors_str = ""
+                if last_error:
+                    errors_str = last_error
+                elif errors > 0:
+                    errors_str = f"{errors} errores"
+
+                # We update the row if we have either index date or urls
+                if last_indexed or urls > 0:
+                    # Column H (8): Última indexación
+                    cells_to_update.append(gspread.Cell(row=i, col=8, value=last_indexed))
+                    # Column I (9): URLs indexadas
+                    cells_to_update.append(gspread.Cell(row=i, col=9, value=urls))
+                    # Column J (10): Errores
+                    cells_to_update.append(gspread.Cell(row=i, col=10, value=errors_str))
+
+                    updated_count += 1
+
+                    # Log SOURCE_SHEET_UPDATE_ROW
+                    logger_service.log(
+                        level="INFO",
+                        action="SOURCE_SHEET_UPDATE_ROW",
+                        message=f"Preparada actualización para fila {i} en la pestaña Fuentes para el dominio {row_dom_raw}",
+                        sheet_id=sheet_id,
+                        detail=json.dumps({
+                            "domain": row_dom_raw,
+                            "row": i,
+                            "last_indexed": last_indexed,
+                            "urls_indexed": urls,
+                            "errors_count": errors
+                        })
+                    )
+
+            if cells_to_update:
+                worksheet.update_cells(cells_to_update, value_input_option='USER_ENTERED')
+
+            return {
+                "success": True,
+                "sources_updated": updated_count,
+                "total_urls": total_urls
+            }
+
         except Exception as e:
             import logging
-            logging.getLogger("encuentro-noticias").warning(f"update_source_stats error: {e}")
+            logging.getLogger("encuentro-noticias").warning(f"sync_sources_status error: {e}")
+            raise e
 
     def clear_all_rows(self, sheet_id: str, worksheet_name: str) -> Dict[str, Any]:
         """Clears all rows in a worksheet except the first row (header)."""
