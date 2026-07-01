@@ -1748,25 +1748,31 @@ class SheetsService:
         total_cells_freed = 0
         
         for tab in report["tabs"]:
-            if tab["excess_rows"] > 0 or tab["excess_cols"] > 0:
-                ws_name = tab["title"]
+            ws_name = tab["title"]
+            current_rows = tab["rows"]
+            current_cols = tab["cols"]
+            target_rows = min(current_rows, tab["recommended_rows"])
+            target_cols = min(current_cols, tab["recommended_cols"])
+            
+            # We only compact if the target is smaller than current
+            if target_rows < current_rows or target_cols < current_cols:
                 try:
                     worksheet = spreadsheet.worksheet(ws_name)
-                    new_rows = tab["recommended_rows"]
-                    new_cols = tab["recommended_cols"]
                     
                     if not dry_run:
-                        worksheet.resize(rows=new_rows, cols=new_cols)
+                        worksheet.resize(rows=target_rows, cols=target_cols)
                         
-                    cells_freed = tab["cells"] - (new_rows * new_cols)
+                    cells_before = current_rows * current_cols
+                    cells_after = target_rows * target_cols
+                    cells_freed = max(cells_before - cells_after, 0)
                     total_cells_freed += cells_freed
                     
                     compacted_tabs.append({
                         "title": ws_name,
-                        "old_rows": tab["rows"],
-                        "old_cols": tab["cols"],
-                        "new_rows": new_rows,
-                        "new_cols": new_cols,
+                        "old_rows": current_rows,
+                        "old_cols": current_cols,
+                        "new_rows": target_rows,
+                        "new_cols": target_cols,
                         "cells_freed": cells_freed
                     })
                 except Exception as e:

@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
+from typing import Optional
 from app.schemas import SetupResponse
 from app.services.sheets_service import sheets_service
 from app.config import settings
@@ -83,13 +84,26 @@ def get_sheet_size_report(sheet_id: str = None):
 
 
 @router.post("/setup/compact-sheet")
-def compact_sheet(sheet_id: str = None, dry_run: bool = False):
+async def compact_sheet(request: Request, sheet_id: Optional[str] = None, dry_run: Optional[bool] = None):
     """
     Compacts worksheets by shrinking trailing empty rows/cols to recommended sizes.
+    Accepts sheet_id and dry_run from query parameters or JSON body.
     """
-    s_id = sheet_id or settings.GOOGLE_SHEET_ID
+    body_dry_run = None
+    body_sheet_id = None
     try:
-        return sheets_service.compact_sheet(s_id, dry_run=dry_run)
+        body_data = await request.json()
+        if body_data:
+            body_dry_run = body_data.get("dry_run")
+            body_sheet_id = body_data.get("sheet_id")
+    except Exception:
+        pass
+
+    final_dry_run = dry_run if dry_run is not None else (body_dry_run if body_dry_run is not None else False)
+    final_sheet_id = sheet_id or body_sheet_id or settings.GOOGLE_SHEET_ID
+
+    try:
+        return sheets_service.compact_sheet(final_sheet_id, dry_run=final_dry_run)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

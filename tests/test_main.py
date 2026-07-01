@@ -2172,3 +2172,123 @@ def test_compact_sheet_does_not_delete_real_data():
         
         sheets_service.compact_sheet("sheet123", dry_run=False)
         mock_ws.resize.assert_called_with(rows=200, cols=8)
+
+
+def test_compact_sheet_never_increases_dimensions_and_endpoint_dry_run_body_or_query():
+    from unittest.mock import patch, MagicMock
+    import gspread
+    from app.services.sheets_service import sheets_service
+    from tests.test_main import client
+    
+    # 1. Test sheet_service.compact_sheet never increases dimensions
+    mock_ws = MagicMock()
+    mock_ws.title = "Libros"
+    # Current dimensions of Libros are 500 rows and 5 columns
+    mock_ws.row_count = 500
+    mock_ws.col_count = 5
+    
+    # Values populated: 3 rows
+    mock_ws.get_all_values.return_value = [
+        ["¿Incluir en búsqueda?", "ISBN", "Título del libro", "Autor del libro", "Estado"],
+        [True, "111", "Book 1", "Author 1", "pending"],
+        [True, "222", "Book 2", "Author 2", "pending"]
+    ]
+    
+    mock_spreadsheet = MagicMock()
+    
+    def side_effect_worksheet(name):
+        if name == "Libros":
+            return mock_ws
+        raise gspread.exceptions.WorksheetNotFound("Not found")
+    mock_spreadsheet.worksheet.side_effect = side_effect_worksheet
+    mock_spreadsheet.worksheets.return_value = [mock_ws]
+    
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+        
+        # Test: Libros expected header len is 8, and min_rows_Libros=200
+        # Recommended rows = max(3 + 100, 200) = 200. Since 200 < current_rows (500), it should shrink.
+        # Recommended cols = max(5, 8) = 8. Since 8 > current_cols (5), it should NOT grow.
+        report = sheets_service.get_sheet_size_report("sheet123")
+        tab = report["tabs"][0]
+        assert tab["recommended_rows"] == 200
+        assert tab["recommended_cols"] == 8
+        
+        # Compact real: target_rows = min(500, 200) = 200
+        # target_cols = min(5, 8) = 5
+        res = sheets_service.compact_sheet("sheet123", dry_run=False)
+        assert res["success"] is True
+        
+        # Ensure it resized to 200 rows and 5 columns (did NOT grow columns to 8)
+        mock_ws.resize.assert_called_with(rows=200, cols=5)
+        
+        # Verify cells_freed calculation
+        # cells_before = 500 * 5 = 2500
+        # cells_after = 200 * 5 = 1000
+        # cells_freed = 2500 - 1000 = 1500
+        assert res["total_cells_freed"] == 1500
+
+    # 2. Test Panel with recommended_rows > current_rows conserves current_rows
+    # (i.e. does not grow Panel rows or columns)
+    mock_ws_panel = MagicMock()
+    mock_ws_panel.title = "Panel"
+    mock_ws_panel.row_count = 30
+    mock_ws_panel.col_count = 10
+    
+    mock_ws_panel.get_all_values.return_value = [
+        ["Encuentro Noticias — Panel de control", ""],
+        ["Fecha mínima", "2024-01-01"]
+    ]
+    
+    mock_spreadsheet_panel = MagicMock()
+    def side_effect_worksheet_panel(name):
+        if name == "Panel":
+            return mock_ws_panel
+        raise gspread.exceptions.WorksheetNotFound("Not found")
+    mock_spreadsheet_panel.worksheet.side_effect = side_effect_worksheet_panel
+    mock_spreadsheet_panel.worksheets.return_value = [mock_ws_panel]
+    
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet_panel
+        
+        # Recommended rows for Panel is max(2 + 100, 50) = 102.
+        # recommended_rows (102) > current_rows (30) -> target_rows should be 30.
+        # Recommended cols is max(2, 2) = 2.
+        # recommended_cols (2) < current_cols (10) -> target_cols should be 2.
+        report = sheets_service.get_sheet_size_report("sheet123")
+        tab = report["tabs"][0]
+        assert tab["recommended_rows"] == 102
+        assert tab["recommended_cols"] == 2
+        
+        # Compact
+        res = sheets_service.compact_sheet("sheet123", dry_run=False)
+        assert res["success"] is True
+        
+        # Ensure it resized to 30 rows and 2 columns (retained 30 rows, shrank columns to 2)
+        mock_ws_panel.resize.assert_called_with(rows=30, cols=2)
+        
+        # cells_before = 300, cells_after = 60, freed = 240
+        assert res["total_cells_freed"] == 240
+
+    # 3. Test HTTP endpoint compact-sheet accepting dry_run from Body JSON and Query parameter
+    with patch("app.services.sheets_service.SheetsService.compact_sheet") as mock_compact:
+        mock_compact.return_value = {"success": True, "dry_run": True, "total_cells_freed": 0, "compacted_tabs": []}
+        
+        # A. dry_run=True in body JSON
+        response = client.post("/setup/compact-sheet", json={"dry_run": True, "sheet_id": "sheet_body"})
+        assert response.status_code == 200
+        mock_compact.assert_called_with("sheet_body", dry_run=True)
+        
+        # B. dry_run=True in query parameter
+        mock_compact.reset_mock()
+        response = client.post("/setup/compact-sheet?dry_run=true&sheet_id=sheet_query")
+        assert response.status_code == 200
+        mock_compact.assert_called_with("sheet_query", dry_run=True)
+        
+        # C. Default behaviour (dry_run=False)
+        mock_compact.reset_mock()
+        response = client.post("/setup/compact-sheet")
+        assert response.status_code == 200
+        # By default it uses settings.GOOGLE_SHEET_ID and dry_run=False
+        from app.config import settings
+        mock_compact.assert_called_with(settings.GOOGLE_SHEET_ID, dry_run=False)
