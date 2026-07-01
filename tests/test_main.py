@@ -1908,6 +1908,7 @@ def test_publish_review_preview_and_error_logging():
     mock_response.text = "ACF fields are invalid"
     
     with patch("app.services.logger_service.logger_service.log") as mock_log, \
+         patch("app.config.settings.WORDPRESS_APPLICATION_PASSWORD", "dummy_pass"), \
          patch("httpx.Client.post", return_value=mock_response):
          
          res = wordpress_publisher.publish_review(
