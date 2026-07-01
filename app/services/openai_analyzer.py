@@ -19,7 +19,8 @@ class BookValidationResult(BaseModel):
     publication_date: str = Field(description="Fecha de publicación detectada (en formato YYYY-MM-DD si es posible).")
     language: str = Field(description="Idioma original del artículo.")
     category: str = Field(description="Categoría a la que pertenece el artículo, debe ser exactamente una de: Cultura/Educación, Política, Economía, Historia, Religión, Sociedad, Ciencia, Tecnología, Literatura, Otros.")
-    summary: str = Field(description="Explicación en español de aproximadamente 120 palabras de dónde, cómo y qué se menciona en el artículo sobre el libro buscado, detallando su relevancia.")
+    summary: str = Field(description="Resumen publicable en español de 2 a 5 frases sobre qué se menciona en el artículo acerca del libro. Debe tener tono informativo, neutral y natural, centrado únicamente en la relación con la obra. No debe incluir scores, puntuaciones, porcentajes, justificaciones de la puntuación ni criterios de evaluación ni las palabras 'score' o 'relevancia'.")
+    score_justification: str = Field(description="Explicación detallada interna de por qué se ha asignado esta puntuación de relevancia o coincidencia. Este campo no es el resumen y no se publica en WordPress.")
 
 class OpenAIAnalyzer:
     def __init__(self):
@@ -72,11 +73,12 @@ class OpenAIAnalyzer:
             "4. CUIDADO CON TÍTULOS GENÉRICOS: Para títulos muy genéricos o cortos (ej. 'Símbolos', 'Biblia', 'Diario'), exige alguna señal contextual clara de que se referieren al libro buscado para evitar falsos positivos con otros temas homónimos.\n"
             "5. La categoría ('category') DEBE ser estrictamente una de las siguientes opciones:\n"
             "   - Cultura/Educación, Política, Economía, Historia, Religión, Sociedad, Ciencia, Tecnología, Literatura, Otros.\n"
-            "6. El resumen ('summary') DEBE estar escrito en ESPAÑOL, tener unas 120 palabras y ser una explicación periodística útil que detalle DÓNDE, CÓMO y POR QUÉ se menciona el libro en el artículo, indicando la relación con el libro y justificando detalladamente el score asignado. Evita resúmenes genéricos de todo el artículo.\n"
+            "6. El resumen ('summary') DEBE estar escrito en ESPAÑOL, tener entre 2 y 5 frases, ser de tono neutral e informativo y apto para su publicación en WordPress. Debe centrarse exclusivamente en qué dice el artículo sobre el libro. NO debe mencionar en absoluto scores, puntuaciones, porcentajes, criterios de evaluación ni justificaciones del score.\n"
             "7. EXTRACCIÓN DE METADATOS DE AUTOR Y FECHA (CRÍTICO):\n"
             "   - NO inventes el autor ('publication_author') ni la fecha ('publication_date').\n"
             "   - Si no hay un autor de carne y hueso visible en el texto o en metadata_detected, deja 'publication_author' vacío, o usa 'Redacción' únicamente si ese término exacto aparece explícitamente en el texto.\n"
-            "   - Si 'metadata_detected' trae una fecha de publicación ('published_date') fiable, respétala a menos que haya una contradicción evidente en el texto del artículo.\n\n"
+            "   - Si 'metadata_detected' trae una fecha de publicación ('published_date') fiable, respétala a menos que haya una contradicción evidente en el texto del artículo.\n"
+            "8. La justificación del score ('score_justification') debe explicar internamente de forma detallada por qué se ha asignado esta puntuación de relevancia o coincidencia. Este campo es puramente interno y NO se publica en WordPress.\n\n"
             "GUÍA DE PUNTUACIÓN ('match_score') APLICAR LA ESCALA COMPLETA:\n"
             "- 90-100: Reseña/Artículo centrado claramente en el libro.\n"
             "- 70-89: Artículo claramente relevante sobre el libro, aunque no sea una reseña pura.\n"
@@ -123,7 +125,7 @@ class OpenAIAnalyzer:
             
             result_obj = completion.choices[0].message.parsed
             if result_obj:
-                return result_obj.model_dump()
+                raw_result = result_obj.model_dump()
             else:
                 raise ValueError("Parsing returned empty result")
 
@@ -143,7 +145,8 @@ class OpenAIAnalyzer:
                     "publication_date": "2023-01-01",
                     "language": "es",
                     "category": "Literatura",
-                    "summary": "Resumen periodístico en español de unas 120 palabras..."
+                    "summary": "Resumen periodístico en español de 2 a 5 frases...",
+                    "score_justification": "Explicación de la puntuación..."
                 }, indent=2)
 
                 response = client.chat.completions.create(
@@ -160,7 +163,7 @@ class OpenAIAnalyzer:
                 data = json.loads(content)
                 
                 # Manual validation and schema mapping to ensure all keys exist
-                return {
+                raw_result = {
                     "is_valid": bool(data.get("is_valid", False)),
                     "match_score": int(data.get("match_score", 0)),
                     "reason": str(data.get("reason", "")),
@@ -172,10 +175,48 @@ class OpenAIAnalyzer:
                     "publication_date": str(data.get("publication_date", detected_date or "")),
                     "language": str(data.get("language", "")),
                     "category": str(data.get("category", "Otros")),
-                    "summary": str(data.get("summary", ""))
+                    "summary": str(data.get("summary", "")),
+                    "score_justification": str(data.get("score_justification", ""))
                 }
             except Exception as e_fallback:
                 logger.error(f"OpenAI fallback query also failed: {e_fallback}")
                 raise RuntimeError(f"error OpenAI: {str(e_fallback)}")
+
+        # Defensive summary cleaning/validation logic
+        summary_val = raw_result.get("summary", "")
+        summary_lower = summary_val.lower()
+        forbidden_words = ["score", "puntuación", "puntuacion", "porcentaje", "relevancia", "tratamiento parcial", "justifica", "criterio"]
+        has_forbidden = any(w in summary_lower for w in forbidden_words)
+
+        if has_forbidden:
+            logger.warning(f"Summary contains forbidden evaluation words: {summary_val}")
+            from app.services.logger_service import logger_service
+            logger_service.log(
+                level="WARNING",
+                action="OPENAI_SUMMARY_FORBIDDEN_WORDS",
+                message="El resumen generado por la IA contiene palabras de puntuación o score y será limpiado.",
+                isbn=isbn,
+                detail=json.dumps({
+                    "original_summary": summary_val,
+                    "forbidden_words_detected": [w for w in forbidden_words if w in summary_lower]
+                }, ensure_ascii=False)
+            )
+            # Split summary by sentences and filter out any sentence containing forbidden words
+            import re
+            sentences = re.split(r'(?<=[.!?])\s+', summary_val)
+            clean_sentences = []
+            for s in sentences:
+                s_lower = s.lower()
+                if not any(w in s_lower for w in forbidden_words):
+                    clean_sentences.append(s)
+            
+            cleaned_summary = " ".join(clean_sentences).strip()
+            # Fallback if too short
+            if not cleaned_summary or len(cleaned_summary.split()) < 5:
+                cleaned_summary = f"El artículo menciona la obra '{book_title}' de {book_author} en el contexto de su análisis y legado."
+            
+            raw_result["summary"] = cleaned_summary
+
+        return raw_result
 
 openai_analyzer = OpenAIAnalyzer()

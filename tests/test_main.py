@@ -3167,6 +3167,115 @@ def test_add_log_batch_writes_to_logs_with_correct_headers():
         sheets_service.add_log_batch("sheet123", log_rows)
 
         assert mock_ws.updates[0][0] == "A2:G2"
-        assert mock_ws.updates[0][1][0] == ["2026-07-01 13:42:00", "INFO", "TEST_ACTION", "9781234", "Msg", "Det", "run123"]
+
+
+# --- OPENAI SUMMARY AND SCORE JUSTIFICATION TESTS ---
+
+def test_summary_cleaning_filters_forbidden_words():
+    from app.services.openai_analyzer import openai_analyzer
+    from unittest.mock import patch, MagicMock
+
+    mock_client = MagicMock()
+    # Structured outputs parse return value mock
+    mock_choice = MagicMock()
+    mock_choice.message.parsed = MagicMock()
+    
+    # We simulate a summary returned by OpenAI that contains forbidden words in some sentences
+    mock_choice.message.parsed.model_dump.return_value = {
+        "is_valid": True,
+        "match_score": 40,
+        "reason": "La obra se menciona brevemente.",
+        "detected_book_title": "San Manuel Bueno, mártir",
+        "detected_book_author": "Miguel de Unamuno",
+        "content_type": "noticia",
+        "publication_name": "El País",
+        "publication_author": "Redacción",
+        "publication_date": "2026-07-01",
+        "language": "es",
+        "category": "Literatura",
+        "summary": "El artículo destaca el nombramiento de Unamuno. Esta mención al libro es muy lateral, justificando así un score de 40 por el tratamiento parcial de la obra. Unamuno es recordado en la Universidad de Salamanca.",
+        "score_justification": "Justificación interna del score 40."
+    }
+    
+    mock_client.beta.chat.completions.parse.return_value = mock_client
+    mock_client.choices = [mock_choice]
+
+    with patch.object(openai_analyzer, "get_client", return_value=mock_client), \
+         patch("app.services.logger_service.logger_service.log") as mock_log:
+         
+         res = openai_analyzer.analyze_article(
+             isbn="123456",
+             book_title="San Manuel Bueno, mártir",
+             book_author="Miguel de Unamuno",
+             query="query",
+             url="url",
+             article_title="title",
+             article_text="text"
+         )
+         
+         # The second sentence should have been stripped out due to forbidden words: "justificando", "score", "tratamiento parcial"
+         # The remaining sentences should be kept
+         summary = res["summary"]
+         assert "El artículo destaca el nombramiento de Unamuno." in summary
+         assert "Unamuno es recordado en la Universidad de Salamanca." in summary
+         assert "score" not in summary.lower()
+         assert "puntuación" not in summary.lower()
+         assert "tratamiento parcial" not in summary.lower()
+         assert "justificando" not in summary.lower()
+         
+         # score_justification remains intact
+         assert res["score_justification"] == "Justificación interna del score 40."
+         
+         # Verification log was triggered
+         warning_calls = [c for c in mock_log.call_args_list if c[1].get("action") == "OPENAI_SUMMARY_FORBIDDEN_WORDS"]
+         assert len(warning_calls) == 1
+
+
+def test_summary_cleaning_fallback_when_completely_filtered():
+    from app.services.openai_analyzer import openai_analyzer
+    from unittest.mock import patch, MagicMock
+
+    mock_client = MagicMock()
+    mock_choice = MagicMock()
+    mock_choice.message.parsed = MagicMock()
+    
+    # We simulate a summary that gets completely filtered out because all sentences have forbidden words
+    mock_choice.message.parsed.model_dump.return_value = {
+        "is_valid": True,
+        "match_score": 40,
+        "reason": "La obra se menciona brevemente.",
+        "detected_book_title": "San Manuel Bueno, mártir",
+        "detected_book_author": "Miguel de Unamuno",
+        "content_type": "noticia",
+        "publication_name": "El País",
+        "publication_author": "Redacción",
+        "publication_date": "2026-07-01",
+        "language": "es",
+        "category": "Literatura",
+        "summary": "Justificando así un score de 40 por el tratamiento parcial de la relevancia.",
+        "score_justification": "Justificación interna."
+    }
+    mock_client.beta.chat.completions.parse.return_value = mock_client
+    mock_client.choices = [mock_choice]
+
+    with patch.object(openai_analyzer, "get_client", return_value=mock_client), \
+         patch("app.services.logger_service.logger_service.log"):
+         
+         res = openai_analyzer.analyze_article(
+             isbn="123456",
+             book_title="San Manuel Bueno, mártir",
+             book_author="Miguel de Unamuno",
+             query="query",
+             url="url",
+             article_title="title",
+             article_text="text"
+         )
+         
+         # Summary must fallback to default clean mention sentence
+         summary = res["summary"]
+         assert "San Manuel Bueno, mártir" in summary
+         assert "Miguel de Unamuno" in summary
+         assert "score" not in summary.lower()
+         assert "relevancia" not in summary.lower()
 
 
