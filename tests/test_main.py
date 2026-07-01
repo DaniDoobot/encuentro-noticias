@@ -1832,8 +1832,8 @@ def test_build_post_payload_mapping():
     assert payload["content"] == "Un resumen de prueba muy completo y descriptivo."
     
     acf_payload = wordpress_publisher.build_acf_payload(review)
-    # 3. El campo Libro se deja vacío por ahora
-    assert acf_payload["libro"] == ""
+    # 3. El campo Libro no se envía para evitar errores de validación en WordPress
+    assert "libro" not in acf_payload
     # 4. El campo ISBN Libro se rellena con ISBN
     assert acf_payload["isbn_libro"] == "978-1234567890"
     # 5. El campo Url se rellena con URL
@@ -2930,7 +2930,7 @@ def test_wordpress_build_acf_payload():
         "Título del libro": "Don Quijote"
     }
     payload = wordpress_publisher.build_acf_payload(review_with_url)
-    assert payload["libro"] == ""
+    assert "libro" not in payload
     assert payload["isbn_libro"] == "9781234567890"
     assert payload["tipo_de_resena"] == "0"
     assert payload["url"] == "https://ejemplo.com/resena-de-prueba"
@@ -2979,6 +2979,7 @@ def test_wordpress_publish_review_two_step_acf_success():
     def mock_post_side_effect(url, **kwargs):
         if "/wp-json/wp/v2/posts/12345" in url:
             assert "json" in kwargs
+            assert "libro" not in kwargs["json"]["acf"]
             assert kwargs["json"]["acf"]["isbn_libro"] == "9781234567890"
             assert kwargs["json"]["acf"]["tipo_de_resena"] == "0"
             return mock_acf_res

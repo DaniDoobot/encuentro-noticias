@@ -197,7 +197,6 @@ class WordPressPublisher:
         """
         url = str(review.get("URL") or "").strip()
         return {
-            "libro": "",
             "isbn_libro": str(review.get("ISBN") or "").strip(),
             "tipo_de_resena": "0" if url else "3",
             "url": url,
