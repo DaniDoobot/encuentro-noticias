@@ -2622,8 +2622,9 @@ def test_ensure_sheet_creates_simplified_headers_and_migrates_existing():
         # 1. Assert Config técnica was deleted
         assert any(call[0][0].title == "Config técnica" for call in mock_spreadsheet.del_worksheet.call_args_list)
         
-        # 2. Assert Config now contains MAX_SEARCH_PAGES_PER_QUERY but NOT WORDPRESS_POST_STATUS or ADMIN_TOKEN
+        # 2. Assert Config now contains BACKEND_BASE_URL and MAX_SEARCH_PAGES_PER_QUERY but NOT WORDPRESS_POST_STATUS or ADMIN_TOKEN
         config_keys = [r[0] for r in mock_config.values]
+        assert "BACKEND_BASE_URL" in config_keys
         assert "MAX_BOOKS_PER_RUN" in config_keys
         assert "MAX_SEARCH_PAGES_PER_QUERY" in config_keys
         assert "WORDPRESS_POST_STATUS" not in config_keys
@@ -2640,6 +2641,96 @@ def test_ensure_sheet_creates_simplified_headers_and_migrates_existing():
         assert "RSS URL" not in mock_fuentes.values[0]
         assert "Buscador interno" not in mock_fuentes.values[0]
         assert mock_fuentes.values[0] == ["Dominio", "Activo", "Tipo", "Notas", "Última indexación", "URLs indexadas", "Errores"]
+
+
+def test_backend_base_url_in_config_defaults():
+    """BACKEND_BASE_URL debe aparecer en Config y migrarse desde Config técnica si existía."""
+    from app.services.sheets_service import sheets_service
+    from unittest.mock import patch, MagicMock
+
+    class SimpleFakeWS:
+        def __init__(self, name, values):
+            self.title = name
+            self.values = values
+            self.id = 999
+            self.col_count = len(values[0]) if values else 26
+            self.row_count = max(len(values), 1000)
+        def row_values(self, idx):
+            return self.values[0] if self.values else []
+        def get_all_values(self):
+            return self.values
+        def get_all_records(self):
+            if not self.values:
+                return []
+            headers = self.values[0]
+            return [{headers[i]: row[i] for i in range(len(headers)) if i < len(row)} for row in self.values[1:]]
+        def insert_row(self, row, index):
+            self.values.insert(index - 1, row)
+        def append_row(self, row, value_input_option=None):
+            self.values.append(row)
+        def clear(self):
+            self.values = []
+        def resize(self, rows=None, cols=None):
+            pass
+        def update(self, range_name, values=None, **kwargs):
+            if range_name == "A1" and values:
+                self.values = values
+        def update_cell(self, row, col, val):
+            pass
+
+    # Config técnica contains an existing BACKEND_BASE_URL the user set previously
+    mock_config = SimpleFakeWS("Config", [
+        ["Clave", "Valor", "Descripción"],
+        ["MAX_BOOKS_PER_RUN", "5", "Desc"]
+    ])
+    mock_tech = SimpleFakeWS("Config técnica", [
+        ["Clave", "Valor", "Descripción"],
+        ["BACKEND_BASE_URL", "https://mi-backend-personalizado.ejemplo.com", "URL personalizada"],
+        ["WORDPRESS_POST_STATUS", "publish", "Debe excluirse"],
+        ["ADMIN_TOKEN", "secreto", "Debe excluirse"],
+    ])
+
+    worksheets = {
+        "Libros": SimpleFakeWS("Libros", [["¿Incluir en búsqueda?", "ISBN", "Título del libro", "Autor del libro", "Estado", "Última ejecución", "Reseñas encontradas", "Observaciones"]]),
+        "Reseñas por publicar": SimpleFakeWS("Reseñas por publicar", [["¿Publicar?", "Estado publicación", "Fecha intento publicación", "Error publicación", "ISBN", "Título del libro", "Autor del libro", "URL", "Título para Web", "Autor para Web", "Medio de publicación", "Fecha de publicación", "Idioma original", "Categoría", "Resumen", "Score de coincidencia", "Tipo de contenido", "Fecha de extracción", "Hash deduplicación", "Query"]]),
+        "Reseñas publicadas": SimpleFakeWS("Reseñas publicadas", []),
+        "Descartes": SimpleFakeWS("Descartes", []),
+        "Fuentes": SimpleFakeWS("Fuentes", [["Dominio", "Activo", "Tipo", "Notas", "Última indexación", "URLs indexadas", "Errores"]]),
+        "Logs": SimpleFakeWS("Logs", [["Fecha", "Nivel", "Acción", "ISBN", "Mensaje", "Detalle", "Run ID"]]),
+        "Config": mock_config,
+        "Config técnica": mock_tech,
+        "Panel": SimpleFakeWS("Panel", [["Encuentro Noticias — Panel de control", ""]]),
+    }
+
+    def get_ws(name):
+        import gspread
+        if name in worksheets:
+            return worksheets[name]
+        raise gspread.exceptions.WorksheetNotFound(name)
+
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client, \
+         patch("app.services.logger_service.logger_service.log"):
+        mock_spreadsheet = MagicMock()
+        mock_spreadsheet.worksheets.return_value = list(worksheets.values())
+        mock_spreadsheet.worksheet.side_effect = get_ws
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+
+        sheets_service.ensure_sheet("some_sheet_id")
+
+        config_keys = [r[0] for r in mock_config.values]
+
+        # BACKEND_BASE_URL debe estar en Config y haberse migrado desde Config técnica
+        assert "BACKEND_BASE_URL" in config_keys, "BACKEND_BASE_URL debe existir en Config"
+
+        # El valor migrado de Config técnica debe prevalecer sobre el default
+        backend_row = next((r for r in mock_config.values if r[0] == "BACKEND_BASE_URL"), None)
+        assert backend_row is not None
+        assert backend_row[1] == "https://mi-backend-personalizado.ejemplo.com", \
+            "El valor de BACKEND_BASE_URL de Config técnica debe migrarse, no sobreescribirse con el default"
+
+        # Claves restringidas nunca deben aparecer en Config
+        assert "WORDPRESS_POST_STATUS" not in config_keys, "WORDPRESS_POST_STATUS no debe estar en Config"
+        assert "ADMIN_TOKEN" not in config_keys, "ADMIN_TOKEN no debe estar en Config"
 
 
 # --- CLEANUP AND WORDPRESS_POST_STATUS PRECEDENCE TESTS ---

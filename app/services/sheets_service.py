@@ -460,7 +460,8 @@ class SheetsService:
             "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", "MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH",
             "MIN_CANDIDATES_BEFORE_AI", "ENABLE_CASCADE_SEARCH",
             "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH",
-            "LOG_RETENTION_DAYS", "DESCARTES_RETENTION_DAYS"
+            "LOG_RETENTION_DAYS", "DESCARTES_RETENTION_DAYS",
+            "BACKEND_BASE_URL"
         }
         
         # Migrate allowed technical keys to existing_basic
@@ -477,6 +478,7 @@ class SheetsService:
             del existing_basic["WORDPRESS_POST_STATUS"]
 
         basic_defaults = [
+            {"Clave": "BACKEND_BASE_URL", "Valor": "https://encuentro-backend.doobot.ai", "Descripción": "URL base del backend usada por el menú de Google Sheets para lanzar procesos"},
             {"Clave": "MAX_BOOKS_PER_RUN", "Valor": settings.MAX_BOOKS_PER_RUN, "Descripción": "Cantidad máxima de libros a procesar por ejecución"},
             {"Clave": "MAX_CANDIDATES_PER_BOOK", "Valor": settings.MAX_CANDIDATES_PER_BOOK, "Descripción": "Cantidad máxima de URLs candidatas a evaluar por libro"},
             {"Clave": "MIN_MATCH_SCORE", "Valor": 1, "Descripción": "Score mínimo de validación de OpenAI para aceptar una reseña (0-100)"},
