@@ -18,7 +18,7 @@ logger = logging.getLogger("encuentro-noticias")
 def is_row_real(row: dict) -> bool:
     # Check if any of the target fields has non-empty text
     target_fields = [
-        "URL", "URL normalizada", "Título del artículo", "Título del libro", 
+        "URL", "Título del artículo", "Título del libro", 
         "Autor del libro", "ISBN", "Resumen", "Hash deduplicación", 
         "Título para Web", "Autor para Web", "Título del libro detectado por IA", 
         "Autor del libro detectado por IA", "WordPress ID", "WordPress URL", 
@@ -28,6 +28,50 @@ def is_row_real(row: dict) -> bool:
         if str(row.get(field, "")).strip():
             return True
     return False
+
+def clean_sheet_value(value: Any) -> Any:
+    if isinstance(value, str):
+        if value.startswith("'"):
+            return value[1:]
+    elif value is None:
+        return ""
+    return value
+
+def clean_row_values(row: List[Any]) -> List[Any]:
+    return [clean_sheet_value(val) for val in row]
+
+DEFAULT_DOMAIN_CONFIGS = {
+    "revistadelibros.com": {
+        "sitemap_url": "https://www.revistadelibros.com/sitemap.xml",
+        "rss_url": "https://www.revistadelibros.com/feed/",
+        "buscador_interno": "https://www.revistadelibros.com/?s={query}"
+    },
+    "nueva-revista.net": {
+        "sitemap_url": "https://www.nueva-revista.net/sitemap.xml",
+        "rss_url": "https://www.nueva-revista.net/feed/",
+        "buscador_interno": "https://www.nueva-revista.net/?s={query}"
+    },
+    "aceprensa.com": {
+        "sitemap_url": "",
+        "rss_url": "https://www.aceprensa.com/feed/",
+        "buscador_interno": ""
+    },
+    "zendalibros.com": {
+        "sitemap_url": "https://www.zendalibros.com/sitemap.xml",
+        "rss_url": "https://www.zendalibros.com/feed/",
+        "buscador_interno": "https://www.zendalibros.com/?s={query}"
+    },
+    "religionenlibertad.com": {
+        "sitemap_url": "",
+        "rss_url": "https://www.religionenlibertad.com/rss/",
+        "buscador_interno": "https://www.religionenlibertad.com/buscar/{query}"
+    },
+    "aciprensa.com": {
+        "sitemap_url": "",
+        "rss_url": "https://www.aciprensa.com/rss/",
+        "buscador_interno": "https://www.aciprensa.com/buscar/{query}"
+    }
+}
 
 def col_num_to_letter(n: int) -> str:
     string = ""
@@ -141,30 +185,26 @@ class SheetsService:
                 "Autor del libro", "URL", "Título para Web", "Autor para Web",
                 "Medio de publicación", "Fecha de publicación",
                 "Idioma original", "Categoría", "Resumen", "Score de coincidencia",
-                "Tipo de contenido", "Fecha de extracción", "Estado", "URL normalizada", "Hash deduplicación", "Query"
+                "Tipo de contenido", "Fecha de extracción", "Hash deduplicación", "Query"
             ],
             "Reseñas publicadas": [
                 "Fecha publicación", "WordPress ID", "WordPress URL", "ISBN", "Título del libro",
                 "Autor del libro", "URL", "Título para Web", "Autor para Web",
                 "Medio de publicación", "Fecha de publicación",
                 "Idioma original", "Categoría", "Resumen", "Score de coincidencia",
-                "Tipo de contenido", "Fecha de extracción", "Estado", "URL normalizada", "Hash deduplicación", "Query"
+                "Tipo de contenido", "Fecha de extracción", "Hash deduplicación", "Query"
             ],
             "Descartes": [
                 "ISBN", "Título del libro", "Autor del libro", "Query", "URL", 
                 "Título detectado", "Motivo de descarte", "Score de coincidencia", "Fecha de extracción"
             ],
             "Fuentes": [
-                "Dominio", "Activo", "Tipo", "Sitemap URL", "RSS URL",
-                "Buscador interno", "Notas", "Última indexación", "URLs indexadas", "Errores"
+                "Dominio", "Activo", "Tipo", "Notas", "Última indexación", "URLs indexadas", "Errores"
             ],
             "Logs": [
                 "Fecha", "Nivel", "Acción", "ISBN", "Mensaje", "Detalle", "Run ID"
             ],
             "Config": [
-                "Clave", "Valor", "Descripción"
-            ],
-            "Config técnica": [
                 "Clave", "Valor", "Descripción"
             ]
         }
@@ -177,42 +217,11 @@ class SheetsService:
             else:
                 worksheet = spreadsheet.add_worksheet(title=tab_name, rows="1000", cols=str(len(headers) + 5))
                 created_tabs.append(tab_name)
-                worksheet.insert_row(headers, index=1)
+                worksheet.insert_row(clean_row_values(headers), index=1)
                 continue
 
             # Ensure headers are correct and run safe migrator if order/columns mismatch
-            if tab_name == "Libros":
-                try:
-                    existing_headers = worksheet.row_values(1)
-                    if existing_headers and "¿Incluir en búsqueda?" not in existing_headers:
-                        logger.info("Migrating 'Libros' to add '¿Incluir en búsqueda?' checkbox column...")
-                        all_rows = worksheet.get_all_values()
-                        data_rows = all_rows[1:] if len(all_rows) > 1 else []
-                        
-                        new_rows = []
-                        for row in data_rows:
-                            row_dict = {}
-                            for i, val in enumerate(row):
-                                if i < len(existing_headers):
-                                    row_dict[existing_headers[i]] = val
-                            
-                            new_row = []
-                            for h in headers:
-                                if h == "¿Incluir en búsqueda?":
-                                    title_val = row_dict.get("Título del libro", "").strip()
-                                    new_row.append(True if title_val else "")
-                                else:
-                                    new_row.append(row_dict.get(h, ""))
-                            new_rows.append(new_row)
-                            
-                        worksheet.clear()
-                        worksheet.resize(rows=max(1000, len(new_rows) + 50), cols=len(headers) + 5)
-                        worksheet.update("A1", [headers] + new_rows)
-                        logger.info("Worksheet 'Libros' successfully migrated.")
-                except Exception as e_libros:
-                    logger.error(f"Could not migrate 'Libros': {e_libros}")
-
-            elif tab_name in ("Reseñas por publicar", "Reseñas publicadas"):
+            if tab_name in ("Libros", "Reseñas por publicar", "Reseñas publicadas", "Descartes", "Fuentes"):
                 try:
                     existing_headers = worksheet.row_values(1)
                     if existing_headers and existing_headers != headers:
@@ -226,45 +235,36 @@ class SheetsService:
                             for i, val in enumerate(row):
                                 if i < len(existing_headers):
                                     row_dict[existing_headers[i]] = val
-                            if not is_row_real(row_dict):
+                                    
+                            if tab_name in ("Reseñas por publicar", "Reseñas publicadas") and not is_row_real(row_dict):
                                 continue
-                                
-                            # Safe copies
-                            title_web_val = row_dict.get("Título para Web", "")
-                            if not title_web_val or str(title_web_val).strip().lower() in ("titulo web", "título web"):
-                                title_web_val = row_dict.get("Título del artículo") or row_dict.get("Título del libro detectado por IA") or ""
-                            
-                            author_web_val = row_dict.get("Autor para Web", "")
-                            if not author_web_val or str(author_web_val).strip().lower() in ("autor web", "autor web "):
-                                author_web_val = row_dict.get("Autor de la publicación") or row_dict.get("Autor del libro detectado por IA") or ""
                                 
                             new_row = []
                             for h in headers:
-                                if h == "Título para Web":
-                                    raw_val = title_web_val
-                                elif h == "Autor para Web":
-                                    raw_val = author_web_val
+                                if h == "¿Incluir en búsqueda?" and tab_name == "Libros":
+                                    title_val = row_dict.get("Título del libro", "").strip()
+                                    new_row.append(True if title_val else "")
+                                elif h == "Título para Web" and tab_name in ("Reseñas por publicar", "Reseñas publicadas"):
+                                    title_web_val = row_dict.get("Título para Web", "")
+                                    if not title_web_val or str(title_web_val).strip().lower() in ("titulo web", "título web"):
+                                        title_web_val = row_dict.get("Título del artículo") or row_dict.get("Título del libro detectado por IA") or ""
+                                    new_row.append(title_web_val)
+                                elif h == "Autor para Web" and tab_name in ("Reseñas por publicar", "Reseñas publicadas"):
+                                    author_web_val = row_dict.get("Autor para Web", "")
+                                    if not author_web_val or str(author_web_val).strip().lower() in ("autor web", "autor web "):
+                                        author_web_val = row_dict.get("Autor de la publicación") or row_dict.get("Autor del libro detectado por IA") or ""
+                                    new_row.append(author_web_val)
+                                elif h == "¿Publicar?" and tab_name == "Reseñas por publicar":
+                                    new_row.append(row_dict.get("¿Publicar?", False))
                                 else:
-                                    raw_val = row_dict.get(h)
-                                    
-                                if raw_val is not None:
-                                    if isinstance(raw_val, str):
-                                        s = raw_val.strip()
-                                        if s.lower() in ("titulo web", "título web", "autor web", "autor web "):
-                                            raw_val = ""
-                                        else:
-                                            raw_val = s
-                                    new_row.append(raw_val)
-                                elif h == "¿Publicar?":
-                                    new_row.append(False)
-                                else:
-                                    new_row.append("")
+                                    new_row.append(row_dict.get(h, ""))
                             new_rows.append(new_row)
                             
                         # Overwrite sheet with new schema and reordered values
                         worksheet.clear()
                         worksheet.resize(rows=max(1000, len(new_rows) + 50), cols=len(headers) + 5)
-                        worksheet.update("A1", [headers] + new_rows)
+                        cleaned_rows = [clean_row_values(r) for r in new_rows]
+                        worksheet.update("A1", [headers] + cleaned_rows)
                         logger.info(f"Worksheet '{tab_name}' successfully migrated with {len(new_rows)} rows.")
                 except Exception as e_hdr:
                     logger.error(f"Could not migrate headers/rows for {tab_name}: {e_hdr}")
@@ -299,10 +299,9 @@ class SheetsService:
                 ["", ""],
                 ["Fecha mínima", "2024-01-01"],
                 ["Fecha máxima", "2026-12-31"],
-                ["Máximo de libros", "5"],
-                ["Modo prueba", True],
-                ["Incluir artículos sin fecha", True],
-                ["Estado última búsqueda", "no iniciado"],
+                ["¿Publicar directamente?", "No"],
+                ["", ""],
+                ["Último run_id", ""],
                 ["Última búsqueda_id", ""],
                 ["Última ejecución", ""],
                 ["Mensaje", ""],
@@ -312,7 +311,8 @@ class SheetsService:
                 ["Use 'Consultar estado' para refrescar el estado de la última búsqueda.", ""]
             ]
             panel_ws.clear()
-            panel_ws.update(range_name="A1", values=panel_structure)
+            cleaned_panel_structure = [clean_row_values(row) for row in panel_structure]
+            panel_ws.update(range_name="A1", values=cleaned_panel_structure)
             
         # Apply date, number validations and boolean checkboxes always
         # Resolve these worksheets before the try block so they are always in scope
@@ -362,25 +362,7 @@ class SheetsService:
                         "fields": "userEnteredFormat.numberFormat"
                     }
                 },
-                # Checkbox validation for B6:B7
-                {
-                    "setDataValidation": {
-                        "range": {
-                            "sheetId": panel_ws.id,
-                            "startRowIndex": 5,
-                            "endRowIndex": 7,
-                            "startColumnIndex": 1,
-                            "endColumnIndex": 2
-                        },
-                        "rule": {
-                            "condition": {
-                                "type": "BOOLEAN"
-                            },
-                            "showCustomUi": True
-                        }
-                    }
-                },
-                # Positive integer validation for B5 (allows invalid/empty)
+                # Boolean checkbox for B5 (¿Publicar directamente?)
                 {
                     "setDataValidation": {
                         "range": {
@@ -392,8 +374,7 @@ class SheetsService:
                         },
                         "rule": {
                             "condition": {
-                                "type": "NUMBER_GREATER",
-                                "values": [{"userEnteredValue": "0"}]
+                                "type": "BOOLEAN"
                             },
                             "showCustomUi": True
                         }
@@ -464,106 +445,87 @@ class SheetsService:
         config_ws = spreadsheet.worksheet("Config")
         config_rows = config_ws.get_all_records()
         existing_basic = {row["Clave"]: row for row in config_rows if "Clave" in row}
-
-        tech_ws = spreadsheet.worksheet("Config técnica")
-        tech_rows = tech_ws.get_all_records()
-        existing_tech = {row["Clave"]: row for row in tech_rows if "Clave" in row}
         
+        # Read old technical configurations if they exist for migration
+        tech_records = []
+        try:
+            tech_ws = spreadsheet.worksheet("Config técnica")
+            tech_records = tech_ws.get_all_records()
+        except gspread.exceptions.WorksheetNotFound:
+            pass
+            
+        allowed_migration_keys = {
+            "MAX_SEARCH_PAGES_PER_QUERY", "REVIEW_DOMAINS", "SEARCH_DELAY_SECONDS",
+            "SEARCH_BACKOFF_SECONDS", "MAX_QUERIES_PER_BOOK", "GOOGLE_NEWS_BROAD_MAX_QUERIES",
+            "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", "MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH",
+            "MIN_CANDIDATES_BEFORE_AI", "ENABLE_CASCADE_SEARCH",
+            "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH",
+            "LOG_RETENTION_DAYS", "DESCARTES_RETENTION_DAYS"
+        }
+        
+        # Migrate allowed technical keys to existing_basic
+        for r in tech_records:
+            k = r.get("Clave")
+            v = r.get("Valor")
+            d = r.get("Descripción", "")
+            if k and k in allowed_migration_keys:
+                if k not in existing_basic:
+                    existing_basic[k] = {"Clave": k, "Valor": v, "Descripción": d}
+
+        # Remove WORDPRESS_POST_STATUS from config if present
+        if "WORDPRESS_POST_STATUS" in existing_basic:
+            del existing_basic["WORDPRESS_POST_STATUS"]
+
         basic_defaults = [
             {"Clave": "MAX_BOOKS_PER_RUN", "Valor": settings.MAX_BOOKS_PER_RUN, "Descripción": "Cantidad máxima de libros a procesar por ejecución"},
             {"Clave": "MAX_CANDIDATES_PER_BOOK", "Valor": settings.MAX_CANDIDATES_PER_BOOK, "Descripción": "Cantidad máxima de URLs candidatas a evaluar por libro"},
             {"Clave": "MIN_MATCH_SCORE", "Valor": 1, "Descripción": "Score mínimo de validación de OpenAI para aceptar una reseña (0-100)"},
             {"Clave": "OPENAI_MODEL", "Valor": settings.OPENAI_MODEL, "Descripción": "Modelo de OpenAI a usar para análisis"},
-            {"Clave": "WORDPRESS_POST_STATUS", "Valor": settings.WORDPRESS_POST_STATUS, "Descripción": "Estado por defecto para posts creados (draft, publish)"},
             {"Clave": "LOG_MAX_ROWS", "Valor": settings.LOG_MAX_ROWS, "Descripción": "Cantidad máxima de filas a mantener en la pestaña Logs"},
-            {"Clave": "DESCARTES_MAX_ROWS", "Valor": getattr(settings, "DESCARTES_MAX_ROWS", 1000), "Descripción": "Cantidad máxima de descartes a mantener en la pestaña Descartes"}
-        ]
-
-        technical_defaults = [
+            {"Clave": "DESCARTES_MAX_ROWS", "Valor": getattr(settings, "DESCARTES_MAX_ROWS", 1000), "Descripción": "Cantidad máxima de descartes a mantener en la pestaña Descartes"},
             {"Clave": "MAX_SEARCH_PAGES_PER_QUERY", "Valor": settings.MAX_SEARCH_PAGES_PER_QUERY, "Descripción": "Páginas máximas del buscador a escanear por query"},
             {"Clave": "REVIEW_DOMAINS", "Valor": "revistadelibros.com,nueva-revista.net,aceprensa.com,elcultural.com,zendalibros.com,babelia.elpais.com", "Descripción": "Dominios culturales/literarios recomendados para búsquedas específicas (separados por coma)"},
             {"Clave": "SEARCH_DELAY_SECONDS", "Valor": settings.SEARCH_DELAY_SECONDS, "Descripción": "Espera en segundos entre cada búsqueda para evitar bloqueos"},
             {"Clave": "SEARCH_BACKOFF_SECONDS", "Valor": settings.SEARCH_BACKOFF_SECONDS, "Descripción": "Espera de enfriamiento en segundos si se detecta rate limit o error"},
-            {"Clave": "MAX_QUERIES_PER_BOOK", "Valor": settings.MAX_QUERIES_PER_BOOK, "Descripción": "Límite máximo de búsquedas por libro"},
-            {"Clave": "ENABLE_GOOGLE_NEWS_RSS", "Valor": settings.ENABLE_GOOGLE_NEWS_RSS, "Descripción": "Activar búsqueda complementaria mediante Google News RSS (true/false)"},
-            {"Clave": "SEARCH_PROVIDER_MODE", "Valor": settings.SEARCH_PROVIDER_MODE, "Descripción": "Modo de proveedor de búsqueda: auto, free_only, google_news_only, serpapi, dataforseo"},
-            {"Clave": "ENABLE_SERPAPI", "Valor": settings.ENABLE_SERPAPI, "Descripción": "Activar proveedor SerpAPI (true/false)"},
-            {"Clave": "SERPAPI_API_KEY", "Valor": settings.SERPAPI_API_KEY or "", "Descripción": "API Key de SerpAPI"},
-            {"Clave": "ENABLE_DATAFORSEO", "Valor": settings.ENABLE_DATAFORSEO, "Descripción": "Activar proveedor DataForSEO (true/false)"},
-            {"Clave": "DATAFORSEO_LOGIN", "Valor": settings.DATAFORSEO_LOGIN or "", "Descripción": "Login (username/email) de DataForSEO"},
-            {"Clave": "DATAFORSEO_PASSWORD", "Valor": settings.DATAFORSEO_PASSWORD or "", "Descripción": "Password de DataForSEO"},
-            {"Clave": "ENABLE_DOMAIN_INDEX", "Valor": settings.ENABLE_DOMAIN_INDEX, "Descripción": "Activar indexación de dominios culturales (true/false)"},
-            {"Clave": "DOMAIN_INDEX_MAX_URLS_PER_DOMAIN", "Valor": settings.DOMAIN_INDEX_MAX_URLS_PER_DOMAIN, "Descripción": "Máximo de URLs a indexar por dominio"},
-            {"Clave": "DOMAIN_INDEX_REFRESH_DAYS", "Valor": settings.DOMAIN_INDEX_REFRESH_DAYS, "Descripción": "Días entre reindexaciones de un mismo dominio"},
-            {"Clave": "DOMAIN_INDEX_MIN_SCORE", "Valor": settings.DOMAIN_INDEX_MIN_SCORE, "Descripción": "Score mínimo para considerar un URL candidato (0-100)"},
-            {"Clave": "DOMAIN_INDEX_DB_PATH", "Valor": settings.DOMAIN_INDEX_DB_PATH, "Descripción": "Ruta al fichero SQLite del índice local"},
-            {"Clave": "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", "Valor": settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES, "Descripción": "Queries máximas de GoogleNewsRss como complemento en modo domain_index_plus_news"},
-            {"Clave": "BLOCK_PROVIDER_FOR_FULL_RUN", "Valor": settings.BLOCK_PROVIDER_FOR_FULL_RUN, "Descripción": "Bloquear proveedores permanentemente durante todo el run (true/false)"},
-            {"Clave": "ENRICH_INDEXED_URLS", "Valor": settings.ENRICH_INDEXED_URLS, "Descripción": "Activar descarga de páginas para enriquecer metadatos (true/false)"},
-            {"Clave": "DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN", "Valor": settings.DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN, "Descripción": "Cantidad máxima de URLs a enriquecer por dominio"},
-            {"Clave": "DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS", "Valor": settings.DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS, "Descripción": "Timeout en segundos para la descarga de páginas"},
-            {"Clave": "DISCOVER_INTERNAL_ARTICLE_LINKS", "Valor": settings.DISCOVER_INTERNAL_ARTICLE_LINKS, "Descripción": "Descubrir enlaces a artículos dentro de páginas índice (true/false)"},
-            {"Clave": "DOMAIN_INDEX_INTERNAL_LINK_DEPTH", "Valor": settings.DOMAIN_INDEX_INTERNAL_LINK_DEPTH, "Descripción": "Profundidad de rastreo de enlaces internos"},
-            {"Clave": "DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE", "Valor": settings.DOMAIN_INDEX_MAX_INTERNAL_LINKS_PER_PAGE, "Descripción": "Cantidad máxima de enlaces internos a descubrir por página índice"},
-            {"Clave": "ENABLE_INTERNAL_DOMAIN_SEARCH", "Valor": settings.ENABLE_INTERNAL_DOMAIN_SEARCH, "Descripción": "Activar búsqueda interna en dominios de fuentes culturales (true/false)"},
-            {"Clave": "INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK", "Valor": settings.INTERNAL_SEARCH_MAX_QUERIES_PER_BOOK, "Descripción": "Cantidad máxima de consultas de búsqueda interna por libro"},
-            {"Clave": "INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN", "Valor": settings.INTERNAL_SEARCH_MAX_RESULTS_PER_DOMAIN, "Descripción": "Resultados máximos a extraer por dominio en búsqueda interna"},
-            {"Clave": "INTERNAL_SEARCH_TIMEOUT_SECONDS", "Valor": settings.INTERNAL_SEARCH_TIMEOUT_SECONDS, "Descripción": "Timeout en segundos para la búsqueda interna"},
-            {"Clave": "INTERNAL_SEARCH_DOMAINS_LIMIT", "Valor": settings.INTERNAL_SEARCH_DOMAINS_LIMIT, "Descripción": "Límite máximo de dominios a consultar en búsqueda interna"},
-            {"Clave": "DEFAULT_INCLUDE_UNKNOWN_DATES", "Valor": settings.DEFAULT_INCLUDE_UNKNOWN_DATES, "Descripción": "Incluir artículos sin fecha de publicación detectada por defecto (true/false)"},
-            {"Clave": "DEFAULT_DATE_MIN", "Valor": settings.DEFAULT_DATE_MIN or "", "Descripción": "Fecha de publicación mínima por defecto (YYYY-MM-DD)"},
-            {"Clave": "DEFAULT_DATE_MAX", "Valor": settings.DEFAULT_DATE_MAX or "", "Descripción": "Fecha de publicación máxima por defecto (YYYY-MM-DD)"},
+            {"Clave": "MAX_QUERIES_PER_BOOK", "Valor": getattr(settings, "MAX_QUERIES_PER_BOOK", 12), "Descripción": "Límite máximo de queries de búsqueda permitidas por libro"},
+            {"Clave": "GOOGLE_NEWS_BROAD_MAX_QUERIES", "Valor": 10, "Descripción": "Límite de queries para la búsqueda amplia en Google News si la normal da 0 candidatos"},
+            {"Clave": "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", "Valor": 10, "Descripción": "Límite de queries adicionales a realizar en dominios activos"},
             {"Clave": "MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH", "Valor": getattr(settings, "MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH", 5), "Descripción": "Mínimo de candidatos requeridos antes de activar la búsqueda interna profunda"},
             {"Clave": "MIN_CANDIDATES_BEFORE_AI", "Valor": getattr(settings, "MIN_CANDIDATES_BEFORE_AI", 1), "Descripción": "Mínimo de candidatos requeridos para ejecutar el análisis IA de OpenAI"},
             {"Clave": "ENABLE_CASCADE_SEARCH", "Valor": getattr(settings, "ENABLE_CASCADE_SEARCH", True), "Descripción": "Activar búsqueda en cascada (Domain Index -> RSS -> Búsqueda Interna)"},
             {"Clave": "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", "Valor": getattr(settings, "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", True), "Descripción": "Activar búsqueda interna si el total de candidatos es bajo"},
             {"Clave": "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", "Valor": getattr(settings, "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", True), "Descripción": "Ejecutar siempre búsqueda interna en dominios activos (true=siempre, false=solo si pocos candidatos)"},
-            {"Clave": "BACKEND_BASE_URL", "Valor": "http://127.0.0.1:8000", "Descripción": "URL base del backend para Apps Script"},
-            {"Clave": "ADMIN_TOKEN", "Valor": settings.ADMIN_TOKEN or "secret_admin_token", "Descripción": "Token de administración secreto para Apps Script (cabecera X-Admin-Token)"},
-            {"Clave": "WORDPRESS_BASE_URL", "Valor": settings.WORDPRESS_BASE_URL or "", "Descripción": "URL base de WordPress (ej. https://miweb.com)"},
-            {"Clave": "WORDPRESS_USERNAME", "Valor": settings.WORDPRESS_USERNAME or "", "Descripción": "Usuario administrador/editor de WordPress"},
-            {"Clave": "WORDPRESS_POST_TYPE", "Valor": settings.WORDPRESS_POST_TYPE, "Descripción": "Tipo de post en WordPress (posts, pages)"},
-            {"Clave": "WORDPRESS_DEFAULT_CATEGORY_ID", "Valor": settings.WORDPRESS_DEFAULT_CATEGORY_ID or "", "Descripción": "ID de categoría de WordPress por defecto (opcional)"},
             {"Clave": "LOG_RETENTION_DAYS", "Valor": settings.LOG_RETENTION_DAYS, "Descripción": "Días de retención de logs en la pestaña Logs"},
             {"Clave": "DESCARTES_RETENTION_DAYS", "Valor": getattr(settings, "DESCARTES_RETENTION_DAYS", 30), "Descripción": "Días de retención de descartes en la pestaña Descartes"}
         ]
 
-        # 1. Move technical keys currently in Config to Config técnica
-        basic_keys_set = {b["Clave"] for b in basic_defaults}
-        for row in config_rows:
-            k = row.get("Clave")
-            v = row.get("Valor")
-            d = row.get("Descripción", "")
-            if k and k not in basic_keys_set:
-                if k not in existing_tech:
-                    tech_ws.append_row([k, v, d], value_input_option="USER_ENTERED")
-                    existing_tech[k] = {"Clave": k, "Valor": v, "Descripción": d}
-
-        # 2. Re-write Config keeping only basic keys
+        # Re-write Config keeping only allowed basic keys
         config_ws.clear()
         config_ws.append_row(["Clave", "Valor", "Descripción"])
         for b in basic_defaults:
             k = b["Clave"]
             val = existing_basic[k]["Valor"] if k in existing_basic else b["Valor"]
             desc = existing_basic[k]["Descripción"] if k in existing_basic else b["Descripción"]
-            config_ws.append_row([k, val, desc], value_input_option="USER_ENTERED")
+            config_ws.append_row(clean_row_values([k, val, desc]), value_input_option="USER_ENTERED")
 
-        # 3. Ensure all technical defaults exist in Config técnica
-        for t in technical_defaults:
-            k = t["Clave"]
-            if k not in existing_tech:
-                tech_ws.append_row([t["Clave"], t["Valor"], t["Descripción"]], value_input_option="USER_ENTERED")
+        # Physically delete the Config técnica worksheet if it was present
+        try:
+            tech_ws = spreadsheet.worksheet("Config técnica")
+            spreadsheet.del_worksheet(tech_ws)
+            logger.info("Deleted old Config técnica sheet.")
+        except gspread.exceptions.WorksheetNotFound:
+            pass
 
-        # Check and update existing technical limits if they are too low
+        # Check and update existing technical limits in Config if they are too low
         try:
             from app.services.logger_service import logger_service
-            tech_all = tech_ws.get_all_values()
-            if tech_all:
-                tech_headers = tech_all[0]
-                if "Clave" in tech_headers and "Valor" in tech_headers:
-                    col_clave = tech_headers.index("Clave") + 1
-                    col_valor = tech_headers.index("Valor") + 1
-                    for r_idx, row in enumerate(tech_all[1:], start=2):
+            config_all = config_ws.get_all_values()
+            if config_all:
+                config_headers = config_all[0]
+                if "Clave" in config_headers and "Valor" in config_headers:
+                    col_clave = config_headers.index("Clave") + 1
+                    col_valor = config_headers.index("Valor") + 1
+                    for r_idx, row in enumerate(config_all[1:], start=2):
                         if col_clave - 1 < len(row) and col_valor - 1 < len(row):
                             clave = row[col_clave - 1]
                             valor_str = row[col_valor - 1]
@@ -573,17 +535,17 @@ class SheetsService:
                                 continue
                             clave_clean = str(clave).strip()
                             if clave_clean == "MAX_QUERIES_PER_BOOK" and valor_int < 12:
-                                tech_ws.update_cell(r_idx, col_valor, 12)
-                                logger.info(f"Updated MAX_QUERIES_PER_BOOK from {valor_int} to 12 in Config técnica")
+                                config_ws.update_cell(r_idx, col_valor, 12)
+                                logger.info(f"Updated MAX_QUERIES_PER_BOOK from {valor_int} to 12 in Config")
                                 logger_service.log("WARNING", "CONFIG_LOW_QUERY_LIMIT_WARNING", f"Advertencia: MAX_QUERIES_PER_BOOK tiene un límite bajo de {valor_int}", sheet_id=sheet_id)
                                 logger_service.log("INFO", "CONFIG_QUERY_LIMITS_AUTO_UPDATED", f"Límites de consulta actualizados automáticamente: MAX_QUERIES_PER_BOOK: {valor_int} -> 12", sheet_id=sheet_id)
                             if clave_clean == "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES" and valor_int < 10:
-                                tech_ws.update_cell(r_idx, col_valor, 10)
-                                logger.info(f"Updated DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES from {valor_int} to 10 in Config técnica")
+                                config_ws.update_cell(r_idx, col_valor, 10)
+                                logger.info(f"Updated DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES from {valor_int} to 10 in Config")
                                 logger_service.log("WARNING", "CONFIG_LOW_QUERY_LIMIT_WARNING", f"Advertencia: DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES tiene un límite bajo de {valor_int}", sheet_id=sheet_id)
                                 logger_service.log("INFO", "CONFIG_QUERY_LIMITS_AUTO_UPDATED", f"Límites de consulta actualizados automáticamente: DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES: {valor_int} -> 10", sheet_id=sheet_id)
         except Exception as e_upd:
-            logger.warning(f"Error checking/updating low query limits in Config técnica: {e_upd}")
+            logger.warning(f"Error checking/updating low query limits in Config: {e_upd}")
 
         # Initialise Fuentes tab with default domains append-only
         try:
@@ -609,27 +571,14 @@ class SheetsService:
 
     def get_config_dict(self, sheet_id: str) -> Dict[str, Any]:
         """
-        Reads configurations from Config técnica first, then Config (user override), falls back to env settings.
+        Reads configurations from Config sheet, falls back to env settings.
         """
         client = self.get_client()
         try:
             spreadsheet = client.open_by_key(sheet_id)
             
-            # 1. Read technical configs
-            tech_dict = {}
-            try:
-                tech_ws = spreadsheet.worksheet("Config técnica")
-                tech_records = tech_ws.get_all_records()
-                for r in tech_records:
-                    key = r.get("Clave")
-                    val = r.get("Valor")
-                    if key and val is not None:
-                        tech_dict[str(key).strip()] = val
-            except Exception as e_tech:
-                logger.warning(f"Could not read Config técnica tab: {e_tech}")
-
-            # 2. Read basic config (takes priority on duplicates)
-            user_dict = {}
+            # Read config keys from Config sheet
+            config_dict = {}
             try:
                 config_ws = spreadsheet.worksheet("Config")
                 config_records = config_ws.get_all_records()
@@ -637,13 +586,11 @@ class SheetsService:
                     key = r.get("Clave")
                     val = r.get("Valor")
                     if key and val is not None:
-                        user_dict[str(key).strip()] = val
+                        config_dict[str(key).strip()] = val
             except Exception as e_user:
                 logger.warning(f"Could not read Config tab: {e_user}")
 
-            # Combine them: user_dict overwrites tech_dict
-            config_dict = {**tech_dict, **user_dict}
-            logger.info(f"CONFIG_LOADED: merged {len(config_dict)} total keys (User keys: {len(user_dict)}, Tech keys: {len(tech_dict)})")
+            logger.info(f"CONFIG_LOADED: read {len(config_dict)} keys from Config")
 
             return {
                 "MAX_BOOKS_PER_RUN": parse_int(config_dict.get("MAX_BOOKS_PER_RUN"), settings.MAX_BOOKS_PER_RUN),
@@ -665,10 +612,10 @@ class SheetsService:
                 "BLOCK_PROVIDER_FOR_FULL_RUN": parse_bool(config_dict.get("BLOCK_PROVIDER_FOR_FULL_RUN"), settings.BLOCK_PROVIDER_FOR_FULL_RUN),
                 "ENABLE_DOMAIN_INDEX": parse_bool(config_dict.get("ENABLE_DOMAIN_INDEX"), settings.ENABLE_DOMAIN_INDEX),
                 "DOMAIN_INDEX_MAX_URLS_PER_DOMAIN": parse_int(config_dict.get("DOMAIN_INDEX_MAX_URLS_PER_DOMAIN"), settings.DOMAIN_INDEX_MAX_URLS_PER_DOMAIN),
-                "DOMAIN_INDEX_REFRESH_DAYS": parse_int(config_dict.get("DOMAIN_INDEX_REFRESH_DAYS"), settings.DOMAIN_INDEX_REFRESH_DAYS),
                 "DOMAIN_INDEX_MIN_SCORE": parse_int(config_dict.get("DOMAIN_INDEX_MIN_SCORE"), settings.DOMAIN_INDEX_MIN_SCORE),
                 "DOMAIN_INDEX_DB_PATH": parse_str(config_dict.get("DOMAIN_INDEX_DB_PATH"), settings.DOMAIN_INDEX_DB_PATH),
                 "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES": parse_int(config_dict.get("DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES"), settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES),
+                "GOOGLE_NEWS_BROAD_MAX_QUERIES": parse_int(config_dict.get("GOOGLE_NEWS_BROAD_MAX_QUERIES"), 10),
                 "ENRICH_INDEXED_URLS": parse_bool(config_dict.get("ENRICH_INDEXED_URLS"), settings.ENRICH_INDEXED_URLS),
                 "DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN": parse_int(config_dict.get("DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN"), settings.DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN),
                 "DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS": parse_int(config_dict.get("DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS"), settings.DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS),
@@ -719,6 +666,7 @@ class SheetsService:
                 "DOMAIN_INDEX_MIN_SCORE": settings.DOMAIN_INDEX_MIN_SCORE,
                 "DOMAIN_INDEX_DB_PATH": settings.DOMAIN_INDEX_DB_PATH,
                 "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES": settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES,
+                "GOOGLE_NEWS_BROAD_MAX_QUERIES": 10,
                 "ENRICH_INDEXED_URLS": settings.ENRICH_INDEXED_URLS,
                 "DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN": settings.DOMAIN_INDEX_ENRICH_MAX_PER_DOMAIN,
                 "DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS": settings.DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS,
@@ -941,6 +889,7 @@ class SheetsService:
                     val = ""
             full_row.append(clean_val(val))
             
+        full_row = clean_row_values(full_row)
         records = worksheet.get_all_records()
         overwrite_row_index = None
         for idx, row in enumerate(records):
@@ -961,7 +910,7 @@ class SheetsService:
         client = self.get_client()
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.worksheet("Descartes")
-        worksheet.append_row(descarte_data)
+        worksheet.append_row(clean_row_values(descarte_data))
 
     def add_log(self, sheet_id: str, log_data: List[Any]):
         """
@@ -989,7 +938,8 @@ class SheetsService:
             start_row = next_row
             end_row = next_row + len(log_rows) - 1
             write_range = f"A{start_row}:G{end_row}"
-            worksheet.update(write_range, log_rows)
+            cleaned_log_rows = [clean_row_values(r) for r in log_rows]
+            worksheet.update(write_range, cleaned_log_rows)
 
         try:
             perform_write()
@@ -1075,13 +1025,18 @@ class SheetsService:
             active_val = str(row.get("Activo", "true")).strip().lower()
             if active_val not in ("true", "1", "yes", "sí", "si"):
                 continue
+            hardcoded = DEFAULT_DOMAIN_CONFIGS.get(domain, {})
+            sitemap_url = str(row.get("Sitemap URL", "")).strip() or hardcoded.get("sitemap_url", "")
+            rss_url = str(row.get("RSS URL", "")).strip() or hardcoded.get("rss_url", "")
+            buscador_interno = str(row.get("Buscador interno", "")).strip() or hardcoded.get("buscador_interno", "")
+
             sources.append({
                 "domain": domain,
                 "active": True,
                 "tipo": str(row.get("Tipo", "cultural")).strip(),
-                "sitemap_url": str(row.get("Sitemap URL", "")).strip(),
-                "rss_url": str(row.get("RSS URL", "")).strip(),
-                "buscador_interno": str(row.get("Buscador interno", "")).strip(),
+                "sitemap_url": sitemap_url,
+                "rss_url": rss_url,
+                "buscador_interno": buscador_interno,
                 "row_index": i,
             })
         return sources
@@ -1130,7 +1085,7 @@ class SheetsService:
             for i, row in enumerate(records, start=2):
                 row_dom_raw = str(row.get("Dominio", "")).strip()
                 if clean_domain_string(row_dom_raw) == clean_domain_string(domain):
-                    worksheet.update(f"H{i}:J{i}", [[last_indexed, urls_indexed, errors_str]])
+                    worksheet.update(f"E{i}:G{i}", [clean_row_values([last_indexed, urls_indexed, errors_str])])
                     updated = True
 
                     # Log SOURCE_SHEET_UPDATE_ROW
@@ -1234,12 +1189,12 @@ class SheetsService:
 
                 # We update the row if we have either index date or urls
                 if last_indexed or urls > 0:
-                    # Column H (8): Última indexación
-                    cells_to_update.append(gspread.Cell(row=i, col=8, value=last_indexed))
-                    # Column I (9): URLs indexadas
-                    cells_to_update.append(gspread.Cell(row=i, col=9, value=urls))
-                    # Column J (10): Errores
-                    cells_to_update.append(gspread.Cell(row=i, col=10, value=errors_str))
+                    # Column E (5): Última indexación
+                    cells_to_update.append(gspread.Cell(row=i, col=5, value=clean_sheet_value(last_indexed)))
+                    # Column F (6): URLs indexadas
+                    cells_to_update.append(gspread.Cell(row=i, col=6, value=clean_sheet_value(urls)))
+                    # Column G (7): Errores
+                    cells_to_update.append(gspread.Cell(row=i, col=7, value=clean_sheet_value(errors_str)))
 
                     updated_count += 1
 
@@ -1526,7 +1481,7 @@ class SheetsService:
                     return ""
                 return s
             return val
-        rows_data = [[clean_val(item) for item in row] for row in rows_data]
+        rows_data = [clean_row_values([clean_val(item) for item in row]) for row in rows_data]
         
         # Read existing records to find empty/false row indices
         records = worksheet.get_all_records()
@@ -1651,30 +1606,26 @@ class SheetsService:
                 "Autor del libro", "URL", "Título para Web", "Autor para Web",
                 "Medio de publicación", "Fecha de publicación",
                 "Idioma original", "Categoría", "Resumen", "Score de coincidencia",
-                "Tipo de contenido", "Fecha de extracción", "Estado", "URL normalizada", "Hash deduplicación", "Query"
+                "Tipo de contenido", "Fecha de extracción", "Hash deduplicación", "Query"
             ],
             "Reseñas publicadas": [
                 "Fecha publicación", "WordPress ID", "WordPress URL", "ISBN", "Título del libro",
                 "Autor del libro", "URL", "Título para Web", "Autor para Web",
                 "Medio de publicación", "Fecha de publicación",
                 "Idioma original", "Categoría", "Resumen", "Score de coincidencia",
-                "Tipo de contenido", "Fecha de extracción", "Estado", "URL normalizada", "Hash deduplicación", "Query"
+                "Tipo de contenido", "Fecha de extracción", "Hash deduplicación", "Query"
             ],
             "Descartes": [
                 "ISBN", "Título del libro", "Autor del libro", "Query", "URL", 
                 "Título detectado", "Motivo de descarte", "Score de coincidencia", "Fecha de extracción"
             ],
             "Fuentes": [
-                "Dominio", "Activo", "Tipo", "Sitemap URL", "RSS URL",
-                "Buscador interno", "Notas", "Última indexación", "URLs indexadas", "Errores"
+                "Dominio", "Activo", "Tipo", "Notas", "Última indexación", "URLs indexadas", "Errores"
             ],
             "Logs": [
                 "Fecha", "Nivel", "Acción", "ISBN", "Mensaje", "Detalle", "Run ID"
             ],
             "Config": [
-                "Clave", "Valor", "Descripción"
-            ],
-            "Config técnica": [
                 "Clave", "Valor", "Descripción"
             ],
             "Panel": [
@@ -1873,7 +1824,9 @@ class SheetsService:
         # Clear and overwrite
         worksheet.clear()
         worksheet.resize(rows=max(1000, len(new_data_rows) + 100), cols=7)
-        worksheet.update("A1", [new_headers] + new_data_rows)
+        cleaned_headers = clean_row_values(new_headers)
+        cleaned_data_rows = [clean_row_values(r) for r in new_data_rows]
+        worksheet.update("A1", [cleaned_headers] + cleaned_data_rows)
 
     def append_default_sources(self, sheet_id: str) -> int:
         """
@@ -1938,7 +1891,7 @@ class SheetsService:
         for dom_raw, active, tipo, sitemap, rss, buscador, notas in recommended:
             cleaned = clean_domain_string(dom_raw)
             if cleaned and cleaned not in existing_domains:
-                row = [cleaned, active, tipo, sitemap, rss, buscador, notas, "", "", ""]
+                row = clean_row_values([cleaned, active, tipo, notas, "", "", ""])
                 to_append.append(row)
                 existing_domains.add(cleaned)
                 

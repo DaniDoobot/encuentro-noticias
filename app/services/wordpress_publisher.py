@@ -191,7 +191,7 @@ class WordPressPublisher:
             "warnings": warnings
         }
 
-    def build_post_payload(self, review: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+    def build_post_payload(self, review: Dict[str, Any], config: Dict[str, Any], status: str = "draft") -> Dict[str, Any]:
         """
         Builds the REST API payload for a WordPress post from the review data.
         """
@@ -222,8 +222,6 @@ class WordPressPublisher:
             "medio": medium,
             "autor": author_web
         }
-
-        status = config.get("WORDPRESS_POST_STATUS") or settings.WORDPRESS_POST_STATUS or "draft"
 
         payload = {
             "title": post_title,
@@ -264,7 +262,41 @@ class WordPressPublisher:
         app_password = settings.WORDPRESS_APPLICATION_PASSWORD
         post_type = config.get("WORDPRESS_POST_TYPE") or settings.WORDPRESS_POST_TYPE or "posts"
 
-        payload = self.build_post_payload(review, config)
+        # Determine status and its source
+        env_status = settings.WORDPRESS_POST_STATUS
+        config_status = config.get("WORDPRESS_POST_STATUS")
+        
+        effective_status = "draft"
+        source = "default"
+        
+        if env_status:
+            effective_status = str(env_status).strip().lower()
+            source = "env"
+        elif config_status:
+            effective_status = str(config_status).strip().lower()
+            source = "config"
+            
+        if effective_status not in ("draft", "publish"):
+            effective_status = "draft"
+            source = "default"
+            
+        import json
+        logger_service.log(
+            level="INFO",
+            action="WORDPRESS_PUBLISH_STATUS_INFO",
+            message=f"Resolución de estado para publicación: {effective_status} (Origen: {source})",
+            isbn=isbn,
+            sheet_id=sheet_id,
+            run_id=run_id,
+            detail=json.dumps({
+                "env_value": env_status,
+                "config_value": config_status,
+                "effective_status": effective_status,
+                "source": source
+            }, ensure_ascii=False)
+        )
+
+        payload = self.build_post_payload(review, config, status=effective_status)
 
         # Log payload preview
         preview_data = {

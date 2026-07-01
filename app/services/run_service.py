@@ -1620,8 +1620,6 @@ class RunService:
                         "Score de coincidencia": score,
                         "Tipo de contenido": analysis.get("content_type", ""),
                         "Fecha de extracción": get_now_madrid_str(),
-                        "Estado": "pendiente",
-                        "URL normalizada": norm_url,
                         "Hash deduplicación": prim_hash,
                         "Query": origin_query
                     }

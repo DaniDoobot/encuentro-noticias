@@ -20,7 +20,7 @@ logger = logging.getLogger("encuentro-noticias")
 def is_row_real(row: dict) -> bool:
     # Check if any of the target fields has non-empty text
     target_fields = [
-        "URL", "URL normalizada", "Título del artículo", 
+        "URL", "Título del artículo", 
         "Título del libro", "Autor del libro", "ISBN", 
         "Resumen", "Hash deduplicación", 
         "Título para Web", "Autor para Web",
