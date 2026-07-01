@@ -1679,7 +1679,7 @@ def test_sync_status_endpoint():
     }
     
     with patch("app.services.sheets_service.sheets_service.sync_sources_status", return_value=mock_sync_result):
-        response = client.post("/sources/sync-status", headers={"X-Admin-Token": settings.ADMIN_TOKEN})
+        response = client.post("/sources/sync-status", headers={"X-Admin-Token": settings.ADMIN_TOKEN or "dummy_token"})
         
     assert response.status_code == 200
     assert response.json() == mock_sync_result
@@ -1788,7 +1788,7 @@ def test_sync_status_endpoint_initialization():
         mock_spreadsheet.worksheet.return_value = fake_ws
         mock_client.return_value.open_by_key.return_value = mock_spreadsheet
         
-        response = client.post("/sources/sync-status", headers={"X-Admin-Token": settings.ADMIN_TOKEN})
+        response = client.post("/sources/sync-status", headers={"X-Admin-Token": settings.ADMIN_TOKEN or "dummy_token"})
         
         assert response.status_code == 200
         assert "CacheService not initialised" not in response.text
