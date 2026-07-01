@@ -279,6 +279,12 @@ class SheetsService:
                     logger.warning(f"Could not verify headers for {tab_name}: {e_hdr}")
 
 
+        # Ensure Logs worksheet structure is correct/migrated
+        try:
+            self.ensure_logs_sheet_structure(sheet_id)
+        except Exception as e_logs_struct:
+            logger.error(f"Error ensuring Logs structure during ensure_sheet: {e_logs_struct}")
+
         # Ensure Panel worksheet exists and has the correct layout
         if "Panel" in existing_sheets:
             panel_ws = existing_sheets["Panel"]
@@ -963,16 +969,18 @@ class SheetsService:
         """
         self.add_log_batch(sheet_id, [log_data])
 
-    def add_log_batch(self, sheet_id: str, log_rows: List[List[Any]]):
+    def add_log_batch(self, sheet_id: str, log_rows: List[List[Any]]) -> Dict[str, Any]:
         """
         Appends multiple rows to Logs in a single API call (reduces quota usage).
         Calculates the next row using column A, and writes to a fixed range A:G.
-        Includes safety handling for 10M cell limit error: executes compaction and retries once.
         """
         if not log_rows:
-            return
-            
+            return {"success": True, "range": "", "rows_written": 0}
+
+        write_range = ""
         def perform_write():
+            nonlocal write_range
+            self.ensure_logs_sheet_structure(sheet_id)
             client = self.get_client()
             spreadsheet = client.open_by_key(sheet_id)
             worksheet = spreadsheet.worksheet("Logs")
@@ -985,23 +993,40 @@ class SheetsService:
 
         try:
             perform_write()
+            return {
+                "success": True,
+                "range": write_range,
+                "rows_written": len(log_rows)
+            }
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            import logging
+            logging.getLogger("encuentro-noticias").error(
+                f"Fallo al escribir logs en Google Sheets: {e}\n{tb}"
+            )
             err_msg = str(e)
-            # Check for cell limit error patterns
             if "10000000" in err_msg or "above the limit" in err_msg or "cell" in err_msg.lower():
-                import logging
-                logging.getLogger("encuentro-noticias").error(
-                    f"Fallo al escribir logs en Google Sheets debido al límite de celdas: {err_msg}. Intentando compactar..."
-                )
                 try:
                     # Execute compaction
                     self.compact_sheet(sheet_id)
                     # Retry once
                     perform_write()
+                    return {
+                        "success": True,
+                        "range": write_range,
+                        "rows_written": len(log_rows)
+                    }
                 except Exception as retry_err:
                     logging.getLogger("encuentro-noticias").error(
-                        f"Error crítico: Reintento de escritura de logs falló: {retry_err}. Continuando sin escribir en Sheets."
+                        f"Error crítico: Reintento de escritura de logs falló: {retry_err}\n{traceback.format_exc()}"
                     )
+                    return {
+                        "success": False,
+                        "error": str(retry_err),
+                        "range": "",
+                        "rows_written": 0
+                    }
             else:
                 # Raise other exceptions (e.g. connection errors, worksheet not found)
                 raise e
@@ -1760,6 +1785,11 @@ class SheetsService:
                     worksheet = spreadsheet.worksheet(ws_name)
                     
                     if not dry_run:
+                        if ws_name == "Logs":
+                            try:
+                                self.ensure_logs_sheet_structure(sheet_id)
+                            except Exception as e_logs_struct:
+                                logger.error(f"Error ensuring Logs structure during compact: {e_logs_struct}")
                         worksheet.resize(rows=target_rows, cols=target_cols)
                         
                     cells_before = current_rows * current_cols
@@ -1785,6 +1815,65 @@ class SheetsService:
             "compacted_tabs": compacted_tabs,
             "report_before": report
         }
+
+    def ensure_logs_sheet_structure(self, sheet_id: str):
+        """
+        Ensures the Logs worksheet has the correct header order and columns count (exactly 7).
+        If old structure exists with data, migrates old rows:
+          old: [Run ID, Fecha, Nivel, ISBN, Acción, Mensaje, Detalle]
+          new: [Fecha, Nivel, Acción, ISBN, Mensaje, Detalle, Run ID]
+        """
+        client = self.get_client()
+        spreadsheet = client.open_by_key(sheet_id)
+        
+        new_headers = ["Fecha", "Nivel", "Acción", "ISBN", "Mensaje", "Detalle", "Run ID"]
+        
+        try:
+            worksheet = spreadsheet.worksheet("Logs")
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title="Logs", rows="1000", cols="7")
+            worksheet.update("A1", [new_headers])
+            return
+
+        # Read all rows
+        all_rows = worksheet.get_all_values()
+        if not all_rows:
+            worksheet.resize(rows=1000, cols=7)
+            worksheet.update("A1", [new_headers])
+            return
+            
+        current_headers = all_rows[0]
+        data_rows = all_rows[1:] if len(all_rows) > 1 else []
+        
+        # If headers are already correct, just ensure columns count is 7
+        if current_headers == new_headers:
+            if worksheet.col_count != 7:
+                worksheet.resize(rows=max(1000, len(all_rows) + 50), cols=7)
+            return
+            
+        # Map values to dictionary if possible
+        new_data_rows = []
+        for row in data_rows:
+            row_dict = {}
+            for idx, header in enumerate(current_headers):
+                if idx < len(row):
+                    row_dict[header] = row[idx]
+            
+            # Map old columns to new
+            run_id = row_dict.get("Run ID", row[0] if len(row) > 0 else "")
+            fecha = row_dict.get("Fecha", row[1] if len(row) > 1 else "")
+            nivel = row_dict.get("Nivel", row[2] if len(row) > 2 else "")
+            isbn = row_dict.get("ISBN", row[3] if len(row) > 3 else "")
+            accion = row_dict.get("Acción", row[4] if len(row) > 4 else "")
+            mensaje = row_dict.get("Mensaje", row[5] if len(row) > 5 else "")
+            detalle = row_dict.get("Detalle", row[6] if len(row) > 6 else "")
+            
+            new_data_rows.append([fecha, nivel, accion, isbn, mensaje, detalle, run_id])
+            
+        # Clear and overwrite
+        worksheet.clear()
+        worksheet.resize(rows=max(1000, len(new_data_rows) + 100), cols=7)
+        worksheet.update("A1", [new_headers] + new_data_rows)
 
     def append_default_sources(self, sheet_id: str) -> int:
         """

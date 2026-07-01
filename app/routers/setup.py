@@ -109,3 +109,29 @@ async def compact_sheet(request: Request, sheet_id: Optional[str] = None, dry_ru
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to compact sheet: {str(e)}"
         )
+
+
+@router.post("/setup/test-log")
+def test_log(sheet_id: str = None):
+    """
+    Test endpoint that writes a single log entry into the Logs sheet.
+    """
+    s_id = sheet_id or settings.GOOGLE_SHEET_ID
+    from app.services.sheets_service import get_now_madrid_str
+    now = get_now_madrid_str()
+    log_row = [now, "INFO", "LOG_WRITE_TEST", "", "Prueba de escritura de logs", "{}", "manual-test"]
+    res = sheets_service.add_log_batch(s_id, [log_row])
+    
+    # Parse next_row from range (e.g., "A2:G2" -> next_row = 2)
+    next_row = 2
+    if res.get("range"):
+        import re
+        m = re.search(r'\d+', res["range"])
+        if m:
+            next_row = int(m.group(0))
+            
+    return {
+        "success": res.get("success", False),
+        "range": res.get("range", ""),
+        "next_row": next_row
+    }

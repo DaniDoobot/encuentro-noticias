@@ -56,10 +56,11 @@ class LoggerService:
             self.logger.info(log_text)
 
         # Batch for Sheets
-        if sheet_id and run_id:
+        if sheet_id:
             timestamp = get_now_madrid_str()
-            log_row = [timestamp, level_upper, action, isbn, message, detail, run_id]
-            batch_key = f"{sheet_id}:{run_id}"
+            actual_run_id = run_id or ""
+            log_row = [timestamp, level_upper, action, isbn, message, detail, actual_run_id]
+            batch_key = sheet_id
             with self._batch_lock:
                 if self._batch_key != batch_key:
                     # Flush previous batch if context switched
@@ -71,8 +72,8 @@ class LoggerService:
                     self._flush_locked(batch_key)
 
     def flush_log_batch(self, sheet_id: str, run_id: str = ""):
-        """Flush any remaining buffered log rows for this sheet/run to Google Sheets."""
-        batch_key = f"{sheet_id}:{run_id}"
+        """Flush any remaining buffered log rows for this sheet to Google Sheets."""
+        batch_key = sheet_id
         with self._batch_lock:
             self._flush_locked(batch_key)
 
@@ -83,9 +84,7 @@ class LoggerService:
         rows = list(self._batch)
         self._batch = []
         try:
-            # Parse sheet_id from key
-            sheet_id = batch_key.split(":", 1)[0]
-            sheets_service.add_log_batch(sheet_id, rows)
+            sheets_service.add_log_batch(batch_key, rows)
         except Exception as e:
             self.logger.error(f"Failed to batch-write log rows to Google Sheets: {e}")
 

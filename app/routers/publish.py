@@ -1,4 +1,6 @@
 import datetime
+import json
+import traceback
 from typing import Dict, Any, List, Optional, Set
 import logging
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -300,7 +302,19 @@ def execute_publication_background(publish_id: str, sheet_id: str, dry_run: bool
         current_publications[publish_id]["errors_count"] = res.errors_count
         current_publications[publish_id]["details"] = res.model_dump()
     except Exception as e:
-        logger.error(f"Error in background publication {publish_id}: {e}")
+        tb = traceback.format_exc()
+        logger.error(f"Error in background publication {publish_id}: {e}\n{tb}")
+        try:
+            logger_service.log(
+                level="ERROR",
+                action="PUBLISH_REVIEWS_FATAL",
+                message=f"Error fatal en segundo plano: {str(e)}",
+                sheet_id=sheet_id,
+                detail=json.dumps({"traceback": tb}, ensure_ascii=False)
+            )
+            logger_service.flush_log_batch(sheet_id)
+        except Exception as e_log:
+            logger.error(f"Fallo al registrar log de error fatal en background: {e_log}")
         current_publications[publish_id]["status"] = "failed"
         current_publications[publish_id]["message"] = f"Fallo en la publicación: {str(e)}"
 
@@ -348,7 +362,28 @@ def post_publish_reviews(req: PublishReviewsRequest):
             publish_id=publish_id
         )
     else:
-        return execute_publication_sync(None, sheet_id, dry_run)
+        try:
+            return execute_publication_sync(None, sheet_id, dry_run)
+        except HTTPException as e_http:
+            raise e_http
+        except Exception as e:
+            tb = traceback.format_exc()
+            logger.error(f"Error fatal en la publicación de reseñas: {e}\n{tb}")
+            try:
+                logger_service.log(
+                    level="ERROR",
+                    action="PUBLISH_REVIEWS_FATAL",
+                    message=f"Error fatal: {str(e)}",
+                    sheet_id=sheet_id,
+                    detail=json.dumps({"traceback": tb}, ensure_ascii=False)
+                )
+                logger_service.flush_log_batch(sheet_id)
+            except Exception as e_log:
+                logger.error(f"Fallo al registrar log de error fatal: {e_log}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Fallo en la publicación de reseñas: {str(e)}"
+            )
 
 class PublishStatusResponse(BaseModel):
     publish_id: str

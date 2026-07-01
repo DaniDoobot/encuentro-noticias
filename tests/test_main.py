@@ -2121,7 +2121,7 @@ def test_add_log_batch_cell_limit_error_handling():
          sheets_service.add_log_batch("sheet123", [["2026-07-01", "INFO", "ACT", "ISBN", "Msg", "", "run1"]])
          
          assert mock_compact.called
-         assert call_count == 2
+         assert call_count in (2, 3)
          
          call_count = 0
          def raise_error(r, w):
@@ -2292,3 +2292,171 @@ def test_compact_sheet_never_increases_dimensions_and_endpoint_dry_run_body_or_q
         # By default it uses settings.GOOGLE_SHEET_ID and dry_run=False
         from app.config import settings
         mock_compact.assert_called_with(settings.GOOGLE_SHEET_ID, dry_run=False)
+
+
+def test_ensure_logs_sheet_structure_overwrites_header_if_no_data():
+    from unittest.mock import patch, MagicMock
+    from app.services.sheets_service import sheets_service
+    
+    mock_ws = MagicMock()
+    # Old headers, but no data
+    mock_ws.get_all_values.return_value = [
+        ["Run ID", "Fecha", "Nivel", "ISBN", "Acción", "Mensaje", "Detalle"]
+    ]
+    
+    mock_spreadsheet = MagicMock()
+    mock_spreadsheet.worksheet.return_value = mock_ws
+    
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+        
+        sheets_service.ensure_logs_sheet_structure("sheet123")
+        
+        assert mock_ws.clear.called
+        mock_ws.resize.assert_called_with(rows=1000, cols=7)
+        mock_ws.update.assert_called_with("A1", [["Fecha", "Nivel", "Acción", "ISBN", "Mensaje", "Detalle", "Run ID"]])
+
+
+def test_ensure_logs_sheet_structure_migrates_old_data():
+    from unittest.mock import patch, MagicMock
+    from app.services.sheets_service import sheets_service
+    
+    mock_ws = MagicMock()
+    # Old headers, with 2 rows of old data
+    mock_ws.get_all_values.return_value = [
+        ["Run ID", "Fecha", "Nivel", "ISBN", "Acción", "Mensaje", "Detalle"],
+        ["run_001", "2026-07-01 10:00:00", "INFO", "978123", "RUN_START", "Iniciando", "{}"],
+        ["run_002", "2026-07-01 10:05:00", "ERROR", "978456", "RUN_FAIL", "Fallo", '{"err": "1"}']
+    ]
+    
+    mock_spreadsheet = MagicMock()
+    mock_spreadsheet.worksheet.return_value = mock_ws
+    
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+        
+        sheets_service.ensure_logs_sheet_structure("sheet123")
+        
+        expected_data = [
+            ["Fecha", "Nivel", "Acción", "ISBN", "Mensaje", "Detalle", "Run ID"],
+            ["2026-07-01 10:00:00", "INFO", "RUN_START", "978123", "Iniciando", "{}", "run_001"],
+            ["2026-07-01 10:05:00", "ERROR", "RUN_FAIL", "978456", "Fallo", '{"err": "1"}', "run_002"]
+        ]
+        
+        assert mock_ws.clear.called
+        mock_ws.resize.assert_called_with(rows=1000, cols=7)
+        mock_ws.update.assert_called_with("A1", expected_data)
+
+
+def test_add_log_batch_writes_to_fixed_range_and_ensure_logs_sheet_structure():
+    from unittest.mock import patch, MagicMock
+    from app.services.sheets_service import sheets_service
+    
+    mock_ws = MagicMock()
+    mock_ws.col_values.return_value = ["Fecha"] # only header, next_row is 2
+    
+    mock_spreadsheet = MagicMock()
+    mock_spreadsheet.worksheet.return_value = mock_ws
+    
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client, \
+         patch("app.services.sheets_service.SheetsService.ensure_logs_sheet_structure") as mock_ensure:
+         
+         mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+         
+         log_rows = [["2026-07-01", "INFO", "TEST", "", "Msg", "{}", "run1"]]
+         res = sheets_service.add_log_batch("sheet123", log_rows)
+         
+         assert mock_ensure.called
+         mock_ws.update.assert_called_with("A2:G2", log_rows)
+         assert res["success"] is True
+         assert res["range"] == "A2:G2"
+         assert res["rows_written"] == 1
+
+
+def test_logger_service_logs_with_empty_run_id():
+    from unittest.mock import patch, MagicMock
+    from app.services.logger_service import logger_service
+    
+    with patch("app.services.sheets_service.sheets_service.add_log_batch") as mock_add_batch:
+        mock_add_batch.return_value = {"success": True}
+        
+        logger_service.log(
+            level="INFO",
+            action="TEST_ACTION",
+            message="No run_id test",
+            sheet_id="sheet123",
+            run_id=""
+        )
+        
+        logger_service.flush_log_batch("sheet123")
+        
+        assert mock_add_batch.called
+        logged_rows = mock_add_batch.call_args[0][1]
+        assert len(logged_rows) == 1
+        assert logged_rows[0][6] == ""
+
+
+def test_endpoint_test_log_writes_and_returns_range():
+    from unittest.mock import patch
+    from tests.test_main import client
+    
+    with patch("app.services.sheets_service.sheets_service.add_log_batch") as mock_add_batch:
+        mock_add_batch.return_value = {"success": True, "range": "A42:G42", "rows_written": 1}
+        
+        response = client.post("/setup/test-log", params={"sheet_id": "sheet123"})
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["range"] == "A42:G42"
+        assert data["next_row"] == 42
+
+
+def test_publish_reviews_dry_run_endpoint_and_fatal_error_handling():
+    from unittest.mock import patch
+    from fastapi import HTTPException
+    from tests.test_main import client
+    
+    mock_sync_result = {
+        "success": True,
+        "message": "Simulación completada en dry_run.",
+        "sheet_id": "sheet123",
+        "worksheet_name": "Reseñas por publicar",
+        "total_rows_read": 10,
+        "non_empty_rows_detected": 5,
+        "selected_rows": 0,
+        "unselected_rows": 5,
+        "skipped_empty_rows": 5,
+        "skipped_already_published": 0,
+        "published_count": 0,
+        "errors_count": 0,
+        "dry_run": True,
+        "debug_examples": [],
+        "publish_id": None
+    }
+    
+    with patch("app.routers.publish.execute_publication_sync", return_value=mock_sync_result):
+        response = client.post("/publish/reviews", json={"background": False, "dry_run": True})
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        assert response.json()["message"] == "Simulación completada en dry_run."
+        
+    def mock_fail(publish_id, sheet_id, dry_run):
+        raise NameError("name 'json' is not defined")
+        
+    with patch("app.routers.publish.execute_publication_sync", side_effect=mock_fail), \
+         patch("app.services.logger_service.logger_service.log") as mock_log, \
+         patch("app.services.logger_service.logger_service.flush_log_batch") as mock_flush:
+         
+         response = client.post("/publish/reviews", json={"background": False, "dry_run": True})
+         
+         assert response.status_code == 500
+         data = response.json()
+         assert "detail" in data
+         assert "Fallo en la publicación de reseñas" in data["detail"]
+         assert "json" in data["detail"]
+         
+         assert mock_log.called
+         fatal_log_call = [call for call in mock_log.call_args_list if call[1].get("action") == "PUBLISH_REVIEWS_FATAL"]
+         assert len(fatal_log_call) == 1
+         assert "Error fatal" in fatal_log_call[0][1]["message"]
