@@ -1,8 +1,10 @@
 import base64
+import json
 import httpx
 from typing import Dict, Any, Optional
 import logging
 from app.config import settings
+from app.services.logger_service import logger_service
 
 logger = logging.getLogger("encuentro-noticias")
 
@@ -203,65 +205,93 @@ class WordPressPublisher:
 
         title_libro = clean_val(review.get("Título del libro"))
         title_web = clean_val(review.get("Título para Web"))
-        title_ia = clean_val(review.get("Título del libro detectado por IA"))
-        title_art = clean_val(review.get("Título del artículo"))
-
-        author_libro = clean_val(review.get("Autor del libro"))
+        isbn_libro = clean_val(review.get("ISBN"))
+        original_url = clean_val(review.get("URL"))
+        medium = clean_val(review.get("Medio de publicación"))
         author_web = clean_val(review.get("Autor para Web"))
-        author_ia = clean_val(review.get("Autor del libro detectado por IA"))
+        summary = clean_val(review.get("Resumen"))
 
         # wordpress title: priority is title_web (Título para Web), fallback to title_libro (Título del libro)
         post_title = (title_web or title_libro or "Reseña").strip()
 
-        # used for content layout
-        title_book = title_libro or "Sin título"
-        author_book = author_libro or "Sin autor"
-
-        summary = review.get("Resumen", "")
-        original_url = review.get("URL", "")
-        medium = review.get("Medio de publicación", "")
-        pub_date = review.get("Fecha de publicación", "")
-        content_type = review.get("Tipo de contenido", "reseña")
-        
-        # Author para Web representará el autor de la reseña. Si no, fallback a medio.
-        author_review = author_web or review.get("Autor de la publicación") or medium or ""
-        
-        post_content = f"""<p><strong>Libro:</strong> {title_book}</p>
-<p><strong>Autor del libro:</strong> {author_book}</p>
-<p><strong>Medio de origen:</strong> {medium}</p>
-{f"<p><strong>Autor de la reseña:</strong> {author_review}</p>" if author_review else ""}
-{f"<p><strong>Fecha de la publicación original:</strong> {pub_date}</p>" if pub_date else ""}
-<p><strong>Tipo de contenido:</strong> {content_type}</p>
-<hr />
-<p>{summary}</p>
-<hr />
-<p><em>Reseña original publicada en: <a href=\"{original_url}\" target=\"_blank\">{original_url}</a></em></p>"""
+        # Custom ACF / Meta fields
+        acf_fields = {
+            "libro": title_libro,
+            "isbn_libro": isbn_libro,
+            "url": original_url,
+            "medio": medium,
+            "autor": author_web
+        }
 
         status = config.get("WORDPRESS_POST_STATUS") or settings.WORDPRESS_POST_STATUS or "draft"
-        
+
         payload = {
             "title": post_title,
-            "content": post_content,
-            "status": status
+            "content": summary,
+            "status": status,
+            "acf": acf_fields,
+            "meta": acf_fields
         }
-        
+
         cat_id = config.get("WORDPRESS_DEFAULT_CATEGORY_ID") or settings.WORDPRESS_DEFAULT_CATEGORY_ID
         if cat_id:
             try:
                 payload["categories"] = [int(cat_id)]
             except ValueError:
                 pass
-                
+
         return payload
 
-    def publish_review(self, review: Dict[str, Any], config: Dict[str, Any], dry_run: bool = False) -> Dict[str, Any]:
+    def publish_review(
+        self,
+        review: Dict[str, Any],
+        config: Dict[str, Any],
+        dry_run: bool = False,
+        sheet_id: str = "",
+        run_id: str = ""
+    ) -> Dict[str, Any]:
         """
         Publishes a single review to WordPress (or simulates if dry_run=True).
         """
+        def clean_val(val: Any) -> str:
+            if not val:
+                return ""
+            return str(val).strip()
+
+        isbn = clean_val(review.get("ISBN"))
+        url_cfg = config.get("WORDPRESS_BASE_URL") or settings.WORDPRESS_BASE_URL
+        username = config.get("WORDPRESS_USERNAME") or settings.WORDPRESS_USERNAME
+        app_password = settings.WORDPRESS_APPLICATION_PASSWORD
+        post_type = config.get("WORDPRESS_POST_TYPE") or settings.WORDPRESS_POST_TYPE or "posts"
+
+        payload = self.build_post_payload(review, config)
+
+        # Log payload preview
+        preview_data = {
+            "post_title": payload.get("title", ""),
+            "content_length": len(payload.get("content", "")),
+            "libro": payload.get("acf", {}).get("libro", ""),
+            "isbn_libro": payload.get("acf", {}).get("isbn_libro", ""),
+            "url": payload.get("acf", {}).get("url", ""),
+            "medio": payload.get("acf", {}).get("medio", ""),
+            "autor": payload.get("acf", {}).get("autor", ""),
+            "autor_libro_ignored": clean_val(review.get("Autor del libro"))
+        }
+        
+        logger_service.log(
+            level="INFO",
+            action="WORDPRESS_PAYLOAD_PREVIEW",
+            message="Vista previa del payload de WordPress antes de enviar",
+            isbn=isbn,
+            detail=json.dumps(preview_data, ensure_ascii=False),
+            sheet_id=sheet_id,
+            run_id=run_id
+        )
+
         if dry_run:
             import random
             sim_id = random.randint(1000, 9999)
-            base_url = config.get("WORDPRESS_BASE_URL") or settings.WORDPRESS_BASE_URL or "https://ejemplo.wordpress.com"
+            base_url = url_cfg or "https://ejemplo.wordpress.com"
             base_url = base_url.rstrip("/")
             return {
                 "success": True,
@@ -269,21 +299,14 @@ class WordPressPublisher:
                 "wordpress_url": f"{base_url}/?p={sim_id}",
                 "message": "Publicación simulada en dry_run."
             }
-            
-        url = config.get("WORDPRESS_BASE_URL") or settings.WORDPRESS_BASE_URL
-        username = config.get("WORDPRESS_USERNAME") or settings.WORDPRESS_USERNAME
-        app_password = settings.WORDPRESS_APPLICATION_PASSWORD
-        post_type = config.get("WORDPRESS_POST_TYPE") or settings.WORDPRESS_POST_TYPE or "posts"
-        
-        if not url or not username or not app_password:
+
+        if not url_cfg or not username or not app_password:
             return {
                 "success": False,
                 "error": "Faltan credenciales de WordPress en variables de entorno o Config."
             }
-            
-        url = url.rstrip("/")
-        payload = self.build_post_payload(review, config)
-        
+
+        url = url_cfg.rstrip("/")
         try:
             auth = httpx.BasicAuth(username, app_password)
             with httpx.Client(timeout=20.0) as client:
@@ -299,11 +322,36 @@ class WordPressPublisher:
                         "message": "Publicación exitosa."
                     }
                 else:
+                    # Log failure details as requested: WORDPRESS_PUBLISH_ERROR
+                    error_detail = {
+                        "status_code": res.status_code,
+                        "response_text": res.text,
+                        "payload_keys": list(payload.keys())
+                    }
+                    logger_service.log(
+                        level="ERROR",
+                        action="WORDPRESS_PUBLISH_ERROR",
+                        message=f"Fallo al publicar en WordPress (HTTP {res.status_code})",
+                        isbn=isbn,
+                        detail=json.dumps(error_detail, ensure_ascii=False),
+                        sheet_id=sheet_id,
+                        run_id=run_id
+                    )
                     return {
                         "success": False,
                         "error": f"Fallo al publicar (HTTP {res.status_code}): {res.text}"
                     }
         except Exception as e:
+            # Also log connection exceptions as error
+            logger_service.log(
+                level="ERROR",
+                action="WORDPRESS_PUBLISH_ERROR",
+                message=f"Error de conexión con WordPress: {str(e)}",
+                isbn=isbn,
+                detail=str(e),
+                sheet_id=sheet_id,
+                run_id=run_id
+            )
             return {
                 "success": False,
                 "error": f"Error de conexión con WordPress: {str(e)}"

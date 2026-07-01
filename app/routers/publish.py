@@ -157,7 +157,7 @@ def execute_publication_sync(publish_id: Optional[str], sheet_id: str, dry_run: 
             continue
             
         # Attempt WordPress publication
-        pub_res = wordpress_publisher.publish_review(row, config, dry_run=dry_run)
+        pub_res = wordpress_publisher.publish_review(row, config, dry_run=dry_run, sheet_id=sheet_id, run_id=publish_id or "")
         
         if pub_res.get("success"):
             published_count += 1

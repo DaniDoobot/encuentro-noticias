@@ -1794,4 +1794,152 @@ def test_sync_status_endpoint_initialization():
         assert "CacheService not initialised" not in response.text
 
 
+def test_build_post_payload_mapping():
+    from app.services.wordpress_publisher import wordpress_publisher
+    
+    review = {
+        "Título del libro": "El Nombre de la Rosa",
+        "Título para Web": "Gran Reseña del Nombre de la Rosa",
+        "ISBN": "978-1234567890",
+        "URL": "https://cultura.com/reseña-rosa",
+        "Medio de publicación": "Cultura y Letras",
+        "Autor para Web": "Felipe Reseñador",
+        "Autor del libro": "Umberto Eco",
+        "Resumen": "Un resumen de prueba muy completo y descriptivo."
+    }
+    
+    payload = wordpress_publisher.build_post_payload(review, {})
+    
+    # 1. build_post_payload usa Título para Web como título
+    assert payload["title"] == "Gran Reseña del Nombre de la Rosa"
+    
+    # 2. build_post_payload usa Resumen como cuerpo
+    assert payload["content"] == "Un resumen de prueba muy completo y descriptivo."
+    
+    # Check acf and meta maps
+    for mapping in ["acf", "meta"]:
+        # 3. El campo Libro se rellena con Título del libro
+        assert payload[mapping]["libro"] == "El Nombre de la Rosa"
+        # 4. El campo ISBN Libro se rellena con ISBN
+        assert payload[mapping]["isbn_libro"] == "978-1234567890"
+        # 5. El campo Url se rellena con URL
+        assert payload[mapping]["url"] == "https://cultura.com/reseña-rosa"
+        # 6. El campo Medio se rellena con Medio de publicación
+        assert payload[mapping]["medio"] == "Cultura y Letras"
+        # 7. El campo Autor se rellena con Autor para Web, no con Autor del libro
+        assert payload[mapping]["autor"] == "Felipe Reseñador"
+        assert payload[mapping]["autor"] != "Umberto Eco"
+
+
+def test_build_post_payload_title_fallback():
+    from app.services.wordpress_publisher import wordpress_publisher
+    
+    # 8. Si Título para Web está vacío, usar fallback Título del libro
+    review = {
+        "Título del libro": "El Nombre de la Rosa",
+        "Título para Web": "",
+        "ISBN": "978-1234567890",
+        "URL": "https://cultura.com/reseña-rosa",
+        "Medio de publicación": "Cultura y Letras",
+        "Autor para Web": "Felipe Reseñador",
+        "Autor del libro": "Umberto Eco",
+        "Resumen": "Resumen"
+    }
+    
+    payload = wordpress_publisher.build_post_payload(review, {})
+    assert payload["title"] == "El Nombre de la Rosa"
+
+
+def test_build_post_payload_autor_fallback_and_redaccion():
+    from app.services.wordpress_publisher import wordpress_publisher
+    
+    # 9. Si Autor para Web está vacío, dejar Autor vacío y no inventarlo
+    review_empty_autor = {
+        "Título del libro": "El Nombre de la Rosa",
+        "Título para Web": "Título Web",
+        "ISBN": "978-1234567890",
+        "URL": "https://cultura.com/reseña-rosa",
+        "Medio de publicación": "Cultura y Letras",
+        "Autor para Web": "",
+        "Autor del libro": "Umberto Eco",
+        "Resumen": "Resumen"
+    }
+    
+    payload_empty = wordpress_publisher.build_post_payload(review_empty_autor, {})
+    assert payload_empty["acf"]["autor"] == ""
+    assert payload_empty["meta"]["autor"] == ""
+    
+    # Si Autor para Web viene como "Redacción", se mantiene
+    review_redaccion = {
+        "Título del libro": "El Nombre de la Rosa",
+        "Título para Web": "Título Web",
+        "ISBN": "978-1234567890",
+        "URL": "https://cultura.com/reseña-rosa",
+        "Medio de publicación": "Cultura y Letras",
+        "Autor para Web": "Redacción",
+        "Autor del libro": "Umberto Eco",
+        "Resumen": "Resumen"
+    }
+    
+    payload_redaccion = wordpress_publisher.build_post_payload(review_redaccion, {})
+    assert payload_redaccion["acf"]["autor"] == "Redacción"
+    assert payload_redaccion["meta"]["autor"] == "Redacción"
+
+
+def test_publish_review_preview_and_error_logging():
+    from unittest.mock import patch, MagicMock
+    from app.services.wordpress_publisher import wordpress_publisher
+    import json
+    
+    review = {
+        "Título del libro": "El Nombre de la Rosa",
+        "Título para Web": "Gran Reseña",
+        "ISBN": "978-1234567890",
+        "URL": "https://cultura.com/reseña-rosa",
+        "Medio de publicación": "Cultura y Letras",
+        "Autor para Web": "Felipe Reseñador",
+        "Autor del libro": "Umberto Eco",
+        "Resumen": "Un resumen"
+    }
+    
+    # Mock httpx.Client response to simulate WordPress returning 400 Bad Request
+    mock_response = MagicMock()
+    mock_response.status_code = 400
+    mock_response.text = "ACF fields are invalid"
+    
+    with patch("app.services.logger_service.logger_service.log") as mock_log, \
+         patch("httpx.Client.post", return_value=mock_response):
+         
+         res = wordpress_publisher.publish_review(
+             review=review,
+             config={
+                 "WORDPRESS_BASE_URL": "https://myblog.com",
+                 "WORDPRESS_USERNAME": "admin"
+             },
+             dry_run=False,
+             sheet_id="sheet123",
+             run_id="run456"
+         )
+         
+         assert res["success"] is False
+         assert "Fallo al publicar (HTTP 400)" in res["error"]
+         
+         # Verify WORDPRESS_PAYLOAD_PREVIEW was logged
+         preview_calls = [call for call in mock_log.call_args_list if call[1].get("action") == "WORDPRESS_PAYLOAD_PREVIEW"]
+         assert len(preview_calls) == 1
+         preview_detail = json.loads(preview_calls[0][1]["detail"])
+         assert preview_detail["post_title"] == "Gran Reseña"
+         assert preview_detail["libro"] == "El Nombre de la Rosa"
+         
+         # Verify WORDPRESS_PUBLISH_ERROR was logged with full details
+         error_calls = [call for call in mock_log.call_args_list if call[1].get("action") == "WORDPRESS_PUBLISH_ERROR"]
+         assert len(error_calls) == 1
+         error_detail = json.loads(error_calls[0][1]["detail"])
+         assert error_detail["status_code"] == 400
+         assert error_detail["response_text"] == "ACF fields are invalid"
+         assert "title" in error_detail["payload_keys"]
+         assert "acf" in error_detail["payload_keys"]
+
+
+
 
