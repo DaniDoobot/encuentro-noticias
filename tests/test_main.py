@@ -1942,5 +1942,233 @@ def test_publish_review_preview_and_error_logging():
          assert "acf" in error_detail["payload_keys"]
 
 
+def test_publish_review_preview_and_error_logging():
+    from unittest.mock import patch, MagicMock
+    from app.services.wordpress_publisher import wordpress_publisher
+    import json
+    
+    review = {
+        "Título del libro": "El Nombre de la Rosa",
+        "Título para Web": "Gran Reseña",
+        "ISBN": "978-1234567890",
+        "URL": "https://cultura.com/reseña-rosa",
+        "Medio de publicación": "Cultura y Letras",
+        "Autor para Web": "Felipe Reseñador",
+        "Autor del libro": "Umberto Eco",
+        "Resumen": "Un resumen"
+    }
+    
+    # Mock httpx.Client response to simulate WordPress returning 400 Bad Request
+    mock_response = MagicMock()
+    mock_response.status_code = 400
+    mock_response.text = "ACF fields are invalid"
+    
+    with patch("app.services.logger_service.logger_service.log") as mock_log,          patch("app.config.settings.WORDPRESS_APPLICATION_PASSWORD", "dummy_pass"),          patch("httpx.Client.post", return_value=mock_response):
+         
+         res = wordpress_publisher.publish_review(
+             review=review,
+             config={
+                 "WORDPRESS_BASE_URL": "https://myblog.com",
+                 "WORDPRESS_USERNAME": "admin"
+             },
+             dry_run=False,
+             sheet_id="sheet123",
+             run_id="run456"
+         )
+         
+         assert res["success"] is False
+         assert "Fallo al publicar (HTTP 400)" in res["error"]
+         
+         # Verify WORDPRESS_PAYLOAD_PREVIEW was logged
+         preview_calls = [call for call in mock_log.call_args_list if call[1].get("action") == "WORDPRESS_PAYLOAD_PREVIEW"]
+         assert len(preview_calls) == 1
+         preview_detail = json.loads(preview_calls[0][1]["detail"])
+         assert preview_detail["post_title"] == "Gran Reseña"
+         assert preview_detail["libro"] == "El Nombre de la Rosa"
+         
+         # Verify WORDPRESS_PUBLISH_ERROR was logged with full details
+         error_calls = [call for call in mock_log.call_args_list if call[1].get("action") == "WORDPRESS_PUBLISH_ERROR"]
+         assert len(error_calls) == 1
+         error_detail = json.loads(error_calls[0][1]["detail"])
+         assert error_detail["status_code"] == 400
+         assert error_detail["response_text"] == "ACF fields are invalid"
+         assert "title" in error_detail["payload_keys"]
+         assert "acf" in error_detail["payload_keys"]
 
 
+def test_sheet_compaction_report_and_dry_run():
+    from unittest.mock import patch, MagicMock
+    import gspread
+    from app.services.sheets_service import sheets_service
+    
+    # Mock worksheet for Logs
+    mock_ws = MagicMock()
+    mock_ws.title = "Logs"
+    mock_ws.row_count = 1000
+    mock_ws.col_count = 100
+    # 10 rows, where the first is headers and others are log values (7 columns)
+    mock_ws.get_all_values.return_value = [
+        ["Fecha", "Nivel", "Acción", "ISBN", "Mensaje", "Detalle", "Run ID"],
+        ["2026-07-01", "INFO", "RUN_START", "12345", "Msg", "", "run1"],
+        ["2026-07-01", "INFO", "BOOK_QUERIES_BUILT", "12345", "Msg", "", "run1"],
+        ["", "", "", "", "", "", ""] # trailing empty row, should be ignored
+    ]
+    
+    mock_spreadsheet = MagicMock()
+    mock_spreadsheet.worksheets.return_value = [mock_ws]
+    
+    def side_effect_worksheet(name):
+        if name == "Logs":
+            return mock_ws
+        raise gspread.exceptions.WorksheetNotFound("Not found")
+    mock_spreadsheet.worksheet.side_effect = side_effect_worksheet
+    
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+        
+        # 1. Audits size report
+        report = sheets_service.get_sheet_size_report("sheet123")
+        assert report["success"] is True
+        
+        tab_log = report["tabs"][0]
+        assert tab_log["title"] == "Logs"
+        assert tab_log["rows"] == 1000
+        assert tab_log["cols"] == 100
+        assert tab_log["last_data_row"] == 4
+        assert tab_log["last_data_col"] == 7 
+        
+        assert tab_log["recommended_rows"] == 500
+        assert tab_log["recommended_cols"] == 7
+        
+        assert tab_log["excess_rows"] == 500
+        assert tab_log["excess_cols"] == 93
+        
+        # 2. dry_run = True
+        comp_dry = sheets_service.compact_sheet("sheet123", dry_run=True)
+        assert comp_dry["success"] is True
+        assert comp_dry["dry_run"] is True
+        assert comp_dry["total_cells_freed"] == (1000 * 100) - (500 * 7)
+        assert len(comp_dry["compacted_tabs"]) == 1
+        assert comp_dry["compacted_tabs"][0]["title"] == "Logs"
+        assert not mock_ws.resize.called
+        
+        # 3. dry_run = False
+        comp_real = sheets_service.compact_sheet("sheet123", dry_run=False)
+        assert comp_real["success"] is True
+        assert comp_real["dry_run"] is False
+        assert mock_ws.resize.called
+        mock_ws.resize.assert_called_with(rows=500, cols=7)
+
+
+def test_logs_write_fixed_range_and_col_a_next_row():
+    from unittest.mock import patch, MagicMock
+    from app.services.sheets_service import sheets_service
+    
+    mock_ws = MagicMock()
+    mock_ws.col_values.return_value = ["Fecha", "2026-07-01 09:00:00", "2026-07-01 09:05:00"]
+    
+    mock_spreadsheet = MagicMock()
+    mock_spreadsheet.worksheet.return_value = mock_ws
+    
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+        
+        log_rows = [
+            ["2026-07-01 09:10:00", "INFO", "ACTION_1", "111", "Message 1", "", "run_abc"],
+            ["2026-07-01 09:11:00", "INFO", "ACTION_2", "111", "Message 2", "", "run_abc"]
+        ]
+        
+        sheets_service.add_log_batch("sheet123", log_rows)
+        mock_ws.update.assert_called_with("A4:G5", log_rows)
+
+
+def test_add_log_batch_cell_limit_error_handling():
+    from unittest.mock import patch, MagicMock
+    import gspread
+    from app.services.sheets_service import sheets_service
+    
+    mock_ws = MagicMock()
+    mock_ws.col_values.return_value = ["Fecha"]
+    
+    # Mock Response object to avoid AttributeError in APIError
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "error": {
+            "code": 400,
+            "message": "This action would increase the number of cells in the workbook above the limit of 10000000 cells.",
+            "status": "INVALID_ARGUMENT"
+        }
+    }
+    mock_response.text = "This action would increase the number of cells in the workbook above the limit of 10000000 cells."
+    
+    api_error = gspread.exceptions.APIError(mock_response)
+    
+    call_count = 0
+    def side_effect_update(write_range, rows):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise api_error
+        return {"success": True}
+        
+    mock_ws.update.side_effect = side_effect_update
+    mock_spreadsheet = MagicMock()
+    mock_spreadsheet.worksheet.return_value = mock_ws
+    
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client,          patch("app.services.sheets_service.SheetsService.compact_sheet", return_value={"success": True}) as mock_compact:
+         
+         mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+         sheets_service.add_log_batch("sheet123", [["2026-07-01", "INFO", "ACT", "ISBN", "Msg", "", "run1"]])
+         
+         assert mock_compact.called
+         assert call_count == 2
+         
+         call_count = 0
+         def raise_error(r, w):
+             raise api_error
+         mock_ws.update.side_effect = raise_error
+         mock_compact.reset_mock()
+         
+         sheets_service.add_log_batch("sheet123", [["2026-07-01", "INFO", "ACT", "ISBN", "Msg", "", "run1"]])
+         assert mock_compact.called
+
+
+def test_compact_sheet_does_not_delete_real_data():
+    from unittest.mock import patch, MagicMock
+    import gspread
+    from app.services.sheets_service import sheets_service
+    
+    mock_ws = MagicMock()
+    mock_ws.title = "Libros"
+    mock_ws.row_count = 500
+    mock_ws.col_count = 10
+    
+    mock_ws.get_all_values.return_value = [
+        ["¿Incluir en búsqueda?", "ISBN", "Título del libro", "Autor del libro", "Estado", "Última ejecución", "Reseñas encontradas", "Observaciones"],
+        [True, "111", "Book 1", "Author 1", "pending", "", "", ""],
+        [True, "222", "Book 2", "Author 2", "pending", "", "", ""],
+        [True, "333", "Book 3", "Author 3", "pending", "", "", ""],
+        [True, "444", "Book 4", "Author 4", "pending", "", "", ""]
+    ]
+    
+    mock_spreadsheet = MagicMock()
+    
+    def side_effect_worksheet(name):
+        if name == "Libros":
+            return mock_ws
+        raise gspread.exceptions.WorksheetNotFound("Not found")
+    mock_spreadsheet.worksheet.side_effect = side_effect_worksheet
+    mock_spreadsheet.worksheets.return_value = [mock_ws]
+    
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+        
+        report = sheets_service.get_sheet_size_report("sheet123")
+        tab = report["tabs"][0]
+        
+        assert tab["last_data_row"] == 5
+        assert tab["recommended_rows"] == 200
+        assert tab["excess_rows"] == 300
+        
+        sheets_service.compact_sheet("sheet123", dry_run=False)
+        mock_ws.resize.assert_called_with(rows=200, cols=8)

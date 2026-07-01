@@ -336,6 +336,7 @@ class RunService:
                 current_runs[run_id]["status"] = "completed"
                 current_runs[run_id]["message"] = f"Ejecución completada. Procesados {current_runs[run_id]['books_processed']} libros."
                 self._auto_cleanup_descartes(sheet_id, run_id)
+                self._auto_compact_sheet(sheet_id, run_id)
                 self._add_in_memory_log(run_id, "INFO", "RUN_END", f"Ejecución global completada. Completados={current_runs[run_id]['books_completed']}, Sin resultados={current_runs[run_id]['books_no_results']}, Fallidos={current_runs[run_id]['books_failed']}")
                 logger_service.log("INFO", "RUN_END", f"Ejecución global completada. Completados={current_runs[run_id]['books_completed']}, Sin resultados={current_runs[run_id]['books_no_results']}, Fallidos={current_runs[run_id]['books_failed']}", sheet_id=sheet_id, run_id=run_id)
             else:
@@ -449,6 +450,7 @@ class RunService:
             current_runs[run_id]["status"] = "completed"
             current_runs[run_id]["message"] = f"Ejecución completada para ISBN {isbn}."
             self._auto_cleanup_descartes(sheet_id, run_id)
+            self._auto_compact_sheet(sheet_id, run_id)
             self._add_in_memory_log(run_id, "INFO", "RUN_END", f"Ejecución individual para ISBN {isbn} completada.")
             logger_service.log("INFO", "RUN_END", f"Ejecución individual para ISBN {isbn} completada.", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
 
@@ -1748,5 +1750,29 @@ class RunService:
         except Exception as e:
             import logging
             logging.getLogger("encuentro-noticias").warning(f"Error doing auto descartes cleanup: {e}")
+
+    def _auto_compact_sheet(self, sheet_id: str, run_id: str):
+        try:
+            res = sheets_service.compact_sheet(sheet_id)
+            if res.get("compacted_tabs"):
+                compacted_summaries = [
+                    f"{t['title']} (celdas liberadas: {t['cells_freed']})"
+                    for t in res["compacted_tabs"]
+                ]
+                msg = f"Compactación automática de celdas completada. Pestañas: {', '.join(compacted_summaries)}."
+            else:
+                msg = "Compactación automática de celdas completada. No se requirieron cambios."
+                
+            logger_service.log(
+                level="INFO",
+                action="SHEET_COMPACT",
+                message=msg,
+                sheet_id=sheet_id,
+                run_id=run_id,
+                detail=json.dumps(res, ensure_ascii=False)
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger("encuentro-noticias").warning(f"Error doing auto sheet compaction: {e}")
 
 run_service = RunService()

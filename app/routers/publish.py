@@ -254,15 +254,20 @@ def execute_publication_sync(publish_id: Optional[str], sheet_id: str, dry_run: 
         action="PUBLISH_REVIEWS",
         message=summary_msg,
         sheet_id=sheet_id,
-        detail={
+        detail=json.dumps({
             "dry_run": dry_run,
             "published": published_count,
             "errors": errors_count,
             "unselected": unselected_count,
             "cancelled": bool(publish_id and publish_id in cancelled_publications)
-        }
+        }, ensure_ascii=False)
     )
     logger_service.flush_log_batch(sheet_id)
+
+    try:
+        sheets_service.compact_sheet(sheet_id)
+    except Exception as e_comp:
+        logger.error(f"Fallo al compactar hoja tras la publicación: {e_comp}")
 
     return PublishReviewsResponse(
         success=True,

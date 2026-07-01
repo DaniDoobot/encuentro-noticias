@@ -58,7 +58,7 @@ class LoggerService:
         # Batch for Sheets
         if sheet_id and run_id:
             timestamp = get_now_madrid_str()
-            log_row = [run_id, timestamp, level_upper, isbn, action, message, detail]
+            log_row = [timestamp, level_upper, action, isbn, message, detail, run_id]
             batch_key = f"{sheet_id}:{run_id}"
             with self._batch_lock:
                 if self._batch_key != batch_key:

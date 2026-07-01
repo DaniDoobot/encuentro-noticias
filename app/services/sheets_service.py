@@ -159,7 +159,7 @@ class SheetsService:
                 "Buscador interno", "Notas", "Última indexación", "URLs indexadas", "Errores"
             ],
             "Logs": [
-                "Run ID", "Fecha", "Nivel", "ISBN", "Acción", "Mensaje", "Detalle"
+                "Fecha", "Nivel", "Acción", "ISBN", "Mensaje", "Detalle", "Run ID"
             ],
             "Config": [
                 "Clave", "Valor", "Descripción"
@@ -961,21 +961,50 @@ class SheetsService:
         """
         Appends a single row to Logs. Use add_log_batch for multiple rows.
         """
-        client = self.get_client()
-        spreadsheet = client.open_by_key(sheet_id)
-        worksheet = spreadsheet.worksheet("Logs")
-        worksheet.append_row(log_data)
+        self.add_log_batch(sheet_id, [log_data])
 
     def add_log_batch(self, sheet_id: str, log_rows: List[List[Any]]):
         """
         Appends multiple rows to Logs in a single API call (reduces quota usage).
+        Calculates the next row using column A, and writes to a fixed range A:G.
+        Includes safety handling for 10M cell limit error: executes compaction and retries once.
         """
         if not log_rows:
             return
-        client = self.get_client()
-        spreadsheet = client.open_by_key(sheet_id)
-        worksheet = spreadsheet.worksheet("Logs")
-        worksheet.append_rows(log_rows, value_input_option="RAW")
+            
+        def perform_write():
+            client = self.get_client()
+            spreadsheet = client.open_by_key(sheet_id)
+            worksheet = spreadsheet.worksheet("Logs")
+            col_a_vals = worksheet.col_values(1)
+            next_row = len(col_a_vals) + 1
+            start_row = next_row
+            end_row = next_row + len(log_rows) - 1
+            write_range = f"A{start_row}:G{end_row}"
+            worksheet.update(write_range, log_rows)
+
+        try:
+            perform_write()
+        except Exception as e:
+            err_msg = str(e)
+            # Check for cell limit error patterns
+            if "10000000" in err_msg or "above the limit" in err_msg or "cell" in err_msg.lower():
+                import logging
+                logging.getLogger("encuentro-noticias").error(
+                    f"Fallo al escribir logs en Google Sheets debido al límite de celdas: {err_msg}. Intentando compactar..."
+                )
+                try:
+                    # Execute compaction
+                    self.compact_sheet(sheet_id)
+                    # Retry once
+                    perform_write()
+                except Exception as retry_err:
+                    logging.getLogger("encuentro-noticias").error(
+                        f"Error crítico: Reintento de escritura de logs falló: {retry_err}. Continuando sin escribir en Sheets."
+                    )
+            else:
+                # Raise other exceptions (e.g. connection errors, worksheet not found)
+                raise e
 
     def update_reviews_hashes(self, sheet_id: str, updates: List[Tuple[int, str]]):
         """
@@ -1577,6 +1606,178 @@ class SheetsService:
             "deleted_count": deleted_count,
             "remaining_count": new_count,
             "message": f"Se eliminaron {deleted_count} filas antiguas de Descartes. Quedan {new_count} filas."
+        }
+
+    def get_sheet_size_report(self, sheet_id: str) -> Dict[str, Any]:
+        """
+        Audits the size of the Google Sheet, returning a report detailing row/col/cell counts,
+        last populated data row/col, and excess cells for all worksheets.
+        """
+        client = self.get_client()
+        spreadsheet = client.open_by_key(sheet_id)
+        
+        expected_headers_map = {
+            "Libros": [
+                "¿Incluir en búsqueda?", "ISBN", "Título del libro", "Autor del libro", 
+                "Estado", "Última ejecución", "Reseñas encontradas", "Observaciones"
+            ],
+            "Reseñas por publicar": [
+                "¿Publicar?", "Estado publicación", "Fecha intento publicación", "Error publicación", "ISBN", "Título del libro",
+                "Autor del libro", "URL", "Título para Web", "Autor para Web",
+                "Medio de publicación", "Fecha de publicación",
+                "Idioma original", "Categoría", "Resumen", "Score de coincidencia",
+                "Tipo de contenido", "Fecha de extracción", "Estado", "URL normalizada", "Hash deduplicación", "Query"
+            ],
+            "Reseñas publicadas": [
+                "Fecha publicación", "WordPress ID", "WordPress URL", "ISBN", "Título del libro",
+                "Autor del libro", "URL", "Título para Web", "Autor para Web",
+                "Medio de publicación", "Fecha de publicación",
+                "Idioma original", "Categoría", "Resumen", "Score de coincidencia",
+                "Tipo de contenido", "Fecha de extracción", "Estado", "URL normalizada", "Hash deduplicación", "Query"
+            ],
+            "Descartes": [
+                "ISBN", "Título del libro", "Autor del libro", "Query", "URL", 
+                "Título detectado", "Motivo de descarte", "Score de coincidencia", "Fecha de extracción"
+            ],
+            "Fuentes": [
+                "Dominio", "Activo", "Tipo", "Sitemap URL", "RSS URL",
+                "Buscador interno", "Notas", "Última indexación", "URLs indexadas", "Errores"
+            ],
+            "Logs": [
+                "Fecha", "Nivel", "Acción", "ISBN", "Mensaje", "Detalle", "Run ID"
+            ],
+            "Config": [
+                "Clave", "Valor", "Descripción"
+            ],
+            "Config técnica": [
+                "Clave", "Valor", "Descripción"
+            ],
+            "Panel": [
+                "Encuentro Noticias — Panel de control", ""
+            ]
+        }
+        
+        tabs_to_audit = list(expected_headers_map.keys())
+        
+        tab_reports = []
+        spreadsheet_total_cells = 0
+        
+        ROW_BUFFER = 100
+        min_rows_map = {
+            "Logs": 500,
+            "Descartes": 200,
+            "Reseñas por publicar": 200,
+            "Reseñas publicadas": 200,
+            "Fuentes": 200,
+            "Libros": 200,
+            "Config": 50,
+            "Config técnica": 50,
+            "Panel": 50
+        }
+        
+        for ws_name in tabs_to_audit:
+            try:
+                worksheet = spreadsheet.worksheet(ws_name)
+            except Exception:
+                continue
+                
+            current_rows = worksheet.row_count
+            current_cols = worksheet.col_count
+            current_cells = current_rows * current_cols
+            spreadsheet_total_cells += current_cells
+            
+            # Fetch values
+            values = worksheet.get_all_values()
+            
+            last_data_row = len(values)
+            last_data_col = 0
+            if values:
+                # Find the maximum index of populated columns in any row
+                for row in values:
+                    # filter out trailing empty values in row to find real col count
+                    real_row_len = len(row)
+                    while real_row_len > 0 and str(row[real_row_len - 1]).strip() == "":
+                        real_row_len -= 1
+                    if real_row_len > last_data_col:
+                        last_data_col = real_row_len
+                        
+            # Map expected headers length
+            expected_headers = expected_headers_map[ws_name]
+            header_len = len(expected_headers)
+            
+            # Recommended rows and columns
+            min_rows = min_rows_map.get(ws_name, 100)
+            recommended_rows = max(last_data_row + ROW_BUFFER, min_rows)
+            recommended_cols = max(last_data_col, header_len)
+            
+            # Excess calculation
+            excess_rows = max(current_rows - recommended_rows, 0)
+            excess_cols = max(current_cols - recommended_cols, 0)
+            
+            tab_reports.append({
+                "title": ws_name,
+                "rows": current_rows,
+                "cols": current_cols,
+                "cells": current_cells,
+                "last_data_row": last_data_row,
+                "last_data_col": last_data_col,
+                "recommended_rows": recommended_rows,
+                "recommended_cols": recommended_cols,
+                "excess_rows": excess_rows,
+                "excess_cols": excess_cols
+            })
+            
+        return {
+            "success": True,
+            "spreadsheet_total_cells": spreadsheet_total_cells,
+            "tabs": tab_reports
+        }
+
+    def compact_sheet(self, sheet_id: str, dry_run: bool = False) -> Dict[str, Any]:
+        """
+        Compacts the Google Sheet by shrinking tabs with excess rows or columns.
+        """
+        report = self.get_sheet_size_report(sheet_id)
+        if not report.get("success"):
+            return report
+            
+        client = self.get_client()
+        spreadsheet = client.open_by_key(sheet_id)
+        
+        compacted_tabs = []
+        total_cells_freed = 0
+        
+        for tab in report["tabs"]:
+            if tab["excess_rows"] > 0 or tab["excess_cols"] > 0:
+                ws_name = tab["title"]
+                try:
+                    worksheet = spreadsheet.worksheet(ws_name)
+                    new_rows = tab["recommended_rows"]
+                    new_cols = tab["recommended_cols"]
+                    
+                    if not dry_run:
+                        worksheet.resize(rows=new_rows, cols=new_cols)
+                        
+                    cells_freed = tab["cells"] - (new_rows * new_cols)
+                    total_cells_freed += cells_freed
+                    
+                    compacted_tabs.append({
+                        "title": ws_name,
+                        "old_rows": tab["rows"],
+                        "old_cols": tab["cols"],
+                        "new_rows": new_rows,
+                        "new_cols": new_cols,
+                        "cells_freed": cells_freed
+                    })
+                except Exception as e:
+                    logger.warning(f"Failed to compact tab '{ws_name}': {e}")
+                    
+        return {
+            "success": True,
+            "dry_run": dry_run,
+            "total_cells_freed": total_cells_freed,
+            "compacted_tabs": compacted_tabs,
+            "report_before": report
         }
 
     def append_default_sources(self, sheet_id: str) -> int:

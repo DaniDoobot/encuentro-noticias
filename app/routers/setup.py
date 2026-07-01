@@ -65,3 +65,33 @@ def debug_google_news(q: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Google News debug query failed: {str(e)}"
         )
+
+
+@router.post("/setup/sheet-size-report")
+def get_sheet_size_report(sheet_id: str = None):
+    """
+    Returns a report detailing grid sizes and estimated excess cells for all tabs.
+    """
+    s_id = sheet_id or settings.GOOGLE_SHEET_ID
+    try:
+        return sheets_service.get_sheet_size_report(s_id)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate sheet size report: {str(e)}"
+        )
+
+
+@router.post("/setup/compact-sheet")
+def compact_sheet(sheet_id: str = None, dry_run: bool = False):
+    """
+    Compacts worksheets by shrinking trailing empty rows/cols to recommended sizes.
+    """
+    s_id = sheet_id or settings.GOOGLE_SHEET_ID
+    try:
+        return sheets_service.compact_sheet(s_id, dry_run=dry_run)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to compact sheet: {str(e)}"
+        )
