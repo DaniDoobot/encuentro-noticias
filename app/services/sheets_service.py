@@ -299,7 +299,9 @@ class SheetsService:
                 ["", ""],
                 ["Fecha mínima", "2024-01-01"],
                 ["Fecha máxima", "2026-12-31"],
-                ["¿Publicar directamente?", "No"],
+                ["Máximo de libros", 10],
+                ["Modo prueba (dry run)", True],
+                ["Incluir artículos sin fecha", True],
                 ["", ""],
                 ["Último run_id", ""],
                 ["Última búsqueda_id", ""],
@@ -362,13 +364,54 @@ class SheetsService:
                         "fields": "userEnteredFormat.numberFormat"
                     }
                 },
-                # Boolean checkbox for B5 (¿Publicar directamente?)
+                # Number validation for B5 (Máximo de libros): integer 1-5000
                 {
                     "setDataValidation": {
                         "range": {
                             "sheetId": panel_ws.id,
                             "startRowIndex": 4,
                             "endRowIndex": 5,
+                            "startColumnIndex": 1,
+                            "endColumnIndex": 2
+                        },
+                        "rule": {
+                            "condition": {
+                                "type": "NUMBER_BETWEEN",
+                                "values": [
+                                    {"userEnteredValue": "1"},
+                                    {"userEnteredValue": "5000"}
+                                ]
+                            },
+                            "showCustomUi": True,
+                            "strict": False
+                        }
+                    }
+                },
+                # Boolean checkbox for B6 (Modo prueba)
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": panel_ws.id,
+                            "startRowIndex": 5,
+                            "endRowIndex": 6,
+                            "startColumnIndex": 1,
+                            "endColumnIndex": 2
+                        },
+                        "rule": {
+                            "condition": {
+                                "type": "BOOLEAN"
+                            },
+                            "showCustomUi": True
+                        }
+                    }
+                },
+                # Boolean checkbox for B7 (Incluir artículos sin fecha)
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": panel_ws.id,
+                            "startRowIndex": 6,
+                            "endRowIndex": 7,
                             "startColumnIndex": 1,
                             "endColumnIndex": 2
                         },

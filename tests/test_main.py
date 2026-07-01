@@ -2641,6 +2641,140 @@ def test_ensure_sheet_creates_simplified_headers_and_migrates_existing():
         assert "RSS URL" not in mock_fuentes.values[0]
         assert "Buscador interno" not in mock_fuentes.values[0]
         assert mock_fuentes.values[0] == ["Dominio", "Activo", "Tipo", "Notas", "Última indexación", "URLs indexadas", "Errores"]
+def test_panel_b5_numeric_validation():
+    """B5 del Panel debe recibir validación NUMBER_BETWEEN (1-5000), no BOOLEAN.
+    B6 y B7 deben recibir validación BOOLEAN (checkboxes).
+    """
+    from app.services.sheets_service import sheets_service
+    from unittest.mock import patch, MagicMock, call
+
+    captured_requests = []
+
+    class PanelFakeWS:
+        def __init__(self, name):
+            self.title = name
+            self.id = 42
+            self.col_count = 2
+            self.row_count = 100
+            self.values = [["Encuentro Noticias — Panel de control", ""]]
+        def row_values(self, idx):
+            return self.values[0] if self.values else []
+        def get_all_values(self):
+            return self.values
+        def get_all_records(self):
+            return []
+        def insert_row(self, row, index):
+            pass
+        def append_row(self, row, value_input_option=None):
+            pass
+        def clear(self):
+            pass
+        def resize(self, rows=None, cols=None):
+            pass
+        def update(self, range_name, values=None, **kwargs):
+            pass
+        def update_cell(self, row, col, val):
+            pass
+
+    class GenericFakeWS:
+        def __init__(self, name, headers):
+            self.title = name
+            self.id = hash(name) % 10000
+            self.col_count = len(headers)
+            self.row_count = 1000
+            self.values = [headers]
+        def row_values(self, idx):
+            return self.values[0] if self.values else []
+        def get_all_values(self):
+            return self.values
+        def get_all_records(self):
+            return []
+        def insert_row(self, row, index):
+            pass
+        def append_row(self, row, value_input_option=None):
+            pass
+        def clear(self):
+            pass
+        def resize(self, rows=None, cols=None):
+            pass
+        def update(self, range_name, values=None, **kwargs):
+            pass
+        def update_cell(self, row, col, val):
+            pass
+
+    panel_ws = PanelFakeWS("Panel")
+    libros_ws = GenericFakeWS("Libros", ["¿Incluir en búsqueda?", "ISBN", "Título del libro", "Autor del libro", "Estado", "Última ejecución", "Reseñas encontradas", "Observaciones"])
+    por_pub_ws = GenericFakeWS("Reseñas por publicar", ["¿Publicar?", "Estado publicación", "Fecha intento publicación", "Error publicación", "ISBN", "Título del libro", "Autor del libro", "URL", "Título para Web", "Autor para Web", "Medio de publicación", "Fecha de publicación", "Idioma original", "Categoría", "Resumen", "Score de coincidencia", "Tipo de contenido", "Fecha de extracción", "Hash deduplicación", "Query"])
+    pub_ws = GenericFakeWS("Reseñas publicadas", ["Fecha publicación", "WordPress ID", "WordPress URL", "ISBN", "Título del libro", "Autor del libro", "URL", "Título para Web", "Autor para Web", "Medio de publicación", "Fecha de publicación", "Idioma original", "Categoría", "Resumen", "Score de coincidencia", "Tipo de contenido", "Fecha de extracción", "Hash deduplicación", "Query"])
+    config_ws = GenericFakeWS("Config", ["Clave", "Valor", "Descripción"])
+    fuentes_ws = GenericFakeWS("Fuentes", ["Dominio", "Activo", "Tipo", "Notas", "Última indexación", "URLs indexadas", "Errores"])
+    logs_ws = GenericFakeWS("Logs", ["Fecha", "Nivel", "Acción", "ISBN", "Mensaje", "Detalle", "Run ID"])
+    descartes_ws = GenericFakeWS("Descartes", ["ISBN", "Título del libro", "Autor del libro", "Query", "URL", "Título detectado", "Motivo de descarte", "Score de coincidencia", "Fecha de extracción"])
+
+    worksheets = {
+        "Panel": panel_ws, "Libros": libros_ws,
+        "Reseñas por publicar": por_pub_ws, "Reseñas publicadas": pub_ws,
+        "Config": config_ws, "Fuentes": fuentes_ws, "Logs": logs_ws, "Descartes": descartes_ws,
+    }
+
+    def get_ws(name):
+        import gspread
+        if name in worksheets:
+            return worksheets[name]
+        raise gspread.exceptions.WorksheetNotFound(name)
+
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client, \
+         patch("app.services.logger_service.logger_service.log"):
+        mock_spreadsheet = MagicMock()
+        mock_spreadsheet.worksheets.return_value = list(worksheets.values())
+        mock_spreadsheet.worksheet.side_effect = get_ws
+
+        def capture_batch(payload):
+            captured_requests.extend(payload.get("requests", []))
+        mock_spreadsheet.batch_update.side_effect = capture_batch
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+
+        sheets_service.ensure_sheet("some_sheet_id")
+
+    # Extraer todas las reglas setDataValidation aplicadas al Panel (sheetId=42)
+    panel_validations = [
+        r["setDataValidation"]
+        for r in captured_requests
+        if "setDataValidation" in r and r["setDataValidation"]["range"]["sheetId"] == panel_ws.id
+    ]
+
+    # Debe haber exactamente 4 validaciones en el Panel: B3:B4 (fecha), B5 (número), B6 (bool), B7 (bool)
+    assert len(panel_validations) == 4, f"Se esperaban 4 validaciones en Panel, se obtuvieron {len(panel_validations)}"
+
+    # B5 (rowIndex 4-5): debe ser NUMBER_BETWEEN, no BOOLEAN
+    b5_val = next(
+        (v for v in panel_validations if v["range"]["startRowIndex"] == 4 and v["range"]["endRowIndex"] == 5),
+        None
+    )
+    assert b5_val is not None, "No se encontró validación para B5 (rowIndex 4)"
+    assert b5_val["rule"]["condition"]["type"] == "NUMBER_BETWEEN", \
+        f"B5 debe tener validación NUMBER_BETWEEN, tiene: {b5_val['rule']['condition']['type']}"
+    values = b5_val["rule"]["condition"]["values"]
+    assert values[0]["userEnteredValue"] == "1"
+    assert values[1]["userEnteredValue"] == "5000"
+
+    # B6 (rowIndex 5-6): debe ser BOOLEAN (Modo prueba)
+    b6_val = next(
+        (v for v in panel_validations if v["range"]["startRowIndex"] == 5 and v["range"]["endRowIndex"] == 6),
+        None
+    )
+    assert b6_val is not None, "No se encontró validación para B6 (rowIndex 5)"
+    assert b6_val["rule"]["condition"]["type"] == "BOOLEAN", \
+        f"B6 debe ser BOOLEAN, tiene: {b6_val['rule']['condition']['type']}"
+
+    # B7 (rowIndex 6-7): debe ser BOOLEAN (Incluir sin fecha)
+    b7_val = next(
+        (v for v in panel_validations if v["range"]["startRowIndex"] == 6 and v["range"]["endRowIndex"] == 7),
+        None
+    )
+    assert b7_val is not None, "No se encontró validación para B7 (rowIndex 6)"
+    assert b7_val["rule"]["condition"]["type"] == "BOOLEAN", \
+        f"B7 debe ser BOOLEAN, tiene: {b7_val['rule']['condition']['type']}"
 
 
 def test_backend_base_url_in_config_defaults():
