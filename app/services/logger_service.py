@@ -84,7 +84,9 @@ class LoggerService:
         rows = list(self._batch)
         self._batch = []
         try:
-            sheets_service.add_log_batch(batch_key, rows)
+            res = sheets_service.add_log_batch(batch_key, rows)
+            if isinstance(res, dict) and not res.get("success"):
+                self.logger.error(f"Failed to batch-write log rows to Google Sheets: {res.get('error')}")
         except Exception as e:
             self.logger.error(f"Failed to batch-write log rows to Google Sheets: {e}")
 

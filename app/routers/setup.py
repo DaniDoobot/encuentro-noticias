@@ -28,6 +28,7 @@ def ensure_sheet():
         )
 
 
+
 @router.get("/debug/google-news")
 def debug_google_news(q: str):
     """

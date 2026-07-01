@@ -3053,3 +3053,119 @@ def test_wordpress_publish_review_two_step_acf_failure():
         assert len(attempt_calls) == 1
         assert len(error_calls) == 1
 
+
+# --- SHEET LOGS REGRESSION TESTS ---
+
+def test_publish_review_dry_run_logs_details():
+    from app.services.wordpress_publisher import wordpress_publisher
+    from unittest.mock import patch, MagicMock
+    import json
+
+    review = {
+        "ISBN": "9781234567890",
+        "URL": "https://ejemplo.com/resena-de-prueba",
+        "Medio de publicación": "El Cultural",
+        "Autor para Web": "Juan Pérez",
+        "Título del libro": "Don Quijote"
+    }
+
+    with patch("app.services.logger_service.logger_service.log") as mock_log:
+        wordpress_publisher.publish_review(
+            review=review,
+            config={},
+            dry_run=True,
+            sheet_id="sheet123",
+            run_id="run_dry_1"
+        )
+
+        # 1. verify_sheet_id is passed to logger_service.log
+        for call_args in mock_log.call_args_list:
+            kwargs = call_args[1]
+            assert kwargs.get("sheet_id") == "sheet123"
+
+        # 2. WORDPRESS_PAYLOAD_PREVIEW is called
+        preview_calls = [c for c in mock_log.call_args_list if c[1].get("action") == "WORDPRESS_PAYLOAD_PREVIEW"]
+        assert len(preview_calls) == 1
+        detail = json.loads(preview_calls[0][1]["detail"])
+        assert detail["post_title"] == "Don Quijote"
+
+        # 3. WORDPRESS_ACF_UPDATE_ATTEMPT is called in dry_run
+        attempt_calls = [c for c in mock_log.call_args_list if c[1].get("action") == "WORDPRESS_ACF_UPDATE_ATTEMPT"]
+        assert len(attempt_calls) == 1
+
+        # 4. WORDPRESS_ACF_UPDATE_SUCCESS is called in dry_run
+        success_calls = [c for c in mock_log.call_args_list if c[1].get("action") == "WORDPRESS_ACF_UPDATE_SUCCESS"]
+        assert len(success_calls) == 1
+
+
+def test_logger_service_log_receives_sheet_id():
+    from app.services.logger_service import logger_service
+    from unittest.mock import patch
+
+    with patch.object(logger_service, "_batch_lock"):
+        logger_service.log(
+            level="INFO",
+            action="TEST_ACTION",
+            message="Test Msg",
+            isbn="123456",
+            detail="detail",
+            sheet_id="my_sheet_id",
+            run_id="my_run_id"
+        )
+        # Flush to check it has sheet_id
+        assert logger_service._batch_key == "my_sheet_id"
+        assert len(logger_service._batch) == 1
+        assert logger_service._batch[0][1] == "INFO"
+        assert logger_service._batch[0][2] == "TEST_ACTION"
+        assert logger_service._batch[0][3] == "123456"
+        assert logger_service._batch[0][6] == "my_run_id"
+        
+        # Clear buffer
+        logger_service._batch = []
+
+
+def test_add_log_batch_writes_to_logs_with_correct_headers():
+    from app.services.sheets_service import sheets_service
+    from unittest.mock import patch, MagicMock
+
+    class FakeWS:
+        def __init__(self):
+            self.title = "Logs"
+            self.id = 123
+            self.col_count = 7
+            self.row_count = 100
+            self.values = [["Fecha", "Nivel", "Acción", "ISBN", "Mensaje", "Detalle", "Run ID"]]
+            self.cleared = False
+            self.resized = None
+            self.updates = []
+
+        def col_values(self, col):
+            return [row[col - 1] for row in self.values]
+
+        def get_all_values(self):
+            return self.values
+
+        def resize(self, rows=None, cols=None):
+            self.resized = (rows, cols)
+
+        def clear(self):
+            self.cleared = True
+            self.values = []
+
+        def update(self, range_name, values, **kwargs):
+            self.updates.append((range_name, values))
+            self.values = values
+
+    mock_ws = FakeWS()
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
+        mock_spreadsheet = MagicMock()
+        mock_spreadsheet.worksheet.return_value = mock_ws
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+
+        log_rows = [["2026-07-01 13:42:00", "INFO", "TEST_ACTION", "9781234", "Msg", "Det", "run123"]]
+        sheets_service.add_log_batch("sheet123", log_rows)
+
+        assert mock_ws.updates[0][0] == "A2:G2"
+        assert mock_ws.updates[0][1][0] == ["2026-07-01 13:42:00", "INFO", "TEST_ACTION", "9781234", "Msg", "Det", "run123"]
+
+
