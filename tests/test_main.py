@@ -1831,19 +1831,18 @@ def test_build_post_payload_mapping():
     # 2. build_post_payload usa Resumen como cuerpo
     assert payload["content"] == "Un resumen de prueba muy completo y descriptivo."
     
-    # Check acf and meta maps
-    for mapping in ["acf", "meta"]:
-        # 3. El campo Libro se rellena con Título del libro
-        assert payload[mapping]["libro"] == "El Nombre de la Rosa"
-        # 4. El campo ISBN Libro se rellena con ISBN
-        assert payload[mapping]["isbn_libro"] == "978-1234567890"
-        # 5. El campo Url se rellena con URL
-        assert payload[mapping]["url"] == "https://cultura.com/reseña-rosa"
-        # 6. El campo Medio se rellena con Medio de publicación
-        assert payload[mapping]["medio"] == "Cultura y Letras"
-        # 7. El campo Autor se rellena con Autor para Web, no con Autor del libro
-        assert payload[mapping]["autor"] == "Felipe Reseñador"
-        assert payload[mapping]["autor"] != "Umberto Eco"
+    acf_payload = wordpress_publisher.build_acf_payload(review)
+    # 3. El campo Libro se deja vacío por ahora
+    assert acf_payload["libro"] == ""
+    # 4. El campo ISBN Libro se rellena con ISBN
+    assert acf_payload["isbn_libro"] == "978-1234567890"
+    # 5. El campo Url se rellena con URL
+    assert acf_payload["url"] == "https://cultura.com/reseña-rosa"
+    # 6. El campo Medio se rellena con Medio de publicación
+    assert acf_payload["medio"] == "Cultura y Letras"
+    # 7. El campo Autor se rellena con Autor para Web, no con Autor del libro
+    assert acf_payload["autor"] == "Felipe Reseñador"
+    assert acf_payload["autor"] != "Umberto Eco"
 
 
 def test_build_post_payload_title_fallback():
@@ -1880,9 +1879,8 @@ def test_build_post_payload_autor_fallback_and_redaccion():
         "Resumen": "Resumen"
     }
     
-    payload_empty = wordpress_publisher.build_post_payload(review_empty_autor, {})
-    assert payload_empty["acf"]["autor"] == ""
-    assert payload_empty["meta"]["autor"] == ""
+    acf_empty = wordpress_publisher.build_acf_payload(review_empty_autor)
+    assert acf_empty["autor"] == ""
     
     # Si Autor para Web viene como "Redacción", se mantiene
     review_redaccion = {
@@ -1896,9 +1894,8 @@ def test_build_post_payload_autor_fallback_and_redaccion():
         "Resumen": "Resumen"
     }
     
-    payload_redaccion = wordpress_publisher.build_post_payload(review_redaccion, {})
-    assert payload_redaccion["acf"]["autor"] == "Redacción"
-    assert payload_redaccion["meta"]["autor"] == "Redacción"
+    acf_redaccion = wordpress_publisher.build_acf_payload(review_redaccion)
+    assert acf_redaccion["autor"] == "Redacción"
 
 
 def test_publish_review_preview_and_error_logging():
@@ -1954,61 +1951,7 @@ def test_publish_review_preview_and_error_logging():
          assert error_detail["status_code"] == 400
          assert error_detail["response_text"] == "ACF fields are invalid"
          assert "title" in error_detail["payload_keys"]
-         assert "acf" in error_detail["payload_keys"]
-
-
-def test_publish_review_preview_and_error_logging():
-    from unittest.mock import patch, MagicMock
-    from app.services.wordpress_publisher import wordpress_publisher
-    import json
-    
-    review = {
-        "Título del libro": "El Nombre de la Rosa",
-        "Título para Web": "Gran Reseña",
-        "ISBN": "978-1234567890",
-        "URL": "https://cultura.com/reseña-rosa",
-        "Medio de publicación": "Cultura y Letras",
-        "Autor para Web": "Felipe Reseñador",
-        "Autor del libro": "Umberto Eco",
-        "Resumen": "Un resumen"
-    }
-    
-    # Mock httpx.Client response to simulate WordPress returning 400 Bad Request
-    mock_response = MagicMock()
-    mock_response.status_code = 400
-    mock_response.text = "ACF fields are invalid"
-    
-    with patch("app.services.logger_service.logger_service.log") as mock_log,          patch("app.config.settings.WORDPRESS_APPLICATION_PASSWORD", "dummy_pass"),          patch("httpx.Client.post", return_value=mock_response):
-         
-         res = wordpress_publisher.publish_review(
-             review=review,
-             config={
-                 "WORDPRESS_BASE_URL": "https://myblog.com",
-                 "WORDPRESS_USERNAME": "admin"
-             },
-             dry_run=False,
-             sheet_id="sheet123",
-             run_id="run456"
-         )
-         
-         assert res["success"] is False
-         assert "Fallo al publicar (HTTP 400)" in res["error"]
-         
-         # Verify WORDPRESS_PAYLOAD_PREVIEW was logged
-         preview_calls = [call for call in mock_log.call_args_list if call[1].get("action") == "WORDPRESS_PAYLOAD_PREVIEW"]
-         assert len(preview_calls) == 1
-         preview_detail = json.loads(preview_calls[0][1]["detail"])
-         assert preview_detail["post_title"] == "Gran Reseña"
-         assert preview_detail["libro"] == "El Nombre de la Rosa"
-         
-         # Verify WORDPRESS_PUBLISH_ERROR was logged with full details
-         error_calls = [call for call in mock_log.call_args_list if call[1].get("action") == "WORDPRESS_PUBLISH_ERROR"]
-         assert len(error_calls) == 1
-         error_detail = json.loads(error_calls[0][1]["detail"])
-         assert error_detail["status_code"] == 400
-         assert error_detail["response_text"] == "ACF fields are invalid"
-         assert "title" in error_detail["payload_keys"]
-         assert "acf" in error_detail["payload_keys"]
+         assert "acf" not in error_detail["payload_keys"]
 
 
 def test_sheet_compaction_report_and_dry_run():
@@ -2971,3 +2914,142 @@ def test_wordpress_post_status_precedence_resolution():
             detail = json.loads(status_logs[0][1]["detail"])
             assert detail["effective_status"] == "draft"
             assert detail["source"] == "default"
+
+
+# --- WORDPRESS ACF TESTS ---
+
+def test_wordpress_build_acf_payload():
+    from app.services.wordpress_publisher import wordpress_publisher
+
+    # Case 1: URL is present
+    review_with_url = {
+        "ISBN": "9781234567890",
+        "URL": "https://ejemplo.com/resena-de-prueba",
+        "Medio de publicación": "El Cultural",
+        "Autor para Web": "Juan Pérez",
+        "Título del libro": "Don Quijote"
+    }
+    payload = wordpress_publisher.build_acf_payload(review_with_url)
+    assert payload["libro"] == ""
+    assert payload["isbn_libro"] == "9781234567890"
+    assert payload["tipo_de_resena"] == "0"
+    assert payload["url"] == "https://ejemplo.com/resena-de-prueba"
+    assert payload["medio"] == "El Cultural"
+    assert payload["autor"] == "Juan Pérez"
+    assert payload["id_resena"] == ""
+
+    # Case 2: URL is empty
+    review_no_url = {
+        "ISBN": "9781234567890",
+        "URL": "",
+        "Medio de publicación": "El Cultural",
+        "Autor para Web": "Juan Pérez"
+    }
+    payload_no_url = wordpress_publisher.build_acf_payload(review_no_url)
+    assert payload_no_url["tipo_de_resena"] == "3"
+    assert payload_no_url["url"] == ""
+
+
+def test_wordpress_publish_review_two_step_acf_success():
+    from app.services.wordpress_publisher import wordpress_publisher
+    from unittest.mock import patch, MagicMock
+    import json
+
+    review = {
+        "ISBN": "9781234567890",
+        "URL": "https://ejemplo.com/resena-de-prueba",
+        "Medio de publicación": "El Cultural",
+        "Autor para Web": "Juan Pérez"
+    }
+    config = {
+        "WORDPRESS_BASE_URL": "https://mi-wordpress.com",
+        "WORDPRESS_USERNAME": "mi-usuario"
+    }
+
+    # Mock response for first post (creation)
+    mock_create_res = MagicMock()
+    mock_create_res.status_code = 201
+    mock_create_res.json.return_value = {"id": 12345, "link": "https://mi-wordpress.com/?p=12345"}
+
+    # Mock response for second post (ACF update)
+    mock_acf_res = MagicMock()
+    mock_acf_res.status_code = 200
+    mock_acf_res.text = '{"success": true}'
+
+    def mock_post_side_effect(url, **kwargs):
+        if "/wp-json/wp/v2/posts/12345" in url:
+            assert "json" in kwargs
+            assert kwargs["json"]["acf"]["isbn_libro"] == "9781234567890"
+            assert kwargs["json"]["acf"]["tipo_de_resena"] == "0"
+            return mock_acf_res
+        elif "/wp-json/wp/v2/posts" in url:
+            assert "json" in kwargs
+            # Ensure ACF is NOT in initial creation payload
+            assert "acf" not in kwargs["json"]
+            return mock_create_res
+        raise ValueError(f"Unexpected url: {url}")
+
+    with patch("httpx.Client.post", side_effect=mock_post_side_effect), \
+         patch("app.config.settings.WORDPRESS_APPLICATION_PASSWORD", "password123"), \
+         patch("app.services.logger_service.logger_service.log") as mock_logger:
+
+        result = wordpress_publisher.publish_review(review, config, dry_run=False, sheet_id="sheet123", run_id="run123")
+        assert result["success"] is True
+        assert result["wordpress_id"] == "12345"
+        assert result["wordpress_url"] == "https://mi-wordpress.com/?p=12345"
+
+        # Check logs
+        attempt_calls = [c for c in mock_logger.call_args_list if c[1].get("action") == "WORDPRESS_ACF_UPDATE_ATTEMPT"]
+        success_calls = [c for c in mock_logger.call_args_list if c[1].get("action") == "WORDPRESS_ACF_UPDATE_SUCCESS"]
+        assert len(attempt_calls) == 1
+        assert len(success_calls) == 1
+
+
+def test_wordpress_publish_review_two_step_acf_failure():
+    from app.services.wordpress_publisher import wordpress_publisher
+    from unittest.mock import patch, MagicMock
+    import json
+
+    review = {
+        "ISBN": "9781234567890",
+        "URL": "https://ejemplo.com/resena-de-prueba",
+        "Medio de publicación": "El Cultural",
+        "Autor para Web": "Juan Pérez"
+    }
+    config = {
+        "WORDPRESS_BASE_URL": "https://mi-wordpress.com",
+        "WORDPRESS_USERNAME": "mi-usuario"
+    }
+
+    # Mock response for first post (creation)
+    mock_create_res = MagicMock()
+    mock_create_res.status_code = 201
+    mock_create_res.json.return_value = {"id": 12345, "link": "https://mi-wordpress.com/?p=12345"}
+
+    # Mock response for second post (ACF update failure)
+    mock_acf_res = MagicMock()
+    mock_acf_res.status_code = 400
+    mock_acf_res.text = '{"error": "invalid field"}'
+
+    def mock_post_side_effect(url, **kwargs):
+        if "/wp-json/wp/v2/posts/12345" in url:
+            return mock_acf_res
+        elif "/wp-json/wp/v2/posts" in url:
+            return mock_create_res
+        raise ValueError(f"Unexpected url: {url}")
+
+    with patch("httpx.Client.post", side_effect=mock_post_side_effect), \
+         patch("app.config.settings.WORDPRESS_APPLICATION_PASSWORD", "password123"), \
+         patch("app.services.logger_service.logger_service.log") as mock_logger:
+
+        result = wordpress_publisher.publish_review(review, config, dry_run=False, sheet_id="sheet123", run_id="run123")
+        assert result["success"] is False
+        assert result["wordpress_id"] == "12345"
+        assert "falló la actualización de campos ACF" in result["error"]
+
+        # Check logs
+        attempt_calls = [c for c in mock_logger.call_args_list if c[1].get("action") == "WORDPRESS_ACF_UPDATE_ATTEMPT"]
+        error_calls = [c for c in mock_logger.call_args_list if c[1].get("action") == "WORDPRESS_ACF_UPDATE_ERROR"]
+        assert len(attempt_calls) == 1
+        assert len(error_calls) == 1
+

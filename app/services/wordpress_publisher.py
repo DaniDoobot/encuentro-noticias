@@ -191,6 +191,21 @@ class WordPressPublisher:
             "warnings": warnings
         }
 
+    def build_acf_payload(self, review: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Builds the ACF payload for the custom fields of the review.
+        """
+        url = str(review.get("URL") or "").strip()
+        return {
+            "libro": "",
+            "isbn_libro": str(review.get("ISBN") or "").strip(),
+            "tipo_de_resena": "0" if url else "3",
+            "url": url,
+            "medio": str(review.get("Medio de publicación") or "").strip(),
+            "autor": str(review.get("Autor para Web") or "").strip(),
+            "id_resena": "",
+        }
+
     def build_post_payload(self, review: Dict[str, Any], config: Dict[str, Any], status: str = "draft") -> Dict[str, Any]:
         """
         Builds the REST API payload for a WordPress post from the review data.
@@ -205,30 +220,15 @@ class WordPressPublisher:
 
         title_libro = clean_val(review.get("Título del libro"))
         title_web = clean_val(review.get("Título para Web"))
-        isbn_libro = clean_val(review.get("ISBN"))
-        original_url = clean_val(review.get("URL"))
-        medium = clean_val(review.get("Medio de publicación"))
-        author_web = clean_val(review.get("Autor para Web"))
         summary = clean_val(review.get("Resumen"))
 
         # wordpress title: priority is title_web (Título para Web), fallback to title_libro (Título del libro)
         post_title = (title_web or title_libro or "Reseña").strip()
 
-        # Custom ACF / Meta fields
-        acf_fields = {
-            "libro": title_libro,
-            "isbn_libro": isbn_libro,
-            "url": original_url,
-            "medio": medium,
-            "autor": author_web
-        }
-
         payload = {
             "title": post_title,
             "content": summary,
-            "status": status,
-            "acf": acf_fields,
-            "meta": acf_fields
+            "status": status
         }
 
         cat_id = config.get("WORDPRESS_DEFAULT_CATEGORY_ID") or settings.WORDPRESS_DEFAULT_CATEGORY_ID
@@ -262,6 +262,28 @@ class WordPressPublisher:
         app_password = settings.WORDPRESS_APPLICATION_PASSWORD
         post_type = config.get("WORDPRESS_POST_TYPE") or settings.WORDPRESS_POST_TYPE or "posts"
 
+        # Check required fields
+        missing_fields = []
+        if not clean_val(review.get("ISBN")):
+            missing_fields.append("ISBN")
+        if not clean_val(review.get("URL")):
+            missing_fields.append("URL")
+        if not clean_val(review.get("Autor para Web")):
+            missing_fields.append("Autor para Web")
+        if not clean_val(review.get("Medio de publicación")):
+            missing_fields.append("Medio de publicación")
+
+        if missing_fields:
+            logger_service.log(
+                level="WARNING",
+                action="WORDPRESS_ACF_REQUIRED_FIELDS_WARNING",
+                message=f"Faltan campos requeridos para ACF: {', '.join(missing_fields)}",
+                isbn=isbn,
+                detail=json.dumps({"missing_fields": missing_fields, "review": review}, ensure_ascii=False),
+                sheet_id=sheet_id,
+                run_id=run_id
+            )
+
         # Determine status and its source
         env_status = settings.WORDPRESS_POST_STATUS
         config_status = config.get("WORDPRESS_POST_STATUS")
@@ -280,7 +302,6 @@ class WordPressPublisher:
             effective_status = "draft"
             source = "default"
             
-        import json
         logger_service.log(
             level="INFO",
             action="WORDPRESS_PUBLISH_STATUS_INFO",
@@ -297,16 +318,18 @@ class WordPressPublisher:
         )
 
         payload = self.build_post_payload(review, config, status=effective_status)
+        acf_payload = self.build_acf_payload(review)
 
         # Log payload preview
         preview_data = {
             "post_title": payload.get("title", ""),
             "content_length": len(payload.get("content", "")),
-            "libro": payload.get("acf", {}).get("libro", ""),
-            "isbn_libro": payload.get("acf", {}).get("isbn_libro", ""),
-            "url": payload.get("acf", {}).get("url", ""),
-            "medio": payload.get("acf", {}).get("medio", ""),
-            "autor": payload.get("acf", {}).get("autor", ""),
+            "libro": review.get("Título del libro", ""),
+            "isbn_libro": acf_payload.get("isbn_libro", ""),
+            "url": acf_payload.get("url", ""),
+            "medio": acf_payload.get("medio", ""),
+            "autor": acf_payload.get("autor", ""),
+            "acf": acf_payload,
             "autor_libro_ignored": clean_val(review.get("Autor del libro"))
         }
         
@@ -325,6 +348,33 @@ class WordPressPublisher:
             sim_id = random.randint(1000, 9999)
             base_url = url_cfg or "https://ejemplo.wordpress.com"
             base_url = base_url.rstrip("/")
+            
+            # Simulate attempt and success logs
+            logger_service.log(
+                level="INFO",
+                action="WORDPRESS_ACF_UPDATE_ATTEMPT",
+                message="Intento de actualizar campos ACF en WordPress (Simulado)",
+                isbn=isbn,
+                detail=json.dumps({
+                    "post_id": str(sim_id),
+                    "isbn_libro": acf_payload.get("isbn_libro"),
+                    "url": acf_payload.get("url"),
+                    "medio": acf_payload.get("medio"),
+                    "autor": acf_payload.get("autor"),
+                    "tipo_de_resena": acf_payload.get("tipo_de_resena")
+                }, ensure_ascii=False),
+                sheet_id=sheet_id,
+                run_id=run_id
+            )
+            logger_service.log(
+                level="INFO",
+                action="WORDPRESS_ACF_UPDATE_SUCCESS",
+                message="Campos ACF actualizados correctamente en WordPress (Simulado)",
+                isbn=isbn,
+                sheet_id=sheet_id,
+                run_id=run_id
+            )
+            
             return {
                 "success": True,
                 "wordpress_id": str(sim_id),
@@ -347,12 +397,82 @@ class WordPressPublisher:
                     res_data = res.json()
                     wp_id = str(res_data.get("id"))
                     wp_url = res_data.get("link")
-                    return {
-                        "success": True,
-                        "wordpress_id": wp_id,
-                        "wordpress_url": wp_url,
-                        "message": "Publicación exitosa."
-                    }
+                    
+                    # Second call: update ACF fields
+                    logger_service.log(
+                        level="INFO",
+                        action="WORDPRESS_ACF_UPDATE_ATTEMPT",
+                        message=f"Intento de actualizar campos ACF para post ID {wp_id}",
+                        isbn=isbn,
+                        detail=json.dumps({
+                            "post_id": wp_id,
+                            "isbn_libro": acf_payload.get("isbn_libro"),
+                            "url": acf_payload.get("url"),
+                            "medio": acf_payload.get("medio"),
+                            "autor": acf_payload.get("autor"),
+                            "tipo_de_resena": acf_payload.get("tipo_de_resena")
+                        }, ensure_ascii=False),
+                        sheet_id=sheet_id,
+                        run_id=run_id
+                    )
+                    
+                    try:
+                        acf_update_body = {"acf": acf_payload}
+                        acf_res = client.post(f"{url}/wp-json/wp/v2/{post_type}/{wp_id}", json=acf_update_body, auth=auth)
+                        if acf_res.status_code in (200, 201):
+                            logger_service.log(
+                                level="INFO",
+                                action="WORDPRESS_ACF_UPDATE_SUCCESS",
+                                message=f"Campos ACF actualizados exitosamente para post ID {wp_id}",
+                                isbn=isbn,
+                                detail=acf_res.text,
+                                sheet_id=sheet_id,
+                                run_id=run_id
+                            )
+                            return {
+                                "success": True,
+                                "wordpress_id": wp_id,
+                                "wordpress_url": wp_url,
+                                "message": "Publicación exitosa."
+                            }
+                        else:
+                            # Log ACF failure
+                            logger_service.log(
+                                level="ERROR",
+                                action="WORDPRESS_ACF_UPDATE_ERROR",
+                                message=f"Error al actualizar campos ACF para post ID {wp_id} (HTTP {acf_res.status_code})",
+                                isbn=isbn,
+                                detail=json.dumps({
+                                    "status_code": acf_res.status_code,
+                                    "response_text": acf_res.text,
+                                    "post_id": wp_id,
+                                    "acf_payload": acf_payload
+                                }, ensure_ascii=False),
+                                sheet_id=sheet_id,
+                                run_id=run_id
+                            )
+                            return {
+                                "success": False,
+                                "wordpress_id": wp_id,
+                                "wordpress_url": wp_url,
+                                "error": f"El post se creó (ID {wp_id}) pero falló la actualización de campos ACF (HTTP {acf_res.status_code}): {acf_res.text}"
+                            }
+                    except Exception as e_acf:
+                        logger_service.log(
+                            level="ERROR",
+                            action="WORDPRESS_ACF_UPDATE_ERROR",
+                            message=f"Excepción al actualizar campos ACF para post ID {wp_id}: {str(e_acf)}",
+                            isbn=isbn,
+                            detail=str(e_acf),
+                            sheet_id=sheet_id,
+                            run_id=run_id
+                        )
+                        return {
+                            "success": False,
+                            "wordpress_id": wp_id,
+                            "wordpress_url": wp_url,
+                            "error": f"El post se creó (ID {wp_id}) pero ocurrió un error al actualizar campos ACF: {str(e_acf)}"
+                        }
                 else:
                     # Log failure details as requested: WORDPRESS_PUBLISH_ERROR
                     error_detail = {
