@@ -163,10 +163,10 @@ class RunService:
     def execute_run(self, run_id: str, limit_books: int, dry_run: bool, date_min: Optional[str] = None, date_max: Optional[str] = None, include_unknown_dates: Optional[bool] = None):
         sheet_id = settings.GOOGLE_SHEET_ID
         log_prefix = "[PRUEBA] " if dry_run else ""
-        self._add_in_memory_log(run_id, "INFO", "RUN_START", f"{log_prefix}Iniciando run global (limit_books={limit_books}, dry_run={dry_run})")
-        logger_service.log("INFO", "RUN_START", f"{log_prefix}Iniciando ejecución {run_id}", sheet_id=sheet_id, run_id=run_id)
-
+        
         try:
+            self._add_in_memory_log(run_id, "INFO", "RUN_START", f"{log_prefix}Iniciando run global (limit_books={limit_books}, dry_run={dry_run})")
+            logger_service.log("INFO", "RUN_START", f"{log_prefix}Iniciando ejecución {run_id}", sheet_id=sheet_id, run_id=run_id)
             current_runs[run_id]["status"] = "running"
             search_service.reset_blocked_providers()
             
@@ -199,16 +199,16 @@ class RunService:
             books_skipped_missing_title = books_result["books_skipped_missing_title"]
             books_skipped_not_included = books_result.get("books_skipped_not_included", 0)
             books_skipped_blocked_status = books_result.get("books_skipped_blocked_status", 0)
-
+ 
             current_runs[run_id]["books_rows_read"] = books_rows_read
             current_runs[run_id]["books_pending_detected"] = books_pending_detected
             current_runs[run_id]["books_skipped_missing_title"] = books_skipped_missing_title
             current_runs[run_id]["books_skipped_not_included"] = books_skipped_not_included
             current_runs[run_id]["books_skipped_blocked_status"] = books_skipped_blocked_status
-
+ 
             total_books = len(pending_books)
             current_runs[run_id]["books_total"] = total_books
-
+ 
             detection_summary = (
                 f"Detección libros: leidas={books_rows_read}, "
                 f"incluidas_en_busqueda={books_pending_detected}, "
@@ -218,14 +218,14 @@ class RunService:
             )
             logger_service.log("INFO", "BOOKS_DETECTION_SUMMARY", f"{log_prefix}{detection_summary}", sheet_id=sheet_id, run_id=run_id)
             self._add_in_memory_log(run_id, "INFO", "BOOKS_DETECTION_SUMMARY", detection_summary)
-
+ 
             if books_skipped_missing_title > 0:
                 logger_service.log(
                     "WARNING", "BOOK_ROW_SKIPPED_MISSING_TITLE",
                     f"{log_prefix}{books_skipped_missing_title} fila(s) omitidas por falta de título.",
                     sheet_id=sheet_id, run_id=run_id
                 )
-
+ 
             if total_books == 0:
                 msg = "No se encontraron libros con estado 'pendiente' en la pestaña 'Libros'."
                 current_runs[run_id]["status"] = "completed"
@@ -233,7 +233,7 @@ class RunService:
                 self._add_in_memory_log(run_id, "INFO", "RUN_END", msg)
                 logger_service.log("INFO", "RUN_END", msg, sheet_id=sheet_id, run_id=run_id)
                 return
-
+ 
             # 3. Load all existing reviews for deduplication
             self._add_in_memory_log(run_id, "INFO", "DEDUPE_INIT", "Cargando reseñas existentes para deduplicación...")
             existing_reviews = sheets_service.get_all_reviews(sheet_id)
@@ -360,10 +360,24 @@ class RunService:
                 logger_service.log("INFO", "RUN_END", f"Ejecución global cancelada por el usuario.", sheet_id=sheet_id, run_id=run_id)
 
         except Exception as e:
-            current_runs[run_id]["status"] = "failed"
-            current_runs[run_id]["message"] = f"Error en la ejecución: {str(e)}"
+            if run_id in current_runs:
+                current_runs[run_id]["status"] = "failed"
+                current_runs[run_id]["message"] = f"Error en la ejecución: {str(e)}"
             self._add_in_memory_log(run_id, "ERROR", "RUN_ERROR", str(e))
-            logger_service.log("ERROR", "RUN_ERROR", f"Error general: {e}", sheet_id=sheet_id, run_id=run_id)
+            try:
+                logger_service.log("ERROR", "RUN_ERROR", f"Error general: {e}", sheet_id=sheet_id, run_id=run_id)
+            except Exception:
+                pass
+        finally:
+            if run_id in current_runs:
+                status = current_runs[run_id].get("status")
+                if status in ("running", "pending"):
+                    current_runs[run_id]["status"] = "completed"
+                    current_runs[run_id]["message"] = f"Ejecución completada. Procesados {current_runs[run_id].get('books_processed', 0)} libros."
+            try:
+                logger_service.flush_log_batch(sheet_id, run_id)
+            except Exception:
+                pass
 
     def execute_single_book(self, run_id: str, isbn: str, dry_run: bool, date_min: Optional[str] = None, date_max: Optional[str] = None, include_unknown_dates: Optional[bool] = None):
         sheet_id = settings.GOOGLE_SHEET_ID
@@ -471,10 +485,24 @@ class RunService:
             logger_service.log("INFO", "RUN_END", f"Ejecución individual para ISBN {isbn} completada.", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
 
         except Exception as e:
-            current_runs[run_id]["status"] = "failed"
-            current_runs[run_id]["message"] = f"Error en la ejecución: {str(e)}"
+            if run_id in current_runs:
+                current_runs[run_id]["status"] = "failed"
+                current_runs[run_id]["message"] = f"Error en la ejecución: {str(e)}"
             self._add_in_memory_log(run_id, "ERROR", "RUN_ERROR", str(e))
-            logger_service.log("ERROR", "RUN_ERROR", f"Error general: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+            try:
+                logger_service.log("ERROR", "RUN_ERROR", f"Error general: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+            except Exception:
+                pass
+        finally:
+            if run_id in current_runs:
+                status = current_runs[run_id].get("status")
+                if status in ("running", "pending"):
+                    current_runs[run_id]["status"] = "completed"
+                    current_runs[run_id]["message"] = f"Ejecución completada para ISBN {isbn}."
+            try:
+                logger_service.flush_log_batch(sheet_id, run_id)
+            except Exception:
+                pass
 
     def _process_book(
         self,
@@ -525,6 +553,7 @@ class RunService:
 
         author_str = f" por {author}" if author.strip() else ""
         logger_service.log("INFO", "BOOK_PROCESS_START", f"{log_prefix}Procesando libro: '{title}'{author_str}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+        logger_service.log("INFO", "BOOK_SEARCH_STARTED", f"{log_prefix}Búsqueda iniciada para el libro: '{title}' por '{author}' (ISBN: {isbn})", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
         self._add_in_memory_log(run_id, "INFO", "BOOK_PROCESS_START", f"{log_prefix}Procesando: '{title}'{author_str}", isbn=isbn)
 
         # Clear tracked providers used for this book
@@ -626,6 +655,50 @@ class RunService:
         }, ensure_ascii=False)
         logger_service.log("INFO", "BOOK_QUERIES_BUILT", f"{log_prefix}Queries generadas para la búsqueda", isbn=isbn, detail=queries_built_detail, sheet_id=sheet_id, run_id=run_id)
         self._add_in_memory_log(run_id, "INFO", "BOOK_QUERIES_BUILT", f"{log_prefix}Queries generadas para la búsqueda", isbn=isbn, detail=queries_built_detail)
+
+        queries_dict_len = len(prioritarias) + len(apoyo) + len(dominios) + len(broad_queries)
+        logger_service.log("INFO", "BOOK_SEARCH_QUERIES_GENERATED", f"{log_prefix}Queries generadas para la búsqueda del libro '{title}' (ISBN: {isbn}): total={queries_dict_len} (Prioritarias={len(prioritarias)}, Apoyo={len(apoyo)}, Dominios={len(dominios)}, Broad={len(broad_queries)})", isbn=isbn, detail=queries_built_detail, sheet_id=sheet_id, run_id=run_id)
+
+        # Log individual prioritarias
+        isbn_clean = isbn.replace('"', "").replace('-', "").strip()
+        for q in prioritarias:
+            strategy = "título_exacto_más_autor"
+            if isbn_clean and isbn_clean in q:
+                strategy = "isbn"
+            elif "lavransdatter" in q.lower() or "lavransdotter" in q.lower():
+                strategy = "variante_internacional"
+            elif "alexei" in q.lower() or "navalny" in q.lower():
+                strategy = "variante_ortográfica_autor"
+            elif query_builder.clean_punctuation(title) in q:
+                strategy = "título_sin_puntuación_más_autor"
+            elif query_builder.remove_volume(title) in q:
+                strategy = "título_sin_volumen_más_autor"
+            elif "," in title and title.split(",", 1)[0].strip() in q:
+                strategy = "primer_segmento_título_más_autor"
+            logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query prioritaria generada ({strategy}): {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": strategy, "level": "prioritaria"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
+
+        # Log individual apoyo
+        for q in apoyo:
+            strategy = "título_apoyo_más_autor"
+            if "lavransdatter" in q.lower() or "lavransdotter" in q.lower():
+                strategy = "variante_internacional"
+            elif "alexei" in q.lower() or "navalny" in q.lower():
+                strategy = "variante_ortográfica_autor"
+            elif query_builder.clean_punctuation(title) in q:
+                strategy = "título_sin_puntuación_más_autor"
+            elif query_builder.remove_volume(title) in q:
+                strategy = "título_sin_volumen_más_autor"
+            elif "," in title and title.split(",", 1)[0].strip() in q:
+                strategy = "primer_segmento_título_más_autor"
+            logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query apoyo generada ({strategy}): {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": strategy, "level": "apoyo"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
+
+        # Log individual dominios
+        for q in dominios:
+            logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query dominio generada: {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": "restricción_dominio", "level": "dominios"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
+
+        # Log individual broad
+        for q in broad_queries:
+            logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query broad generada: {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": "búsqueda_amplia_sin_autor", "level": "broad"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
 
         self._add_in_memory_log(
             run_id, "INFO", "QUERIES_GENERATED", 
@@ -1176,6 +1249,23 @@ class RunService:
             sheet_id=sheet_id,
             run_id=run_id
         )
+        logger_service.log(
+            level="INFO",
+            action="BOOK_CANDIDATES_FOUND",
+            message=f"{log_prefix}Candidatos encontrados para el libro '{title}' (ISBN: {isbn}): total={len(candidate_urls)} (Index={domain_index_candidates_count}, News={google_news_candidates_count}, Interna={internal_search_candidates_count})",
+            isbn=isbn,
+            detail=json.dumps({
+                "isbn": isbn,
+                "title": title,
+                "author": author,
+                "total_candidates": len(candidate_urls),
+                "domain_index_candidates": domain_index_candidates_count,
+                "google_news_candidates": google_news_candidates_count,
+                "internal_search_candidates": internal_search_candidates_count
+            }, ensure_ascii=False),
+            sheet_id=sheet_id,
+            run_id=run_id
+        )
         self._add_in_memory_log(
             run_id=run_id,
             level="INFO",
@@ -1705,6 +1795,67 @@ class RunService:
             if "books_details" not in current_runs[run_id]:
                 current_runs[run_id]["books_details"] = []
             current_runs[run_id]["books_details"].append(book_detail)
+
+        # Action: BOOK_VALID_REVIEWS_FOUND
+        logger_service.log(
+            level="INFO",
+            action="BOOK_VALID_REVIEWS_FOUND",
+            message=f"{log_prefix}Reseñas válidas encontradas para el libro '{title}' (ISBN: {isbn}): {reviews_added}",
+            isbn=isbn,
+            detail=json.dumps({
+                "isbn": isbn,
+                "title": title,
+                "author": author,
+                "reviews_found": reviews_added,
+                "candidates_evaluated": len(candidate_urls),
+                "descartes": descartes_added
+            }, ensure_ascii=False),
+            sheet_id=sheet_id,
+            run_id=run_id
+        )
+
+        motivo_no_validas = ""
+        if reviews_added == 0:
+            if len(candidate_urls) == 0:
+                motivo_no_validas = "No se encontraron candidatos durante la búsqueda."
+            elif extracted_ok_count == 0:
+                motivo_no_validas = "Fallo al extraer el contenido de los candidatos (errores de descarga/acceso)."
+            elif openai_accepted_count == 0:
+                motivo_no_validas = "Todos los candidatos evaluados fueron rechazados por la IA (no relevantes/baja puntuación)."
+            else:
+                motivo_no_validas = "Reseñas descartadas por filtros de fecha o duplicados."
+
+        book_summary_info = {
+            "isbn": isbn,
+            "title": title,
+            "author": author,
+            "candidates_found": len(candidate_urls),
+            "candidates_evaluated": len(candidate_urls),
+            "valid_reviews": reviews_added,
+            "descartes": descartes_added,
+            "reason_no_valid": motivo_no_validas
+        }
+
+        if final_status in ("completado", "sin_resultados"):
+            logger_service.log(
+                level="INFO",
+                action="BOOK_COMPLETED",
+                message=f"{log_prefix}Procesamiento completado para '{title}' (ISBN: {isbn}). Válidas: {reviews_added}, Descartes: {descartes_added}. {motivo_no_validas}",
+                isbn=isbn,
+                detail=json.dumps(book_summary_info, ensure_ascii=False),
+                sheet_id=sheet_id,
+                run_id=run_id
+            )
+        else:
+            logger_service.log(
+                level="ERROR",
+                action="BOOK_FAILED",
+                message=f"{log_prefix}Procesamiento fallido para '{title}' (ISBN: {isbn}). {observation}",
+                isbn=isbn,
+                detail=json.dumps(book_summary_info, ensure_ascii=False),
+                sheet_id=sheet_id,
+                run_id=run_id
+            )
 
         logger_service.log("INFO", "BOOK_PROCESS_END", f"{log_prefix}Libro finalizado con estado '{final_status}'. {observation}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
         self._add_in_memory_log(run_id, "INFO", "BOOK_PROCESS_END", f"{log_prefix}Finalizado: {final_status}. {observation}", isbn=isbn)

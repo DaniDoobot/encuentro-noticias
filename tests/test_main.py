@@ -1995,17 +1995,19 @@ def test_sheet_compaction_report_and_dry_run():
         assert tab_log["last_data_row"] == 4
         assert tab_log["last_data_col"] == 7 
         
-        assert tab_log["recommended_rows"] == 500
+        from app.config import settings
+        expected_rec_rows = max(500, settings.LOG_MAX_ROWS + 200)
+        assert tab_log["recommended_rows"] == expected_rec_rows
         assert tab_log["recommended_cols"] == 7
         
-        assert tab_log["excess_rows"] == 500
+        assert tab_log["excess_rows"] == max(1000 - expected_rec_rows, 0)
         assert tab_log["excess_cols"] == 93
         
         # 2. dry_run = True
         comp_dry = sheets_service.compact_sheet("sheet123", dry_run=True)
         assert comp_dry["success"] is True
         assert comp_dry["dry_run"] is True
-        assert comp_dry["total_cells_freed"] == (1000 * 100) - (500 * 7)
+        assert comp_dry["total_cells_freed"] == (1000 * 100) - (min(1000, expected_rec_rows) * 7)
         assert len(comp_dry["compacted_tabs"]) == 1
         assert comp_dry["compacted_tabs"][0]["title"] == "Logs"
         assert not mock_ws.resize.called
@@ -2015,7 +2017,7 @@ def test_sheet_compaction_report_and_dry_run():
         assert comp_real["success"] is True
         assert comp_real["dry_run"] is False
         assert mock_ws.resize.called
-        mock_ws.resize.assert_called_with(rows=500, cols=7)
+        mock_ws.resize.assert_called_with(rows=min(1000, expected_rec_rows), cols=7)
 
 
 def test_logs_write_fixed_range_and_col_a_next_row():
@@ -3439,3 +3441,131 @@ def test_summary_cleaning_fallback_when_completely_filtered():
          assert "relevancia" not in summary.lower()
 
 
+
+
+
+def test_query_builder_comma_volume_and_negative_filters():
+    from app.services.query_builder import query_builder
+
+    # Case 1: "Cristina, hija de Lavrans Vol. I" / "Sigrid Undset"
+    title_1 = "Cristina, hija de Lavrans Vol. I"
+    author_1 = "Sigrid Undset"
+    isbn_1 = "9781234567890"
+
+    queries_dict = query_builder.build_queries(title_1, author_1, isbn_1)
+    prioritarias = queries_dict["prioritarias"]
+    apoyo = queries_dict["apoyo"]
+    broad = query_builder.build_broad_queries(title_1, author_1, isbn_1)
+
+    all_queries = prioritarias + apoyo + broad
+
+    # Assertions for expected queries
+    # Exact title + author
+    assert any('"Cristina, hija de Lavrans Vol. I" "Sigrid Undset"' in q for q in prioritarias)
+    # Volume removed
+    assert any('"Cristina, hija de Lavrans" "Sigrid Undset"' in q for q in prioritarias)
+    # Punctuation cleaned
+    assert any('"Cristina hija de Lavrans Vol I" "Sigrid Undset"' in q for q in prioritarias)
+    # First part before comma
+    assert any('"Cristina" "Sigrid Undset"' in q for q in prioritarias)
+    # International variants (Condition 5)
+    assert any('"Kristin Lavransdatter" "Sigrid Undset"' in q for q in prioritarias)
+    assert any('"Kristin Lavransdotter" "Sigrid Undset"' in q for q in prioritarias)
+
+    # Negative assertions: make sure none of these bad queries are produced as standalone queries (Condition 5)
+    for q in all_queries:
+        # Strip quotes to check exact unquoted query matches
+        q_strip = q.strip('"').lower()
+        assert q_strip != "hija cristina,"
+        assert q_strip != "hija cristina"
+        assert q_strip != "cristina hija"
+        assert q_strip != "la nueva hija de cristina"
+        assert q_strip != "la nueva hija de cristina,"
+
+    # Case 2: "No tengo miedo, no lo tengáis vosotros" / "Alexéi Navalni"
+    title_2 = "No tengo miedo, no lo tengáis vosotros"
+    author_2 = "Alexéi Navalni"
+    queries_dict_2 = query_builder.build_queries(title_2, author_2, isbn_1)
+    
+    # Assert spelling variations of author (Condition 6)
+    all_q_2 = queries_dict_2["prioritarias"] + queries_dict_2["apoyo"]
+    
+    assert any("Alexéi Navalni" in q for q in all_q_2)
+    assert any("Alexei Navalny" in q for q in all_q_2)
+    assert any("Alexei Navalni" in q for q in all_q_2)
+    assert any("Alexéi Navalny" in q for q in all_q_2)
+
+
+def test_add_log_batch_grid_resize_and_retry():
+    from app.services.sheets_service import sheets_service
+    from unittest.mock import patch, MagicMock
+    import gspread
+
+    mock_client = MagicMock()
+    mock_spreadsheet = MagicMock()
+    mock_worksheet = MagicMock()
+
+    mock_client.open_by_key.return_value = mock_spreadsheet
+    mock_spreadsheet.worksheet.return_value = mock_worksheet
+    
+    # Simulate a worksheet with current row count = 20
+    # Writing 10 rows from next_row = 15 -> end_row = 24.
+    # Since 24 > 20, it must call worksheet.resize(rows=24+100, cols=7)
+    mock_worksheet.row_count = 20
+    mock_worksheet.col_values.return_value = ["A"] * 14 # next_row is 15
+    
+    with patch.object(sheets_service, "get_client", return_value=mock_client), \
+         patch.object(sheets_service, "ensure_logs_sheet_structure") as mock_ensure:
+         
+         # Case A: Success with resize
+         log_rows = [["2026-07-02 10:00:00", "INFO", "ACTION", "ISBN", "Msg", "Detail", "run123"]] * 10
+         res = sheets_service.add_log_batch("sheet_id", log_rows)
+         
+         assert res["success"] is True
+         assert "A15:G24" in res["range"]
+         mock_worksheet.resize.assert_called_with(rows=124, cols=7)
+         mock_worksheet.update.assert_called_with("A15:G24", log_rows)
+
+         # Case B: Exceeds grid limits error retry (Condition 2)
+         mock_response = MagicMock()
+         mock_response.json.return_value = {"error": {"message": "exceeds grid limits", "code": 400}}
+         mock_response.text = "exceeds grid limits"
+         mock_response.status_code = 400
+         api_error = gspread.exceptions.APIError(mock_response)
+         
+         mock_worksheet.update.side_effect = [
+             api_error,
+             None # Second try succeeds
+         ]
+         mock_worksheet.row_count = 20
+         mock_worksheet.col_values.return_value = ["A"] * 14
+         
+         res_retry = sheets_service.add_log_batch("sheet_id", log_rows)
+         assert res_retry["success"] is True
+         # Resize should have been called again on retry
+         assert mock_worksheet.resize.call_count >= 2
+
+
+def test_run_completion_robustness():
+    from app.services.run_service import run_service, current_runs
+    from unittest.mock import patch, MagicMock
+
+    run_id = "test_run_completion_robustness_id"
+    current_runs[run_id] = {
+        "status": "pending",
+        "books_processed": 0,
+        "books_completed": 0,
+        "books_no_results": 0,
+        "books_failed": 0,
+        "logs": []
+    }
+
+    # Simulate get_config_dict throwing an error to test finally robust state completion
+    with patch("app.services.sheets_service.sheets_service.get_config_dict", side_effect=Exception("API Error")), \
+         patch("app.services.logger_service.logger_service.log"):
+         
+         run_service.execute_run(run_id, limit_books=1, dry_run=False)
+         
+         # The run must have been updated to failed status and not remain running/pending (Condition 9, 10)
+         assert current_runs[run_id]["status"] == "failed"
+         assert "API Error" in current_runs[run_id]["message"]

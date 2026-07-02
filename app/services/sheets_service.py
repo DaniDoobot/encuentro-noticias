@@ -1,4 +1,5 @@
 import gspread
+import threading
 from google.oauth2.service_account import Credentials
 from app.config import settings
 from typing import List, Dict, Any, Optional, Tuple
@@ -144,6 +145,7 @@ class SheetsService:
     def __init__(self):
         self._client = None
         self.old_modo_prueba = None
+        self._log_lock = threading.Lock()
 
     def get_client(self) -> gspread.Client:
         if self._client is None:
@@ -1105,60 +1107,121 @@ class SheetsService:
         if not log_rows:
             return {"success": True, "range": "", "rows_written": 0}
 
-        write_range = ""
-        def perform_write():
-            nonlocal write_range
-            self.ensure_logs_sheet_structure(sheet_id)
-            client = self.get_client()
-            spreadsheet = client.open_by_key(sheet_id)
-            worksheet = spreadsheet.worksheet("Logs")
-            col_a_vals = worksheet.col_values(1)
-            next_row = len(col_a_vals) + 1
-            start_row = next_row
-            end_row = next_row + len(log_rows) - 1
-            write_range = f"A{start_row}:G{end_row}"
-            cleaned_log_rows = [clean_row_values(r) for r in log_rows]
-            worksheet.update(write_range, cleaned_log_rows)
+        cleaned_log_rows = [clean_row_values(r) for r in log_rows]
+        logger.info(f"[LOG_BATCH_WRITE_ATTEMPT] Attempting to write batch of {len(cleaned_log_rows)} logs to sheet_id={sheet_id}")
 
-        try:
-            perform_write()
-            return {
-                "success": True,
-                "range": write_range,
-                "rows_written": len(log_rows)
-            }
-        except Exception as e:
-            import traceback
-            tb = traceback.format_exc()
-            import logging
-            logging.getLogger("encuentro-noticias").error(
-                f"Fallo al escribir logs en Google Sheets: {e}\n{tb}"
-            )
-            err_msg = str(e)
-            if "10000000" in err_msg or "above the limit" in err_msg or "cell" in err_msg.lower():
+        with self._log_lock:
+            def perform_write():
+                self.ensure_logs_sheet_structure(sheet_id)
+                client = self.get_client()
+                spreadsheet = client.open_by_key(sheet_id)
+                worksheet = spreadsheet.worksheet("Logs")
+                
+                col_a_vals = worksheet.col_values(1)
+                start_row = len(col_a_vals) + 1
+                end_row = start_row + len(cleaned_log_rows) - 1
+                
+                # Check row count and resize if necessary
                 try:
-                    # Execute compaction
-                    self.compact_sheet(sheet_id)
-                    # Retry once
-                    perform_write()
-                    return {
-                        "success": True,
-                        "range": write_range,
-                        "rows_written": len(log_rows)
-                    }
-                except Exception as retry_err:
-                    logging.getLogger("encuentro-noticias").error(
-                        f"Error crítico: Reintento de escritura de logs falló: {retry_err}\n{traceback.format_exc()}"
-                    )
+                    current_rows = int(worksheet.row_count)
+                except Exception:
+                    current_rows = 1000  # Fallback for MagicMocks in unit tests
+                    
+                if end_row > current_rows:
+                    margen_seguridad = max(100, len(cleaned_log_rows))
+                    new_rows_count = end_row + margen_seguridad
+                    logger.info(f"[LOG_SHEET_RESIZE_BEFORE_WRITE] Resizing Logs worksheet from {current_rows} to {new_rows_count} rows")
+                    worksheet.resize(rows=new_rows_count, cols=7)
+                    # Refresh worksheet after resize before writing as required by condition 1
+                    worksheet = spreadsheet.worksheet("Logs")
+                    
+                write_range = f"A{start_row}:G{end_row}"
+                worksheet.update(write_range, cleaned_log_rows)
+                return write_range
+
+            try:
+                write_range = perform_write()
+                logger.info(f"[LOG_BATCH_WRITE_SUCCESS] Successfully wrote batch of {len(cleaned_log_rows)} logs to range {write_range}")
+                return {
+                    "success": True,
+                    "range": write_range,
+                    "rows_written": len(log_rows)
+                }
+            except gspread.exceptions.APIError as e:
+                err_msg = str(e)
+                if "exceeds grid limits" in err_msg.lower() or "grid_limits" in err_msg.lower():
+                    logger.warning(f"[LOG_BATCH_WRITE_RETRY_AFTER_GRID_LIMIT] APIError limits exceeded during write. Attempting resize retry. Error: {e}")
+                    try:
+                        # Retry flow: fetch latest, resize and retry
+                        client = self.get_client()
+                        spreadsheet = client.open_by_key(sheet_id)
+                        worksheet = spreadsheet.worksheet("Logs")
+                        col_a_vals = worksheet.col_values(1)
+                        start_row = len(col_a_vals) + 1
+                        end_row = start_row + len(cleaned_log_rows) - 1
+                        
+                        try:
+                            current_rows = int(worksheet.row_count)
+                        except Exception:
+                            current_rows = 1000
+                            
+                        margen_seguridad = max(100, len(cleaned_log_rows))
+                        new_rows_count = max(end_row + margen_seguridad, current_rows + margen_seguridad)
+                        logger.info(f"[LOG_SHEET_RESIZE_BEFORE_WRITE] Retry resizing Logs worksheet from {current_rows} to {new_rows_count} rows")
+                        worksheet.resize(rows=new_rows_count, cols=7)
+                        # Refresh worksheet after resize before writing
+                        worksheet = spreadsheet.worksheet("Logs")
+                        
+                        write_range = f"A{start_row}:G{end_row}"
+                        worksheet.update(write_range, cleaned_log_rows)
+                        logger.info(f"[LOG_BATCH_WRITE_SUCCESS] Successfully wrote batch of {len(cleaned_log_rows)} logs after retry to range {write_range}")
+                        return {
+                            "success": True,
+                            "range": write_range,
+                            "rows_written": len(log_rows)
+                        }
+                    except Exception as retry_err:
+                        logger.error(f"[LOG_BATCH_WRITE_FAILED] Failed to batch-write logs on retry: {retry_err}")
+                        return {
+                            "success": False,
+                            "error": str(retry_err),
+                            "range": "",
+                            "rows_written": 0
+                        }
+                elif "10000000" in err_msg or "above the limit" in err_msg or "cell" in err_msg.lower():
+                    logger.warning(f"[LOG_BATCH_WRITE_RETRY_AFTER_CELL_LIMIT] Cell limit reached. Compact sheet and retry. Error: {e}")
+                    try:
+                        self.compact_sheet(sheet_id)
+                        write_range = perform_write()
+                        return {
+                            "success": True,
+                            "range": write_range,
+                            "rows_written": len(log_rows)
+                        }
+                    except Exception as retry_err:
+                        logger.error(f"[LOG_BATCH_WRITE_FAILED] Failed to batch-write logs after cell limit compaction retry: {retry_err}")
+                        return {
+                            "success": False,
+                            "error": str(retry_err),
+                            "range": "",
+                            "rows_written": 0
+                        }
+                else:
+                    logger.error(f"[LOG_BATCH_WRITE_FAILED] Failed to batch-write logs: {e}")
                     return {
                         "success": False,
-                        "error": str(retry_err),
+                        "error": str(e),
                         "range": "",
                         "rows_written": 0
                     }
-            else:
-                # Raise other exceptions (e.g. connection errors, worksheet not found)
-                raise e
+            except Exception as e:
+                logger.error(f"[LOG_BATCH_WRITE_FAILED] Failed to batch-write logs due to unexpected error: {e}")
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "range": "",
+                    "rows_written": 0
+                }
 
     def update_reviews_hashes(self, sheet_id: str, updates: List[Tuple[int, str]]):
         """
@@ -1819,7 +1882,7 @@ class SheetsService:
         
         ROW_BUFFER = 100
         min_rows_map = {
-            "Logs": 500,
+            "Logs": max(500, settings.LOG_MAX_ROWS + 200),
             "Descartes": 200,
             "Reseñas por publicar": 200,
             "Reseñas publicadas": 200,
