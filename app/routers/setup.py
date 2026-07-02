@@ -69,6 +69,30 @@ def debug_google_news(q: str):
         )
 
 
+@router.get("/setup/inspect-panel-prueba")
+def inspect_panel_prueba():
+    """
+    Temporary endpoint to inspect 'Panel prueba' structure.
+    """
+    try:
+        client = sheets_service.get_client()
+        sheet_id = settings.GOOGLE_SHEET_ID
+        spreadsheet = client.open_by_key(sheet_id)
+        worksheet = spreadsheet.worksheet("Panel prueba")
+        rows = worksheet.get_all_values()
+        return {
+            "success": True,
+            "rows": rows[:40]
+        }
+    except Exception as e:
+        import traceback
+        return {
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
+
 @router.post("/setup/sheet-size-report")
 def get_sheet_size_report(sheet_id: str = None):
     """
