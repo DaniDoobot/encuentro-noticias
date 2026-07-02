@@ -19,7 +19,10 @@ def ensure_sheet():
             success=True,
             message="Google Sheet verified and prepared successfully.",
             sheet_id=res["sheet_id"],
-            sheet_url=res["sheet_url"]
+            sheet_url=res["sheet_url"],
+            panel_recreated=res.get("panel_recreated"),
+            modo_prueba_added=res.get("modo_prueba_added"),
+            modo_prueba_value=res.get("modo_prueba_value")
         )
     except Exception as e:
         raise HTTPException(
@@ -67,31 +70,6 @@ def debug_google_news(q: str):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Google News debug query failed: {str(e)}"
         )
-
-
-@router.get("/setup/inspect-panel-prueba")
-def inspect_panel_prueba():
-    """
-    Temporary endpoint to inspect 'Panel prueba' structure.
-    """
-    try:
-        client = sheets_service.get_client()
-        sheet_id = settings.GOOGLE_SHEET_ID
-        spreadsheet = client.open_by_key(sheet_id)
-        worksheet = spreadsheet.worksheet("Panel prueba")
-        rows = worksheet.get_all_values()
-        return {
-            "success": True,
-            "rows": rows[:40]
-        }
-    except Exception as e:
-        import traceback
-        return {
-            "success": False,
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }
-
 
 @router.post("/setup/sheet-size-report")
 def get_sheet_size_report(sheet_id: str = None):

@@ -2,15 +2,15 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Encuentro Noticias')
     .addItem('Lanzar búsqueda', 'launchSearch')
-    .addItem('Consultar estado', 'checkRunStatus')
+    .addItem('Consultar estado búsqueda', 'checkRunStatus')
     .addItem('Cancelar búsqueda', 'cancelSearch')
     .addSeparator()
     .addItem('Publicar reseñas', 'publishReviews')
-    .addItem('Consultar publicación', 'checkPublishStatus')
+    .addItem('Consultar estado publicación', 'checkPublishStatus')
     .addItem('Cancelar publicación', 'cancelPublish')
     .addSeparator()
     .addItem('Indexar fuentes', 'indexSources')
-    .addItem('Consultar indexación', 'checkIndexStatus')
+    .addItem('Consultar estado indexación', 'checkIndexStatus')
     .addSeparator()
     .addItem('Borrar logs', 'cleanupLogs')
     .addItem('Borrar descartes', 'cleanupDescartes')
@@ -58,32 +58,88 @@ function formatDateValue_(value) {
 }
 
 /**
+ * Traduce el estado técnico a texto amigable para el usuario.
+ */
+function getFriendlyStatus_(status, defaultProgressText) {
+  if (!status) return "";
+  var s = status.toLowerCase();
+  if (s === "pending") return "Pendiente";
+  if (s === "running") return defaultProgressText || "Procesando...";
+  if (s === "completed") return "Completado";
+  if (s === "failed") return "Error";
+  if (s === "cancelled" || s === "canceled") return "Cancelado";
+  return status;
+}
+
+/**
+ * Obtiene de forma segura la hoja 'Panel'.
+ */
+function getPanelSheet_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Panel");
+  if (!sheet) {
+    throw new Error("No existe la pestaña Panel.");
+  }
+  return sheet;
+}
+
+/**
+ * Helper centralizado para escribir estado y progreso en la pestaña Panel.
+ */
+function setPanelStatus_(estado, id, mensaje, resumen) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var panelSheet = getPanelSheet_();
+  var now = Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss");
+
+  if (estado !== null && estado !== undefined) {
+    panelSheet.getRange("F4").setValue(estado);
+  }
+  if (id !== null && id !== undefined) {
+    panelSheet.getRange("F5").setValue(id);
+  }
+  panelSheet.getRange("F6").setValue(now);
+  if (mensaje !== null && mensaje !== undefined) {
+    panelSheet.getRange("F7").setValue(mensaje);
+  }
+  if (resumen !== null && resumen !== undefined) {
+    panelSheet.getRange("B11").setValue(resumen);
+  }
+}
+
+/**
  * Lanza una búsqueda de noticias/reseñas desde el panel leyendo la configuración.
  */
 function launchSearch() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var panelSheet = ss.getSheetByName("Panel");
-  if (!panelSheet) {
-    SpreadsheetApp.getUi().alert("Error: No se encontró la pestaña 'Panel'. Ejecute primero el endpoint /setup/ensure-sheet.");
+  var panelSheet;
+  try {
+    panelSheet = getPanelSheet_();
+  } catch (err) {
+    SpreadsheetApp.getUi().alert("Error: " + err.message);
     return;
   }
   
   // Leer inputs del Panel
-  var dateMinRaw = panelSheet.getRange("B3").getValue();
-  var dateMaxRaw = panelSheet.getRange("B4").getValue();
+  var dateMinRaw = panelSheet.getRange("C4").getValue();
+  var dateMaxRaw = panelSheet.getRange("C5").getValue();
   var dateMin = formatDateValue_(dateMinRaw);
   var dateMax = formatDateValue_(dateMaxRaw);
   
-  var maxBooksRaw = panelSheet.getRange("B5").getValue();
-  var dryRun = panelSheet.getRange("B6").getValue();
-  var includeUnknown = panelSheet.getRange("B7").getValue();
+  var maxBooksRaw = panelSheet.getRange("C6").getValue();
+  var includeUnknown = panelSheet.getRange("C7").getValue();
+  
+  // MODO_PRUEBA se lee desde la pestaña Config
+  var dryRun = getConfigValue("MODO_PRUEBA");
   
   // Normalizar booleanos en caso de que sean strings
   if (typeof dryRun === "string") {
-    dryRun = dryRun.toUpperCase() === "TRUE";
+    dryRun = dryRun.toUpperCase() === "TRUE" || dryRun.toUpperCase() === "VERDADERO" || dryRun === "1";
+  } else {
+    dryRun = dryRun === true;
   }
   if (typeof includeUnknown === "string") {
-    includeUnknown = includeUnknown.toUpperCase() === "TRUE";
+    includeUnknown = includeUnknown.toUpperCase() === "TRUE" || includeUnknown.toUpperCase() === "VERDADERO" || includeUnknown === "1";
+  } else {
+    includeUnknown = includeUnknown !== false;
   }
   
   // Validar formato de fechas
@@ -113,13 +169,13 @@ function launchSearch() {
   
   // Construir payload esperado por el backend
   var payload = {
-    "dry_run": dryRun !== false,
+    "dry_run": dryRun,
     "date_min": dateMin || null,
     "date_max": dateMax || null,
-    "include_unknown_dates": includeUnknown !== false
+    "include_unknown_dates": includeUnknown
   };
   
-  // Solo enviar limit_books si B5 no está vacío o nulo
+  // Solo enviar limit_books si C6 no está vacío o nulo
   if (maxBooksRaw !== "" && maxBooksRaw !== null && maxBooksRaw !== undefined) {
     var num = Number(maxBooksRaw);
     if (!isNaN(num) && num > 0) {
@@ -142,7 +198,8 @@ function launchSearch() {
   };
   
   try {
-    panelSheet.getRange("B8").setValue("Iniciando...");
+    setPanelStatus_("Procesando...", null, "Iniciando búsqueda...", "Iniciando búsqueda...");
+    
     var response = UrlFetchApp.fetch(backendUrl + "/runs", options);
     var resCode = response.getResponseCode();
     var resText = response.getContentText();
@@ -151,38 +208,41 @@ function launchSearch() {
       var data = JSON.parse(resText);
       var runId = data.run_id || data.id || "";
       
-      panelSheet.getRange("B8").setValue("running");
-      panelSheet.getRange("B9").setValue(runId);
-      panelSheet.getRange("B10").setValue(Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss"));
-      panelSheet.getRange("B11").setValue("Búsqueda iniciada correctamente.");
+      PropertiesService.getScriptProperties().setProperty("LAST_SEARCH_RUN_ID", runId);
+      
+      setPanelStatus_("Procesando...", runId, "Búsqueda iniciada correctamente.", "Ejecución activa: búsqueda en segundo plano");
       
       SpreadsheetApp.getUi().alert("Búsqueda iniciada correctamente.\nBúsqueda ID: " + runId + "\nPuede refrescar el estado usando el botón 'Consultar estado'.");
     } else {
-      panelSheet.getRange("B8").setValue("error");
-      panelSheet.getRange("B11").setValue("HTTP " + resCode + ": " + resText);
+      setPanelStatus_("Error", "", "HTTP " + resCode + ": " + resText, "Error al iniciar búsqueda.");
       SpreadsheetApp.getUi().alert("Error en el backend (HTTP " + resCode + "):\n" + resText);
     }
   } catch (e) {
-    panelSheet.getRange("B8").setValue("error");
-    panelSheet.getRange("B11").setValue(e.toString());
+    setPanelStatus_("Error", "", e.toString(), "Error de conexión.");
     SpreadsheetApp.getUi().alert("Error de conexión:\n" + e.toString());
   }
 }
 
 /**
- * Consulta el estado de la última búsqueda indicada en B9 y actualiza el panel.
+ * Consulta el estado de la última búsqueda indicada en PropertiesService o F5.
  */
 function checkRunStatus() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var panelSheet = ss.getSheetByName("Panel");
-  if (!panelSheet) {
-    SpreadsheetApp.getUi().alert("Error: No se encontró la pestaña 'Panel'.");
+  var panelSheet;
+  try {
+    panelSheet = getPanelSheet_();
+  } catch (err) {
+    SpreadsheetApp.getUi().alert("Error: " + err.message);
     return;
   }
   
-  var runId = panelSheet.getRange("B9").getValue().toString().trim();
+  var runId = PropertiesService.getScriptProperties().getProperty("LAST_SEARCH_RUN_ID");
+  var cellVal = panelSheet.getRange("F5").getValue().toString().trim();
+  if (cellVal.indexOf("run_") === 0) {
+    runId = cellVal;
+  }
+  
   if (!runId) {
-    SpreadsheetApp.getUi().alert("Error: No hay ningún 'Última búsqueda_id' registrado en la celda B9.");
+    SpreadsheetApp.getUi().alert("Error: No hay ningún 'Última búsqueda_id' registrado.");
     return;
   }
   
@@ -221,11 +281,22 @@ function checkRunStatus() {
       var total = data.books_total || 0;
       var msg = data.message || "";
       
-      panelSheet.getRange("B8").setValue(status);
-      panelSheet.getRange("B10").setValue(Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss"));
-      panelSheet.getRange("B11").setValue("Procesados: " + processed + "/" + total + " — " + msg);
+      var friendlyStatus = getFriendlyStatus_(status, "Procesando...");
+      var progressMsg = "Procesados: " + processed + "/" + total + " — " + msg;
       
-      SpreadsheetApp.getActiveSpreadsheet().toast("Estado de la búsqueda " + runId + " actualizado: " + status, "Encuentro Noticias", 5);
+      if (friendlyStatus === "Cancelado") {
+        setPanelStatus_("Cancelado", null, "Proceso cancelado por el usuario.", "Ejecución cancelada");
+      } else {
+        var resumenTxt = "Ejecución activa: búsqueda en segundo plano";
+        if (friendlyStatus === "Completado") {
+          resumenTxt = "Ejecución completada con éxito";
+        } else if (friendlyStatus === "Error") {
+          resumenTxt = "Ejecución fallida con error";
+        }
+        setPanelStatus_(friendlyStatus, null, progressMsg, resumenTxt);
+      }
+      
+      SpreadsheetApp.getActiveSpreadsheet().toast("Estado de la búsqueda " + runId + " actualizado: " + friendlyStatus, "Encuentro Noticias", 5);
     } else {
       SpreadsheetApp.getUi().alert("Error al consultar estado (HTTP " + resCode + "):\n" + resText);
     }
@@ -238,16 +309,19 @@ function checkRunStatus() {
  * Publica las reseñas marcadas en la pestaña 'Reseñas por publicar' hacia WordPress.
  */
 function publishReviews() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var panelSheet = ss.getSheetByName("Panel");
-  if (!panelSheet) {
-    SpreadsheetApp.getUi().alert("Error: No se encontró la pestaña 'Panel'.");
+  var panelSheet;
+  try {
+    panelSheet = getPanelSheet_();
+  } catch (err) {
+    SpreadsheetApp.getUi().alert("Error: " + err.message);
     return;
   }
   
-  var dryRun = panelSheet.getRange("B6").getValue();
+  var dryRun = getConfigValue("MODO_PRUEBA");
   if (typeof dryRun === "string") {
-    dryRun = dryRun.toUpperCase() === "TRUE";
+    dryRun = dryRun.toUpperCase() === "TRUE" || dryRun.toUpperCase() === "VERDADERO" || dryRun === "1";
+  } else {
+    dryRun = dryRun === true;
   }
   
   var backendUrl = getConfigValue("BACKEND_BASE_URL");
@@ -264,7 +338,7 @@ function publishReviews() {
   
   // Usar background = true para ejecución asíncrona
   var payload = {
-    "dry_run": dryRun !== false,
+    "dry_run": dryRun,
     "background": true
   };
   
@@ -283,9 +357,7 @@ function publishReviews() {
   };
   
   try {
-    panelSheet.getRange("B8").setValue("Publicando...");
-    panelSheet.getRange("B10").setValue(Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss"));
-    panelSheet.getRange("B11").setValue("Iniciando publicación...");
+    setPanelStatus_("Procesando...", null, "Iniciando publicación...", "Iniciando publicación...");
     
     var response = UrlFetchApp.fetch(backendUrl + "/publish/reviews", options);
     var resCode = response.getResponseCode();
@@ -297,43 +369,39 @@ function publishReviews() {
       
       if (publishId) {
         PropertiesService.getScriptProperties().setProperty("LAST_PUBLISH_ID", publishId);
-        panelSheet.getRange("B9").setValue(publishId); // Guardar ID en B9 para check status
-        panelSheet.getRange("B11").setValue("Proceso de publicación iniciado en segundo plano. ID: " + publishId);
+        setPanelStatus_("Procesando...", publishId, "Proceso de publicación iniciado en segundo plano.", "Ejecución activa: publicación en segundo plano");
         SpreadsheetApp.getUi().alert("Publicación iniciada correctamente.\nPublicación ID: " + publishId + "\nPuede refrescar el estado usando 'Consultar publicación'.");
       } else {
         var pubCount = data.published_count || 0;
         var errCount = data.errors_count || 0;
-        var skipCount = data.unselected_count || 0;
         
-        panelSheet.getRange("B8").setValue("completed");
-        panelSheet.getRange("B11").setValue("Publicadas: " + pubCount + ", Errores: " + errCount);
+        setPanelStatus_("Completado", null, "Publicadas: " + pubCount + ", Errores: " + errCount, "Ejecución completada con éxito");
         SpreadsheetApp.getUi().alert("Publicación completada (síncrona).\n- Publicadas: " + pubCount + "\n- Errores: " + errCount);
       }
     } else {
-      panelSheet.getRange("B8").setValue("error");
-      panelSheet.getRange("B11").setValue("HTTP " + resCode + ": " + resText);
+      setPanelStatus_("Error", "", "HTTP " + resCode + ": " + resText, "Error al publicar.");
       SpreadsheetApp.getUi().alert("Error al publicar (HTTP " + resCode + "):\n" + resText);
     }
   } catch (e) {
-    panelSheet.getRange("B8").setValue("error");
-    panelSheet.getRange("B11").setValue(e.toString());
+    setPanelStatus_("Error", "", e.toString(), "Error de conexión.");
     SpreadsheetApp.getUi().alert("Error de conexión:\n" + e.toString());
   }
 }
 
 /**
- * Consulta el estado de publicación en segundo plano usando LAST_PUBLISH_ID o el ID de B9.
+ * Consulta el estado de publicación en segundo plano usando LAST_PUBLISH_ID o el ID de F5.
  */
 function checkPublishStatus() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var panelSheet = ss.getSheetByName("Panel");
-  if (!panelSheet) {
-    SpreadsheetApp.getUi().alert("Error: No se encontró la pestaña 'Panel'.");
+  var panelSheet;
+  try {
+    panelSheet = getPanelSheet_();
+  } catch (err) {
+    SpreadsheetApp.getUi().alert("Error: " + err.message);
     return;
   }
   
   var publishId = PropertiesService.getScriptProperties().getProperty("LAST_PUBLISH_ID");
-  var cellVal = panelSheet.getRange("B9").getValue().toString().trim();
+  var cellVal = panelSheet.getRange("F5").getValue().toString().trim();
   if (cellVal.indexOf("pub_") === 0) {
     publishId = cellVal;
   }
@@ -378,16 +446,25 @@ function checkPublishStatus() {
       var errCount = data.errors_count || 0;
       var msg = data.message || "";
       
-      panelSheet.getRange("B8").setValue(status);
-      panelSheet.getRange("B10").setValue(Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss"));
-      
+      var friendlyStatus = getFriendlyStatus_(status, "Procesando...");
       var progressMsg = "Publicadas: " + pubCount + ", Errores: " + errCount + " — " + msg;
-      panelSheet.getRange("B11").setValue(progressMsg);
       
-      if (status === "completed" || status === "cancelled" || status === "failed") {
-        SpreadsheetApp.getUi().alert("Proceso de publicación finalizado.\nEstado: " + status + "\n" + progressMsg);
+      if (friendlyStatus === "Cancelado") {
+        setPanelStatus_("Cancelado", null, "Proceso cancelado por el usuario.", "Ejecución cancelada");
       } else {
-        SpreadsheetApp.getActiveSpreadsheet().toast("Estado de publicación: " + status + " (" + pubCount + " publicadas)", "Info", 4);
+        var resumenTxt = "Ejecución activa: publicación en segundo plano";
+        if (friendlyStatus === "Completado") {
+          resumenTxt = "Ejecución completada con éxito";
+        } else if (friendlyStatus === "Error") {
+          resumenTxt = "Ejecución fallida con error";
+        }
+        setPanelStatus_(friendlyStatus, null, progressMsg, resumenTxt);
+      }
+      
+      if (friendlyStatus === "Completado" || friendlyStatus === "Cancelado" || friendlyStatus === "Error") {
+        SpreadsheetApp.getUi().alert("Proceso de publicación finalizado.\nEstado: " + friendlyStatus + "\n" + progressMsg);
+      } else {
+        SpreadsheetApp.getActiveSpreadsheet().toast("Estado de publicación: " + friendlyStatus + " (" + pubCount + " publicadas)", "Info", 4);
       }
     } else {
       SpreadsheetApp.getUi().alert("Error al consultar publicación (HTTP " + resCode + "):\n" + resText);
@@ -398,19 +475,25 @@ function checkPublishStatus() {
 }
 
 /**
- * Envía una solicitud al backend para cancelar la búsqueda activa en B9.
+ * Envía una solicitud al backend para cancelar la búsqueda activa en PropertiesService o F5.
  */
 function cancelSearch() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var panelSheet = ss.getSheetByName("Panel");
-  if (!panelSheet) {
-    SpreadsheetApp.getUi().alert("Error: No se encontró la pestaña 'Panel'.");
+  var panelSheet;
+  try {
+    panelSheet = getPanelSheet_();
+  } catch (err) {
+    SpreadsheetApp.getUi().alert("Error: " + err.message);
     return;
   }
   
-  var runId = panelSheet.getRange("B9").getValue().toString().trim();
-  if (!runId || runId.indexOf("run_") !== 0) {
-    SpreadsheetApp.getUi().alert("Error: No hay ningún ID de búsqueda activo en B9 para cancelar.");
+  var runId = PropertiesService.getScriptProperties().getProperty("LAST_SEARCH_RUN_ID");
+  var cellVal = panelSheet.getRange("F5").getValue().toString().trim();
+  if (cellVal.indexOf("run_") === 0) {
+    runId = cellVal;
+  }
+  
+  if (!runId) {
+    SpreadsheetApp.getUi().alert("Error: No hay ningún ID de búsqueda activo para cancelar.");
     return;
   }
   
@@ -443,9 +526,7 @@ function cancelSearch() {
     var resText = response.getContentText();
     
     if (resCode >= 200 && resCode < 300) {
-      panelSheet.getRange("B8").setValue("cancelled");
-      panelSheet.getRange("B10").setValue(Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss"));
-      panelSheet.getRange("B11").setValue("Búsqueda cancelada.");
+      setPanelStatus_("Cancelado", null, "Proceso cancelado por el usuario.", "Ejecución cancelada por el usuario.");
       SpreadsheetApp.getUi().alert("La solicitud de cancelación de la búsqueda fue enviada al backend correctamente.");
     } else {
       SpreadsheetApp.getUi().alert("Error al cancelar la búsqueda (HTTP " + resCode + "):\n" + resText);
@@ -459,15 +540,16 @@ function cancelSearch() {
  * Envía una solicitud al backend para cancelar la publicación activa.
  */
 function cancelPublish() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var panelSheet = ss.getSheetByName("Panel");
-  if (!panelSheet) {
-    SpreadsheetApp.getUi().alert("Error: No se encontró la pestaña 'Panel'.");
+  var panelSheet;
+  try {
+    panelSheet = getPanelSheet_();
+  } catch (err) {
+    SpreadsheetApp.getUi().alert("Error: " + err.message);
     return;
   }
   
   var publishId = PropertiesService.getScriptProperties().getProperty("LAST_PUBLISH_ID");
-  var cellVal = panelSheet.getRange("B9").getValue().toString().trim();
+  var cellVal = panelSheet.getRange("F5").getValue().toString().trim();
   if (cellVal.indexOf("pub_") === 0) {
     publishId = cellVal;
   }
@@ -506,9 +588,7 @@ function cancelPublish() {
     var resText = response.getContentText();
     
     if (resCode >= 200 && resCode < 300) {
-      panelSheet.getRange("B8").setValue("cancelled");
-      panelSheet.getRange("B10").setValue(Utilities.formatDate(new Date(), ss.getSpreadsheetTimeZone(), "yyyy-MM-dd HH:mm:ss"));
-      panelSheet.getRange("B11").setValue("Publicación cancelada.");
+      setPanelStatus_("Cancelado", null, "Proceso cancelado por el usuario.", "Publicación cancelada por el usuario.");
       SpreadsheetApp.getUi().alert("La solicitud de cancelación de la publicación fue enviada al backend correctamente.");
     } else {
       SpreadsheetApp.getUi().alert("Error al cancelar la publicación (HTTP " + resCode + "):\n" + resText);
@@ -522,10 +602,11 @@ function cancelPublish() {
  * Inicia la indexación manual de fuentes en segundo plano.
  */
 function indexSources() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var panelSheet = ss.getSheetByName("Panel");
-  if (!panelSheet) {
-    SpreadsheetApp.getUi().alert("Error: No se encontró la pestaña 'Panel'.");
+  var panelSheet;
+  try {
+    panelSheet = getPanelSheet_();
+  } catch (err) {
+    SpreadsheetApp.getUi().alert("Error: " + err.message);
     return;
   }
   
@@ -561,7 +642,8 @@ function indexSources() {
   };
   
   try {
-    panelSheet.getRange("B8").setValue("Indexando...");
+    setPanelStatus_("Procesando...", null, "Iniciando indexación...", "Iniciando indexación...");
+    
     var response = UrlFetchApp.fetch(backendUrl + "/sources/index", options);
     var resCode = response.getResponseCode();
     var resText = response.getContentText();
@@ -570,38 +652,41 @@ function indexSources() {
       var data = JSON.parse(resText);
       var jobId = data.job_id || "";
       
-      panelSheet.getRange("B8").setValue("running");
-      panelSheet.getRange("B9").setValue(jobId);
-      panelSheet.getRange("B10").setValue(new Date().toISOString().replace("T", " ").slice(0, 19));
-      panelSheet.getRange("B11").setValue("Indexación de fuentes iniciada en segundo plano.");
+      PropertiesService.getScriptProperties().setProperty("LAST_INDEX_JOB_ID", jobId);
+      
+      setPanelStatus_("Procesando...", jobId, "Indexación de fuentes iniciada en segundo plano.", "Ejecución activa: indexación en segundo plano");
       
       SpreadsheetApp.getUi().alert("Indexación iniciada correctamente.\nJob ID: " + jobId + "\nPuede consultar el progreso con 'Consultar indexación'.");
     } else {
-      panelSheet.getRange("B8").setValue("error");
-      panelSheet.getRange("B11").setValue("HTTP " + resCode + ": " + resText);
+      setPanelStatus_("Error", "", "HTTP " + resCode + ": " + resText, "Error al iniciar indexación.");
       SpreadsheetApp.getUi().alert("Error al indexar (HTTP " + resCode + "):\n" + resText);
     }
   } catch (e) {
-    panelSheet.getRange("B8").setValue("error");
-    panelSheet.getRange("B11").setValue(e.toString());
+    setPanelStatus_("Error", "", e.toString(), "Error de conexión.");
     SpreadsheetApp.getUi().alert("Error de conexión:\n" + e.toString());
   }
 }
 
 /**
- * Consulta el estado del job de indexación de fuentes indicado en B9.
+ * Consulta el estado del job de indexación de fuentes indicado en PropertiesService o F5.
  */
 function checkIndexStatus() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var panelSheet = ss.getSheetByName("Panel");
-  if (!panelSheet) {
-    SpreadsheetApp.getUi().alert("Error: No se encontró la pestaña 'Panel'.");
+  var panelSheet;
+  try {
+    panelSheet = getPanelSheet_();
+  } catch (err) {
+    SpreadsheetApp.getUi().alert("Error: " + err.message);
     return;
   }
   
-  var jobId = panelSheet.getRange("B9").getValue().toString().trim();
-  if (!jobId || jobId.indexOf("idx_") !== 0) {
-    SpreadsheetApp.getUi().alert("Error: No hay ningún Job ID de indexación (empieza por idx_) en la celda B9.");
+  var jobId = PropertiesService.getScriptProperties().getProperty("LAST_INDEX_JOB_ID");
+  var cellVal = panelSheet.getRange("F5").getValue().toString().trim();
+  if (cellVal.indexOf("idx_") === 0) {
+    jobId = cellVal;
+  }
+  
+  if (!jobId) {
+    SpreadsheetApp.getUi().alert("Error: No hay ningún Job ID de indexación registrado.");
     return;
   }
   
@@ -641,11 +726,22 @@ function checkIndexStatus() {
       var urls = data.urls_found || 0;
       var errs = (data.errors || []).length;
       
-      panelSheet.getRange("B8").setValue(status);
-      panelSheet.getRange("B10").setValue(new Date().toISOString().replace("T", " ").slice(0, 19));
-      panelSheet.getRange("B11").setValue("Dominios: " + comp + "/" + total + " — URLs encontradas: " + urls + " — Errores: " + errs);
+      var friendlyStatus = getFriendlyStatus_(status, "Indexando...");
+      var progressMsg = "Dominios: " + comp + "/" + total + " — URLs encontradas: " + urls + " — Errores: " + errs;
       
-      SpreadsheetApp.getActiveSpreadsheet().toast("Estado de indexación actualizado: " + status, "Encuentro Noticias", 5);
+      if (friendlyStatus === "Cancelado") {
+        setPanelStatus_("Cancelado", null, "Proceso cancelado por el usuario.", "Ejecución cancelada");
+      } else {
+        var resumenTxt = "Ejecución activa: indexación en segundo plano";
+        if (friendlyStatus === "Completado") {
+          resumenTxt = "Ejecución completada con éxito";
+        } else if (friendlyStatus === "Error") {
+          resumenTxt = "Ejecución fallida con error";
+        }
+        setPanelStatus_(friendlyStatus, null, progressMsg, resumenTxt);
+      }
+      
+      SpreadsheetApp.getActiveSpreadsheet().toast("Estado de indexación actualizado: " + friendlyStatus, "Encuentro Noticias", 5);
     } else {
       SpreadsheetApp.getUi().alert("Error al consultar indexación (HTTP " + resCode + "):\n" + resText);
     }

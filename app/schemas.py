@@ -9,6 +9,9 @@ class SetupResponse(BaseModel):
     message: str
     sheet_id: str
     sheet_url: str
+    panel_recreated: Optional[bool] = None
+    modo_prueba_added: Optional[bool] = None
+    modo_prueba_value: Optional[str] = None
 
 class RunConfig(BaseModel):
     limit_books: Optional[int] = Field(default=None, description="Max books to process in this run")

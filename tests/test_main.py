@@ -2447,6 +2447,7 @@ def test_ensure_sheet_creates_simplified_headers_and_migrates_existing():
             self.resized = None
             self.cleared = False
             self.updates = []
+            self.col_count = len(values[0]) if values else 10
             
         def row_values(self, idx):
             if self.values:
@@ -2672,6 +2673,27 @@ def test_panel_b5_numeric_validation():
         mock_spreadsheet.worksheets.return_value = list(worksheets.values())
         mock_spreadsheet.worksheet.side_effect = get_ws
 
+        def mock_add(title, rows=None, cols=None):
+            new_ws = GenericFakeWS(title, [])
+            if title == "Panel":
+                new_ws.id = 42
+            worksheets[title] = new_ws
+            return new_ws
+        mock_spreadsheet.add_worksheet.side_effect = mock_add
+
+        def mock_dup(source_id, insert_sheet_index, new_sheet_name):
+            new_ws = GenericFakeWS(new_sheet_name, [])
+            if new_sheet_name == "Panel":
+                new_ws.id = 42
+            worksheets[new_sheet_name] = new_ws
+            return new_ws
+        mock_spreadsheet.duplicate_sheet.side_effect = mock_dup
+
+        def mock_del(ws):
+            if ws.title in worksheets:
+                del worksheets[ws.title]
+        mock_spreadsheet.del_worksheet.side_effect = mock_del
+
         def capture_batch(payload):
             captured_requests.extend(payload.get("requests", []))
         mock_spreadsheet.batch_update.side_effect = capture_batch
@@ -2679,45 +2701,40 @@ def test_panel_b5_numeric_validation():
 
         sheets_service.ensure_sheet("some_sheet_id")
 
-    # Extraer todas las reglas setDataValidation aplicadas al Panel (sheetId=42)
+    # Extraer todas las reglas setDataValidation aplicadas al Panel (sheetId=42) que tengan 'rule'
     panel_validations = [
         r["setDataValidation"]
         for r in captured_requests
-        if "setDataValidation" in r and r["setDataValidation"]["range"]["sheetId"] == panel_ws.id
+        if "setDataValidation" in r and r["setDataValidation"]["range"]["sheetId"] == panel_ws.id and "rule" in r["setDataValidation"]
     ]
 
-    # Debe haber exactamente 4 validaciones en el Panel: B3:B4 (fecha), B5 (número), B6 (bool), B7 (bool)
-    assert len(panel_validations) == 4, f"Se esperaban 4 validaciones en Panel, se obtuvieron {len(panel_validations)}"
+    # Debe haber exactamente 3 validaciones en el Panel: C4:C5 (fecha), C6 (número), C7 (bool)
+    assert len(panel_validations) == 3, f"Se esperaban 3 validaciones en Panel, se obtuvieron {len(panel_validations)}"
 
-    # B5 (rowIndex 4-5): debe ser NUMBER_BETWEEN, no BOOLEAN
-    b5_val = next(
-        (v for v in panel_validations if v["range"]["startRowIndex"] == 4 and v["range"]["endRowIndex"] == 5),
-        None
-    )
-    assert b5_val is not None, "No se encontró validación para B5 (rowIndex 4)"
-    assert b5_val["rule"]["condition"]["type"] == "NUMBER_BETWEEN", \
-        f"B5 debe tener validación NUMBER_BETWEEN, tiene: {b5_val['rule']['condition']['type']}"
-    values = b5_val["rule"]["condition"]["values"]
-    assert values[0]["userEnteredValue"] == "1"
-    assert values[1]["userEnteredValue"] == "5000"
-
-    # B6 (rowIndex 5-6): debe ser BOOLEAN (Modo prueba)
-    b6_val = next(
+    # C6 (rowIndex 5-6): debe ser NUMBER_BETWEEN, no BOOLEAN
+    c6_val = next(
         (v for v in panel_validations if v["range"]["startRowIndex"] == 5 and v["range"]["endRowIndex"] == 6),
         None
     )
-    assert b6_val is not None, "No se encontró validación para B6 (rowIndex 5)"
-    assert b6_val["rule"]["condition"]["type"] == "BOOLEAN", \
-        f"B6 debe ser BOOLEAN, tiene: {b6_val['rule']['condition']['type']}"
+    assert c6_val is not None, "No se encontró validación para C6 (rowIndex 5)"
+    assert c6_val["range"]["startColumnIndex"] == 2
+    assert c6_val["range"]["endColumnIndex"] == 3
+    assert c6_val["rule"]["condition"]["type"] == "NUMBER_BETWEEN", \
+        f"C6 debe tener validación NUMBER_BETWEEN, tiene: {c6_val['rule']['condition']['type']}"
+    values = c6_val["rule"]["condition"]["values"]
+    assert values[0]["userEnteredValue"] == "1"
+    assert values[1]["userEnteredValue"] == "5000"
 
-    # B7 (rowIndex 6-7): debe ser BOOLEAN (Incluir sin fecha)
-    b7_val = next(
+    # C7 (rowIndex 6-7): debe ser BOOLEAN (Incluir sin fecha)
+    c7_val = next(
         (v for v in panel_validations if v["range"]["startRowIndex"] == 6 and v["range"]["endRowIndex"] == 7),
         None
     )
-    assert b7_val is not None, "No se encontró validación para B7 (rowIndex 6)"
-    assert b7_val["rule"]["condition"]["type"] == "BOOLEAN", \
-        f"B7 debe ser BOOLEAN, tiene: {b7_val['rule']['condition']['type']}"
+    assert c7_val is not None, "No se encontró validación para C7 (rowIndex 6)"
+    assert c7_val["range"]["startColumnIndex"] == 2
+    assert c7_val["range"]["endColumnIndex"] == 3
+    assert c7_val["rule"]["condition"]["type"] == "BOOLEAN", \
+        f"C7 debe ser BOOLEAN, tiene: {c7_val['rule']['condition']['type']}"
 
 
 def test_backend_base_url_in_config_defaults():
@@ -2824,9 +2841,152 @@ def test_clean_sheet_value():
     assert clean_row_values(row) == ["hello", "normal", 123, ""]
 
 
-def test_ensure_sheet_creates_simplified_headers_and_migrates_existing():
-    # Implementation covered by the extensive mock setup above within the test file
-    pass
+def test_ensure_sheet_recreates_panel_on_old_layout():
+    from app.services.sheets_service import sheets_service
+    from unittest.mock import patch, MagicMock
+
+    class MockWorksheet:
+        def __init__(self, title, values):
+            self.title = title
+            self.values = values
+            self.id = hash(title) % 10000
+            self.cleared = False
+            self.updates = []
+            self.col_count = len(values[0]) if values else 10
+            self.row_count = max(len(values), 1000)
+        def get_all_values(self):
+            return self.values
+        def get_all_records(self):
+            records = []
+            if not self.values:
+                return records
+            headers = self.values[0]
+            for row in self.values[1:]:
+                rec = {}
+                for idx, val in enumerate(row):
+                    if idx < len(headers):
+                        rec[headers[idx]] = val
+                records.append(rec)
+            return records
+        def clear(self):
+            self.cleared = True
+            self.values = []
+        def update(self, range_name, values=None, **kwargs):
+            self.updates.append((range_name, values))
+            if range_name == "A1" and values:
+                self.values = values
+        def append_row(self, row, value_input_option=None):
+            self.values.append(row)
+        def row_values(self, idx):
+            return self.values[0] if self.values else []
+        def resize(self, rows=None, cols=None):
+            pass
+
+    old_panel_values = [
+        ["Encuentro Noticias — Panel de control", ""],
+        ["", ""],
+        ["Fecha mínima", "2024-05-15"],
+        ["Fecha máxima", "2026-11-20"],
+        ["Máximo de libros", "45"],
+        ["Modo prueba", "True"],
+        ["Incluir artículos sin fecha", "False"]
+    ]
+
+    mock_panel = MockWorksheet("Panel", old_panel_values)
+    mock_panel_prueba = MockWorksheet("Panel prueba", [])
+    mock_libros = MockWorksheet("Libros", [["¿Incluir en búsqueda?", "ISBN", "Título del libro"]])
+    mock_por_pub = MockWorksheet("Reseñas por publicar", [["¿Publicar?"]])
+    mock_pub = MockWorksheet("Reseñas publicadas", [["Fecha"]])
+    mock_config = MockWorksheet("Config", [["Clave", "Valor", "Descripción"]])
+    mock_fuentes = MockWorksheet("Fuentes", [["Dominio"]])
+    mock_logs = MockWorksheet("Logs", [["Fecha"]])
+    mock_descartes = MockWorksheet("Descartes", [["ISBN"]])
+
+    worksheets = {
+        "Panel": mock_panel,
+        "Panel prueba": mock_panel_prueba,
+        "Libros": mock_libros,
+        "Reseñas por publicar": mock_por_pub,
+        "Reseñas publicadas": mock_pub,
+        "Config": mock_config,
+        "Fuentes": mock_fuentes,
+        "Logs": mock_logs,
+        "Descartes": mock_descartes
+    }
+
+    def get_ws(name):
+        import gspread
+        if name in worksheets:
+            return worksheets[name]
+        raise gspread.exceptions.WorksheetNotFound(name)
+
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client, \
+         patch("app.services.logger_service.logger_service.log"):
+        
+        mock_spreadsheet = MagicMock()
+        mock_spreadsheet.worksheets.return_value = list(worksheets.values())
+        mock_spreadsheet.worksheet.side_effect = get_ws
+        
+        captured_del = []
+        def mock_del(ws):
+            captured_del.append(ws.title)
+            if ws.title in worksheets:
+                del worksheets[ws.title]
+        mock_spreadsheet.del_worksheet.side_effect = mock_del
+
+        captured_add = []
+        def mock_add(title, rows=None, cols=None):
+            captured_add.append(title)
+            new_ws = MockWorksheet(title, [])
+            worksheets[title] = new_ws
+            return new_ws
+        mock_spreadsheet.add_worksheet.side_effect = mock_add
+
+        captured_dup = []
+        def mock_dup(source_id, insert_sheet_index, new_sheet_name):
+            captured_dup.append(new_sheet_name)
+            new_ws = MockWorksheet(new_sheet_name, [])
+            worksheets[new_sheet_name] = new_ws
+            return new_ws
+        mock_spreadsheet.duplicate_sheet.side_effect = mock_dup
+
+        captured_requests = []
+        def mock_batch_update(payload):
+            captured_requests.extend(payload.get("requests", []))
+        mock_spreadsheet.batch_update.side_effect = mock_batch_update
+
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+
+        res = sheets_service.ensure_sheet("some_sheet_id")
+
+        # Assertions
+        assert res["panel_recreated"] is True
+        assert "Panel" in captured_del
+        assert "Panel" in worksheets
+        assert res["modo_prueba_added"] is True
+        assert res["modo_prueba_value"] == "TRUE"
+
+        # Assert config contains MODO_PRUEBA = TRUE
+        config_rows = worksheets["Config"].values
+        config_keys = [r[0] for r in config_rows]
+        assert "MODO_PRUEBA" in config_keys
+        modo_prueba_row = next(r for r in config_rows if r[0] == "MODO_PRUEBA")
+        assert modo_prueba_row[1] == "TRUE"
+
+        # Assert new Panel has the migrated values
+        panel_rows = worksheets["Panel"].values
+        assert panel_rows[3][1] == "Fecha mínima"
+        assert panel_rows[3][2] == "2024-05-15"
+        assert panel_rows[4][1] == "Fecha máxima"
+        assert panel_rows[4][2] == "2026-11-20"
+        assert panel_rows[5][1] == "Máximo de libros"
+        assert panel_rows[5][2] == 45
+        assert panel_rows[6][1] == "Incluir artículos sin fecha"
+        assert panel_rows[6][2] is False
+
+        # Assert data validations: first request clears validation (no 'rule' key)
+        panel_validations = [r["setDataValidation"] for r in captured_requests if "setDataValidation" in r and "rule" in r["setDataValidation"] and r["setDataValidation"]["range"]["sheetId"] == worksheets["Panel"].id]
+        assert len(panel_validations) == 3 # C4:C5 + C6 + C7
 
 
 def test_wordpress_post_status_precedence_resolution():

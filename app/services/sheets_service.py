@@ -107,9 +107,9 @@ def parse_bool(val: Any, default: bool) -> bool:
     s_val = normalize_config_val(val).lower()
     if not s_val:
         return default
-    if s_val in ("true", "1", "yes", "sí", "si"):
+    if s_val in ("true", "1", "yes", "sí", "si", "verdadero"):
         return True
-    if s_val in ("false", "0", "no"):
+    if s_val in ("false", "0", "no", "falso"):
         return False
     return default
 
@@ -143,6 +143,7 @@ SCOPES = [
 class SheetsService:
     def __init__(self):
         self._client = None
+        self.old_modo_prueba = None
 
     def get_client(self) -> gspread.Client:
         if self._client is None:
@@ -158,6 +159,10 @@ class SheetsService:
         Prepares the sheet: creates tabs and writes headers if missing.
         Does not delete existing data.
         """
+        panel_recreated = False
+        modo_prueba_added = False
+        modo_prueba_value = "FALSE"
+
         client = self.get_client()
         try:
             spreadsheet = client.open_by_key(sheet_id)
@@ -286,53 +291,177 @@ class SheetsService:
             logger.error(f"Error ensuring Logs structure during ensure_sheet: {e_logs_struct}")
 
         # Ensure Panel worksheet exists and has the correct layout
-        if "Panel" in existing_sheets:
-            panel_ws = existing_sheets["Panel"]
-        else:
-            panel_ws = spreadsheet.add_worksheet(title="Panel", rows="30", cols="10")
-            created_tabs.append("Panel")
+        is_old_layout = False
+        old_inputs = {
+            "date_min": "2024-01-01",
+            "date_max": "2026-12-31",
+            "limit_books": 10,
+            "include_unknown": True
+        }
 
-        panel_vals = panel_ws.get_all_values()
-        if not panel_vals or len(panel_vals) < 11:
+        if "Panel" in existing_sheets:
+            try:
+                panel_ws = existing_sheets["Panel"]
+                panel_vals = panel_ws.get_all_values()
+                if panel_vals:
+                    # Detect old panel signals
+                    has_old_header = False
+                    if len(panel_vals) >= 1 and len(panel_vals[0]) >= 1:
+                        if "Encuentro Noticias — Panel de control" in panel_vals[0][0] and "búsqueda y subida" not in panel_vals[0][0]:
+                            has_old_header = True
+                    
+                    has_old_fecha_min = False
+                    if len(panel_vals) >= 3 and len(panel_vals[2]) >= 1:
+                        if panel_vals[2][0] == "Fecha mínima":
+                            has_old_fecha_min = True
+
+                    has_old_modo_prueba = False
+                    if len(panel_vals) >= 6 and len(panel_vals[5]) >= 1:
+                        if "Modo prueba" in panel_vals[5][0]:
+                            has_old_modo_prueba = True
+
+                    has_new_layout = False
+                    if len(panel_vals) >= 3 and len(panel_vals[2]) >= 2:
+                        if panel_vals[2][1] == "Filtros de búsqueda":
+                            has_new_layout = True
+
+                    if has_old_header or has_old_fecha_min or has_old_modo_prueba or not has_new_layout or len(panel_vals) < 17:
+                        is_old_layout = True
+                        logger.info("PANEL_MIGRATION_DETECTED: Old layout detected in Panel tab.")
+                        
+                        # Extract old values to migrate
+                        if len(panel_vals) >= 3 and len(panel_vals[2]) >= 2:
+                            old_inputs["date_min"] = panel_vals[2][1]
+                        if len(panel_vals) >= 4 and len(panel_vals[3]) >= 2:
+                            old_inputs["date_max"] = panel_vals[3][1]
+                        if len(panel_vals) >= 5 and len(panel_vals[4]) >= 2:
+                            try:
+                                old_inputs["limit_books"] = int(panel_vals[4][1])
+                            except Exception:
+                                pass
+                        if len(panel_vals) >= 6 and len(panel_vals[5]) >= 2:
+                            b6_val = str(panel_vals[5][1]).strip().upper()
+                            if b6_val in ("TRUE", "VERDADERO", "SÍ", "SI", "1"):
+                                self.old_modo_prueba = "TRUE"
+                            elif b6_val in ("FALSE", "FALSO", "NO", "0"):
+                                self.old_modo_prueba = "FALSE"
+                        if len(panel_vals) >= 7 and len(panel_vals[6]) >= 2:
+                            old_b7 = str(panel_vals[6][1]).strip().upper()
+                            old_inputs["include_unknown"] = old_b7 in ("TRUE", "VERDADERO", "SÍ", "SI", "1")
+            except Exception as e_detect:
+                logger.error(f"Error checking old Panel for migration: {e_detect}")
+        else:
+            is_old_layout = True
+
+        if "Panel" not in existing_sheets or is_old_layout:
+            panel_recreated = True
+            logger.info("PANEL_MIGRATION_DETECTED: Panel worksheet needs recreation.")
+            
+            # Delete old worksheet if present
+            if "Panel" in existing_sheets:
+                try:
+                    spreadsheet.del_worksheet(existing_sheets["Panel"])
+                    logger.info("PANEL_RECREATED: Old Panel deleted successfully.")
+                except Exception as e_del:
+                    logger.error(f"Error deleting old Panel worksheet: {e_del}")
+
+            # Recreate from Panel prueba if available
+            if "Panel prueba" in existing_sheets:
+                try:
+                    panel_ws = spreadsheet.duplicate_sheet(
+                        existing_sheets["Panel prueba"].id,
+                        insert_sheet_index=0,
+                        new_sheet_name="Panel"
+                    )
+                    logger.info("PANEL_RECREATED: Duplicated Panel prueba as Panel.")
+                except Exception as e_dup:
+                    logger.error(f"Error duplicating Panel prueba, creating clean tab instead: {e_dup}")
+                    panel_ws = spreadsheet.add_worksheet(title="Panel", rows="30", cols="10")
+                    try:
+                        spreadsheet.batch_update({
+                            "requests": [{
+                                "updateSheetProperties": {
+                                    "properties": {
+                                        "sheetId": panel_ws.id,
+                                        "index": 0
+                                    },
+                                    "fields": "index"
+                                }
+                            }]
+                        })
+                    except Exception:
+                        pass
+            else:
+                panel_ws = spreadsheet.add_worksheet(title="Panel", rows="30", cols="10")
+                try:
+                    spreadsheet.batch_update({
+                        "requests": [{
+                            "updateSheetProperties": {
+                                "properties": {
+                                    "sheetId": panel_ws.id,
+                                    "index": 0
+                                },
+                                "fields": "index"
+                            }
+                        }]
+                    })
+                except Exception:
+                    pass
+
+            # Populate structure and values
             panel_structure = [
-                ["Encuentro Noticias — Panel de control", ""],
-                ["", ""],
-                ["Fecha mínima", "2024-01-01"],
-                ["Fecha máxima", "2026-12-31"],
-                ["Máximo de libros", 10],
-                ["Modo prueba (dry run)", True],
-                ["Incluir artículos sin fecha", True],
-                ["", ""],
-                ["Último run_id", ""],
-                ["Última búsqueda_id", ""],
-                ["Última ejecución", ""],
-                ["Mensaje", ""],
-                ["", ""],
-                ["Instrucciones:", ""],
-                ["Use el botón 'Lanzar búsqueda' desde el menú 'Encuentro Noticias' para iniciar una búsqueda.", ""],
-                ["Use 'Consultar estado' para refrescar el estado de la última búsqueda.", ""]
+                ["", "Panel de control de búsqueda y subida a web automática de reseñas", "", "", "", ""],
+                ["", "", "", "", "", ""],
+                ["", "Filtros de búsqueda", "", "", "Información última ejecución", ""],
+                ["", "Fecha mínima", old_inputs["date_min"], "", "Estado", ""],
+                ["", "Fecha máxima", old_inputs["date_max"], "", "ID", ""],
+                ["", "Máximo de libros", old_inputs["limit_books"], "", "Fecha", ""],
+                ["", "Incluir artículos sin fecha", old_inputs["include_unknown"], "", "Mensaje", ""],
+                ["", "", "", "", "", ""],
+                ["", "", "", "", "", ""],
+                ["", "Resumen operativo", "", "", "", ""],
+                ["", "Ejecución inactiva", "", "", "", ""],
+                ["", "", "", "", "", ""],
+                ["", "", "", "", "", ""],
+                ["", "Instrucciones", "", "", "", ""],
+                ["", "1. Usa el botón “Lanzar búsqueda” del menú “Encuentro Noticias” para iniciar una ejecución.", "", "", "", ""],
+                ["", "2. Usa “Consultar estado” para refrescar el estado de la última ejecución.", "", "", "", ""],
+                ["", "3. Revisa el resumen operativo para saber si el proceso está publicando, completado o con error.", "", "", "", ""]
             ]
             panel_ws.clear()
             cleaned_panel_structure = [clean_row_values(row) for row in panel_structure]
             panel_ws.update(range_name="A1", values=cleaned_panel_structure)
+        else:
+            panel_ws = existing_sheets["Panel"]
             
-        # Apply date, number validations and boolean checkboxes always
-        # Resolve these worksheets before the try block so they are always in scope
+        # Apply validations
         libros_ws = spreadsheet.worksheet("Libros")
         try:
             ws_to_pub = spreadsheet.worksheet("Reseñas por publicar")
             ws_pub = spreadsheet.worksheet("Reseñas publicadas")
             
             val_requests = [
-                # Date validation for B3:B4
+                # FULL SANITIZATION: Clear validation on entire Panel sheet to avoid corrupt rules
                 {
                     "setDataValidation": {
                         "range": {
                             "sheetId": panel_ws.id,
-                            "startRowIndex": 2,
-                            "endRowIndex": 4,
-                            "startColumnIndex": 1,
-                            "endColumnIndex": 2
+                            "startRowIndex": 0,
+                            "endRowIndex": 30,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 10
+                        }
+                    }
+                },
+                # Date validation for C4:C5
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": panel_ws.id,
+                            "startRowIndex": 3,
+                            "endRowIndex": 5,
+                            "startColumnIndex": 2,
+                            "endColumnIndex": 3
                         },
                         "rule": {
                             "condition": {
@@ -343,15 +472,15 @@ class SheetsService:
                         }
                     }
                 },
-                # Date format (yyyy-mm-dd) for B3:B4
+                # Date format (yyyy-mm-dd) for C4:C5
                 {
                     "repeatCell": {
                         "range": {
                             "sheetId": panel_ws.id,
-                            "startRowIndex": 2,
-                            "endRowIndex": 4,
-                            "startColumnIndex": 1,
-                            "endColumnIndex": 2
+                            "startRowIndex": 3,
+                            "endRowIndex": 5,
+                            "startColumnIndex": 2,
+                            "endColumnIndex": 3
                         },
                         "cell": {
                             "userEnteredFormat": {
@@ -364,15 +493,15 @@ class SheetsService:
                         "fields": "userEnteredFormat.numberFormat"
                     }
                 },
-                # Number validation for B5 (Máximo de libros): integer 1-5000
+                # Number validation for C6 (Máximo de libros): integer 1-5000
                 {
                     "setDataValidation": {
                         "range": {
                             "sheetId": panel_ws.id,
-                            "startRowIndex": 4,
-                            "endRowIndex": 5,
-                            "startColumnIndex": 1,
-                            "endColumnIndex": 2
+                            "startRowIndex": 5,
+                            "endRowIndex": 6,
+                            "startColumnIndex": 2,
+                            "endColumnIndex": 3
                         },
                         "rule": {
                             "condition": {
@@ -387,33 +516,15 @@ class SheetsService:
                         }
                     }
                 },
-                # Boolean checkbox for B6 (Modo prueba)
-                {
-                    "setDataValidation": {
-                        "range": {
-                            "sheetId": panel_ws.id,
-                            "startRowIndex": 5,
-                            "endRowIndex": 6,
-                            "startColumnIndex": 1,
-                            "endColumnIndex": 2
-                        },
-                        "rule": {
-                            "condition": {
-                                "type": "BOOLEAN"
-                            },
-                            "showCustomUi": True
-                        }
-                    }
-                },
-                # Boolean checkbox for B7 (Incluir artículos sin fecha)
+                # Boolean checkbox for C7 (Incluir artículos sin fecha)
                 {
                     "setDataValidation": {
                         "range": {
                             "sheetId": panel_ws.id,
                             "startRowIndex": 6,
                             "endRowIndex": 7,
-                            "startColumnIndex": 1,
-                            "endColumnIndex": 2
+                            "startColumnIndex": 2,
+                            "endColumnIndex": 3
                         },
                         "rule": {
                             "condition": {
@@ -520,8 +631,26 @@ class SheetsService:
         if "WORDPRESS_POST_STATUS" in existing_basic:
             del existing_basic["WORDPRESS_POST_STATUS"]
 
+        # Determine values for config MODO_PRUEBA
+        if "MODO_PRUEBA" in existing_basic:
+            modo_prueba_value = str(existing_basic["MODO_PRUEBA"]["Valor"]).strip().upper()
+        elif self.old_modo_prueba is not None:
+            existing_basic["MODO_PRUEBA"] = {
+                "Clave": "MODO_PRUEBA",
+                "Valor": self.old_modo_prueba,
+                "Descripción": "Si está activado, las búsquedas/publicaciones se simulan sin ejecutar acciones reales."
+            }
+            modo_prueba_added = True
+            modo_prueba_value = self.old_modo_prueba
+            logger.info(f"MODO_PRUEBA_MIGRATED: Migrated Modo prueba from Panel to Config: {self.old_modo_prueba}")
+        else:
+            modo_prueba_added = True
+            modo_prueba_value = "FALSE"
+            logger.info("MODO_PRUEBA_DEFAULT_ADDED: Added default MODO_PRUEBA = FALSE to Config.")
+
         basic_defaults = [
             {"Clave": "BACKEND_BASE_URL", "Valor": "https://encuentro-backend.doobot.ai", "Descripción": "URL base del backend usada por el menú de Google Sheets para lanzar procesos"},
+            {"Clave": "MODO_PRUEBA", "Valor": "FALSE", "Descripción": "Si está activado, las búsquedas/publicaciones se simulan sin ejecutar acciones reales."},
             {"Clave": "MAX_BOOKS_PER_RUN", "Valor": settings.MAX_BOOKS_PER_RUN, "Descripción": "Cantidad máxima de libros a procesar por ejecución"},
             {"Clave": "MAX_CANDIDATES_PER_BOOK", "Valor": settings.MAX_CANDIDATES_PER_BOOK, "Descripción": "Cantidad máxima de URLs candidatas a evaluar por libro"},
             {"Clave": "MIN_MATCH_SCORE", "Valor": 1, "Descripción": "Score mínimo de validación de OpenAI para aceptar una reseña (0-100)"},
@@ -611,7 +740,10 @@ class SheetsService:
             "success": True,
             "sheet_id": sheet_id,
             "sheet_url": f"https://docs.google.com/spreadsheets/d/{sheet_id}",
-            "created_tabs": created_tabs
+            "created_tabs": created_tabs,
+            "panel_recreated": panel_recreated,
+            "modo_prueba_added": modo_prueba_added,
+            "modo_prueba_value": modo_prueba_value
         }
 
     def get_config_dict(self, sheet_id: str) -> Dict[str, Any]:
@@ -638,6 +770,7 @@ class SheetsService:
             logger.info(f"CONFIG_LOADED: read {len(config_dict)} keys from Config")
 
             return {
+                "MODO_PRUEBA": parse_bool(config_dict.get("MODO_PRUEBA"), False),
                 "MAX_BOOKS_PER_RUN": parse_int(config_dict.get("MAX_BOOKS_PER_RUN"), settings.MAX_BOOKS_PER_RUN),
                 "MAX_SEARCH_PAGES_PER_QUERY": parse_int(config_dict.get("MAX_SEARCH_PAGES_PER_QUERY"), settings.MAX_SEARCH_PAGES_PER_QUERY),
                 "MAX_CANDIDATES_PER_BOOK": parse_int(config_dict.get("MAX_CANDIDATES_PER_BOOK"), settings.MAX_CANDIDATES_PER_BOOK),
@@ -688,6 +821,7 @@ class SheetsService:
         except Exception:
             # Fallback to local configs if sheet configs fail to read
             return {
+                "MODO_PRUEBA": False,
                 "MAX_BOOKS_PER_RUN": settings.MAX_BOOKS_PER_RUN,
                 "MAX_SEARCH_PAGES_PER_QUERY": settings.MAX_SEARCH_PAGES_PER_QUERY,
                 "MAX_CANDIDATES_PER_BOOK": settings.MAX_CANDIDATES_PER_BOOK,

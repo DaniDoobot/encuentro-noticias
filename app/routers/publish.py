@@ -327,6 +327,13 @@ def post_publish_reviews(req: PublishReviewsRequest):
     """
     sheet_id = settings.GOOGLE_SHEET_ID
     dry_run = req.dry_run
+    if not dry_run:
+        try:
+            config = sheets_service.get_config_dict(sheet_id)
+            if config.get("MODO_PRUEBA", False):
+                dry_run = True
+        except Exception:
+            pass
     
     if req.background:
         publish_id = f"pub_{uuid.uuid4().hex[:8]}"

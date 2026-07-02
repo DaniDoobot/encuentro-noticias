@@ -62,6 +62,14 @@ class RunService:
             raise RunCancelledException("Búsqueda cancelada por el usuario.", reviews_added=reviews_added)
 
     def trigger_run(self, limit_books: int = 10, dry_run: bool = False, date_min: Optional[str] = None, date_max: Optional[str] = None, include_unknown_dates: Optional[bool] = None) -> str:
+        if not dry_run:
+            try:
+                sheet_config = sheets_service.get_config_dict(settings.GOOGLE_SHEET_ID)
+                if sheet_config.get("MODO_PRUEBA", False):
+                    dry_run = True
+            except Exception:
+                pass
+
         run_id = f"run_{uuid.uuid4().hex[:8]}"
         current_runs[run_id] = {
             "run_id": run_id,
@@ -90,6 +98,14 @@ class RunService:
         return run_id
 
     def trigger_single_book_run(self, isbn: str, dry_run: bool = False, date_min: Optional[str] = None, date_max: Optional[str] = None, include_unknown_dates: Optional[bool] = None) -> str:
+        if not dry_run:
+            try:
+                sheet_config = sheets_service.get_config_dict(settings.GOOGLE_SHEET_ID)
+                if sheet_config.get("MODO_PRUEBA", False):
+                    dry_run = True
+            except Exception:
+                pass
+
         run_id = f"run_{uuid.uuid4().hex[:8]}"
         current_runs[run_id] = {
             "run_id": run_id,
