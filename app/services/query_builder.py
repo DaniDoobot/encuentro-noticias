@@ -63,6 +63,60 @@ class QueryBuilder:
         return cleaned
 
     @staticmethod
+    def is_safe_broad_query(title: str, query: str, author: str) -> bool:
+        # 1. Always safe if the query contains any spelling variations of the author
+        author_vars = QueryBuilder.get_author_spelling_variations(author)
+        query_lower = query.lower()
+        for av in author_vars:
+            if av.lower() in query_lower:
+                return True
+
+        # 2. Always safe if it contains a valid ISBN
+        cleaned_digits = re.sub(r'[^0-9]', '', query)
+        if len(cleaned_digits) >= 9:
+            return True
+
+        # 3. Always unsafe if the title contains a comma (and has no author)
+        if "," in title:
+            return False
+
+        # 4. Normalize title and generic phrases to strip accents for comparison
+        def strip_accents(text: str) -> str:
+            return "".join(c for c in unicodedata.normalize('NFD', text) if unicodedata.category(c) != 'Mn')
+
+        title_flat = strip_accents(QueryBuilder.clean_punctuation(title)).lower()
+
+        generic_phrases = {
+            "no tengo miedo no lo tengais vosotros",
+            "vivir en el asombro",
+            "el sacrificio",
+            "el sentido religioso",
+            "europa la via romana",
+            "cristina hija de lavrans"
+        }
+
+        # If the title contains or is one of the generic phrases
+        for gp in generic_phrases:
+            if gp in title_flat:
+                return False
+
+        # 5. Check if the query itself is composed only of generic/unsafe words
+        query_flat = strip_accents(QueryBuilder.clean_punctuation(query)).lower()
+        for gp in generic_phrases:
+            if gp in query_flat:
+                return False
+
+        # 6. Must contain at least 3 significant tokens non-generic
+        stop_words = {"del", "las", "los", "con", "para", "por", "una", "unos", "unas", "como", "de", "el", "la", "en", "y", "o"}
+        cleaned_q = re.sub(r'[^a-z0-9\s]', ' ', strip_accents(query_lower))
+        tokens = [t for t in cleaned_q.split() if len(t) >= 3 and t not in stop_words]
+
+        if len(tokens) < 3:
+            return False
+
+        return True
+
+    @staticmethod
     def is_query_allowed(query: str, title: str, author: str) -> bool:
         query_lower = query.lower()
         
@@ -186,6 +240,10 @@ class QueryBuilder:
             q_strip = q_clean.strip()
             if q_strip and q_strip not in seen:
                 if QueryBuilder.is_query_allowed(q_strip, title, author):
+                    author_vars = QueryBuilder.get_author_spelling_variations(author)
+                    has_auth_var = any(av.lower() in q_strip.lower() for av in author_vars)
+                    if not has_auth_var and not QueryBuilder.is_safe_broad_query(title, q_strip, author):
+                        continue
                     seen.add(q_strip)
                     final_queries.append(q_strip)
         return final_queries

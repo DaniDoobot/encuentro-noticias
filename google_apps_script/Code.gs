@@ -209,6 +209,7 @@ function launchSearch() {
       var runId = data.run_id || data.id || "";
       
       PropertiesService.getScriptProperties().setProperty("LAST_SEARCH_RUN_ID", runId);
+      scheduleAutoStatusCheck_("search");
       
       setPanelStatus_("Procesando...", runId, "Búsqueda iniciada correctamente.", "Ejecución activa: búsqueda en segundo plano");
       
@@ -369,6 +370,7 @@ function publishReviews() {
       
       if (publishId) {
         PropertiesService.getScriptProperties().setProperty("LAST_PUBLISH_ID", publishId);
+        scheduleAutoStatusCheck_("publish");
         setPanelStatus_("Procesando...", publishId, "Proceso de publicación iniciado en segundo plano.", "Ejecución activa: publicación en segundo plano");
         SpreadsheetApp.getUi().alert("Publicación iniciada correctamente.\nPublicación ID: " + publishId + "\nPuede refrescar el estado usando 'Consultar publicación'.");
       } else {
@@ -526,6 +528,7 @@ function cancelSearch() {
     var resText = response.getContentText();
     
     if (resCode >= 200 && resCode < 300) {
+      deleteTriggersForType_("search");
       setPanelStatus_("Cancelado", null, "Proceso cancelado por el usuario.", "Ejecución cancelada por el usuario.");
       SpreadsheetApp.getUi().alert("La solicitud de cancelación de la búsqueda fue enviada al backend correctamente.");
     } else {
@@ -588,6 +591,7 @@ function cancelPublish() {
     var resText = response.getContentText();
     
     if (resCode >= 200 && resCode < 300) {
+      deleteTriggersForType_("publish");
       setPanelStatus_("Cancelado", null, "Proceso cancelado por el usuario.", "Publicación cancelada por el usuario.");
       SpreadsheetApp.getUi().alert("La solicitud de cancelación de la publicación fue enviada al backend correctamente.");
     } else {
@@ -653,6 +657,7 @@ function indexSources() {
       var jobId = data.job_id || "";
       
       PropertiesService.getScriptProperties().setProperty("LAST_INDEX_JOB_ID", jobId);
+      scheduleAutoStatusCheck_("index");
       
       setPanelStatus_("Procesando...", jobId, "Indexación de fuentes iniciada en segundo plano.", "Ejecución activa: indexación en segundo plano");
       
@@ -922,4 +927,142 @@ function cleanupEmptyPublicationRows() {
   } catch (e) {
     SpreadsheetApp.getUi().alert("Error de conexión:\n" + e.toString());
   }
+}
+
+/**
+ * Programa un trigger para verificar el estado de forma automática.
+ * type puede ser: "search", "publish", "index"
+ */
+function scheduleAutoStatusCheck_(type) {
+  deleteTriggersForType_(type);
+  var functionName = "";
+  if (type === "search") functionName = "autoCheckSearchStatus_";
+  else if (type === "publish") functionName = "autoCheckPublishStatus_";
+  else if (type === "index") functionName = "autoCheckIndexStatus_";
+  if (functionName) {
+    ScriptApp.newTrigger(functionName).timeBased().everyMinutes(1).create();
+  }
+}
+
+/**
+ * Elimina todos los triggers asociados a un tipo de proceso.
+ */
+function deleteTriggersForType_(type) {
+  var functionName = "";
+  if (type === "search") functionName = "autoCheckSearchStatus_";
+  else if (type === "publish") functionName = "autoCheckPublishStatus_";
+  else if (type === "index") functionName = "autoCheckIndexStatus_";
+  if (!functionName) return;
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === functionName) {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+}
+
+function autoCheckSearchStatus_() {
+  var runId = PropertiesService.getScriptProperties().getProperty("LAST_SEARCH_RUN_ID");
+  if (!runId) { deleteTriggersForType_("search"); return; }
+  var backendUrl = getConfigValue("BACKEND_BASE_URL");
+  var adminToken = getConfigValue("ADMIN_TOKEN");
+  if (!backendUrl) { deleteTriggersForType_("search"); return; }
+  if (backendUrl.slice(-1) === "/") backendUrl = backendUrl.slice(0, -1);
+  var headers = {};
+  if (adminToken) headers["X-Admin-Token"] = adminToken;
+  try {
+    var response = UrlFetchApp.fetch(backendUrl + "/runs/" + runId, { "method": "get", "headers": headers, "muteHttpExceptions": true });
+    if (response.getResponseCode() === 200) {
+      var data = JSON.parse(response.getContentText());
+      var status = data.status || "";
+      var processed = data.books_processed || 0;
+      var total = data.books_total || 0;
+      var msg = data.message || "";
+      var friendlyStatus = getFriendlyStatus_(status, "Procesando...");
+      var progressMsg = "Procesados: " + processed + "/" + total + " — " + msg;
+      if (friendlyStatus === "Completado") {
+        setPanelStatus_("Completado", null, progressMsg, "Búsqueda finalizada");
+        deleteTriggersForType_("search");
+      } else if (friendlyStatus === "Error") {
+        setPanelStatus_("Error", null, progressMsg, "Búsqueda finalizada con error");
+        deleteTriggersForType_("search");
+      } else if (friendlyStatus === "Cancelado") {
+        setPanelStatus_("Cancelado", null, "Proceso cancelado por el usuario.", "Búsqueda cancelada");
+        deleteTriggersForType_("search");
+      } else {
+        setPanelStatus_("Procesando...", null, progressMsg, "Ejecución activa: búsqueda en segundo plano");
+      }
+    }
+  } catch (e) { /* Ignorar errores de conexión temporales */ }
+}
+
+function autoCheckPublishStatus_() {
+  var publishId = PropertiesService.getScriptProperties().getProperty("LAST_PUBLISH_ID");
+  if (!publishId) { deleteTriggersForType_("publish"); return; }
+  var backendUrl = getConfigValue("BACKEND_BASE_URL");
+  var adminToken = getConfigValue("ADMIN_TOKEN");
+  if (!backendUrl) { deleteTriggersForType_("publish"); return; }
+  if (backendUrl.slice(-1) === "/") backendUrl = backendUrl.slice(0, -1);
+  var headers = {};
+  if (adminToken) headers["X-Admin-Token"] = adminToken;
+  try {
+    var response = UrlFetchApp.fetch(backendUrl + "/publish/" + publishId + "/status", { "method": "get", "headers": headers, "muteHttpExceptions": true });
+    if (response.getResponseCode() === 200) {
+      var data = JSON.parse(response.getContentText());
+      var status = data.status || "";
+      var pubCount = data.published_count || 0;
+      var errCount = data.errors_count || 0;
+      var msg = data.message || "";
+      var friendlyStatus = getFriendlyStatus_(status, "Procesando...");
+      var progressMsg = "Publicadas: " + pubCount + ", Errores: " + errCount + " — " + msg;
+      if (friendlyStatus === "Completado") {
+        setPanelStatus_("Completado", null, progressMsg, "Publicación finalizada");
+        deleteTriggersForType_("publish");
+      } else if (friendlyStatus === "Error") {
+        setPanelStatus_("Error", null, progressMsg, "Publicación finalizada con error");
+        deleteTriggersForType_("publish");
+      } else if (friendlyStatus === "Cancelado") {
+        setPanelStatus_("Cancelado", null, "Proceso cancelado por el usuario.", "Publicación cancelada");
+        deleteTriggersForType_("publish");
+      } else {
+        setPanelStatus_("Procesando...", null, progressMsg, "Ejecución activa: publicación en segundo plano");
+      }
+    }
+  } catch (e) { /* Ignorar errores de conexión temporales */ }
+}
+
+function autoCheckIndexStatus_() {
+  var jobId = PropertiesService.getScriptProperties().getProperty("LAST_INDEX_JOB_ID");
+  if (!jobId) { deleteTriggersForType_("index"); return; }
+  var backendUrl = getConfigValue("BACKEND_BASE_URL");
+  var adminToken = getConfigValue("ADMIN_TOKEN");
+  if (!backendUrl) { deleteTriggersForType_("index"); return; }
+  if (backendUrl.slice(-1) === "/") backendUrl = backendUrl.slice(0, -1);
+  var headers = {};
+  if (adminToken) headers["X-Admin-Token"] = adminToken;
+  try {
+    var response = UrlFetchApp.fetch(backendUrl + "/sources/index/status?job_id=" + jobId, { "method": "get", "headers": headers, "muteHttpExceptions": true });
+    if (response.getResponseCode() === 200) {
+      var data = JSON.parse(response.getContentText());
+      var status = data.status || "";
+      var comp = data.domains_completed || 0;
+      var total = data.domains_total || 0;
+      var urls = data.urls_found || 0;
+      var errs = (data.errors || []).length;
+      var friendlyStatus = getFriendlyStatus_(status, "Indexando...");
+      var progressMsg = "Dominios: " + comp + "/" + total + " — URLs: " + urls + " — Errores: " + errs;
+      if (friendlyStatus === "Completado") {
+        setPanelStatus_("Completado", null, progressMsg, "Indexación finalizada");
+        deleteTriggersForType_("index");
+      } else if (friendlyStatus === "Error") {
+        setPanelStatus_("Error", null, progressMsg, "Indexación finalizada con error");
+        deleteTriggersForType_("index");
+      } else if (friendlyStatus === "Cancelado") {
+        setPanelStatus_("Cancelado", null, "Proceso cancelado por el usuario.", "Indexación cancelada");
+        deleteTriggersForType_("index");
+      } else {
+        setPanelStatus_("Procesando...", null, progressMsg, "Ejecución activa: indexación en segundo plano");
+      }
+    }
+  } catch (e) { /* Ignorar errores de conexión temporales */ }
 }

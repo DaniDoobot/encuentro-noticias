@@ -161,6 +161,7 @@ class RunService:
             })
 
     def execute_run(self, run_id: str, limit_books: int, dry_run: bool, date_min: Optional[str] = None, date_max: Optional[str] = None, include_unknown_dates: Optional[bool] = None):
+        processed_books = []
         sheet_id = settings.GOOGLE_SHEET_ID
         log_prefix = "[PRUEBA] " if dry_run else ""
         
@@ -243,6 +244,7 @@ class RunService:
             self._add_in_memory_log(run_id, "INFO", "DEDUPE_INIT", f"Reseñas cargadas: {len(existing_reviews)}. Hashes únicos: {len(existing_hashes)}")
 
             for book in pending_books:
+                processed_books.append((book["row_index"], book.get("isbn", ""), book.get("title", "")))
                 if run_id in cancelled_runs or current_runs[run_id].get("status") == "cancelled":
                     break
                 isbn = book["isbn"]
@@ -369,6 +371,8 @@ class RunService:
             except Exception:
                 pass
         finally:
+            # Run status sanitation for processed books
+            self._sanitize_processed_books(sheet_id, processed_books, run_id)
             if run_id in current_runs:
                 status = current_runs[run_id].get("status")
                 if status in ("running", "pending"):
@@ -380,6 +384,7 @@ class RunService:
                 pass
 
     def execute_single_book(self, run_id: str, isbn: str, dry_run: bool, date_min: Optional[str] = None, date_max: Optional[str] = None, include_unknown_dates: Optional[bool] = None):
+        processed_books = []
         sheet_id = settings.GOOGLE_SHEET_ID
         log_prefix = "[PRUEBA] " if dry_run else ""
         self._add_in_memory_log(run_id, "INFO", "RUN_START", f"{log_prefix}Iniciando run individual para ISBN {isbn} (dry_run={dry_run})")
@@ -408,6 +413,8 @@ class RunService:
                 self._add_in_memory_log(run_id, "WARNING", "BOOK_NOT_FOUND", msg)
                 logger_service.log("WARNING", "BOOK_NOT_FOUND", msg, isbn=isbn, sheet_id=sheet_id, run_id=run_id)
                 return
+
+            processed_books.append((book["row_index"], book.get("isbn", ""), book.get("title", "")))
 
             existing_reviews = sheets_service.get_all_reviews(sheet_id)
             existing_hashes = deduplicator.extract_hashes_from_reviews(existing_reviews)
@@ -494,6 +501,8 @@ class RunService:
             except Exception:
                 pass
         finally:
+            # Run status sanitation for processed books
+            self._sanitize_processed_books(sheet_id, processed_books, run_id)
             if run_id in current_runs:
                 status = current_runs[run_id].get("status")
                 if status in ("running", "pending"):
@@ -659,7 +668,9 @@ class RunService:
         queries_dict_len = len(prioritarias) + len(apoyo) + len(dominios) + len(broad_queries)
         logger_service.log("INFO", "BOOK_SEARCH_QUERIES_GENERATED", f"{log_prefix}Queries generadas para la búsqueda del libro '{title}' (ISBN: {isbn}): total={queries_dict_len} (Prioritarias={len(prioritarias)}, Apoyo={len(apoyo)}, Dominios={len(dominios)}, Broad={len(broad_queries)})", isbn=isbn, detail=queries_built_detail, sheet_id=sheet_id, run_id=run_id)
 
-        # Log individual prioritarias
+        # Log individual prioritarias/apoyo/dominios/broad — only to Sheets if DEBUG_SEARCH_QUERIES is on
+        debug_search_queries = is_true(config.get("DEBUG_SEARCH_QUERIES", settings.DEBUG_SEARCH_QUERIES))
+
         isbn_clean = isbn.replace('"', "").replace('-', "").strip()
         for q in prioritarias:
             strategy = "título_exacto_más_autor"
@@ -675,9 +686,10 @@ class RunService:
                 strategy = "título_sin_volumen_más_autor"
             elif "," in title and title.split(",", 1)[0].strip() in q:
                 strategy = "primer_segmento_título_más_autor"
-            logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query prioritaria generada ({strategy}): {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": strategy, "level": "prioritaria"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
+            if debug_search_queries:
+                logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query prioritaria generada ({strategy}): {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": strategy, "level": "prioritaria"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query prioritaria ({strategy}): {q}", isbn=isbn)
 
-        # Log individual apoyo
         for q in apoyo:
             strategy = "título_apoyo_más_autor"
             if "lavransdatter" in q.lower() or "lavransdotter" in q.lower():
@@ -690,19 +702,23 @@ class RunService:
                 strategy = "título_sin_volumen_más_autor"
             elif "," in title and title.split(",", 1)[0].strip() in q:
                 strategy = "primer_segmento_título_más_autor"
-            logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query apoyo generada ({strategy}): {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": strategy, "level": "apoyo"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
+            if debug_search_queries:
+                logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query apoyo generada ({strategy}): {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": strategy, "level": "apoyo"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query apoyo ({strategy}): {q}", isbn=isbn)
 
-        # Log individual dominios
         for q in dominios:
-            logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query dominio generada: {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": "restricción_dominio", "level": "dominios"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
+            if debug_search_queries:
+                logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query dominio generada: {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": "restricción_dominio", "level": "dominios"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query dominio: {q}", isbn=isbn)
 
-        # Log individual broad
         for q in broad_queries:
-            logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query broad generada: {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": "búsqueda_amplia_sin_autor", "level": "broad"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
+            if debug_search_queries:
+                logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query broad generada: {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": "búsqueda_amplia_sin_autor", "level": "broad"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query broad: {q}", isbn=isbn)
 
         self._add_in_memory_log(
-            run_id, "INFO", "QUERIES_GENERATED", 
-            f"{log_prefix}Generadas queries por nivel: Prioritarias={len(prioritarias)}, Apoyo={len(apoyo)}, Dominios={len(dominios)}, Broad={len(broad_queries)}", 
+            run_id, "INFO", "QUERIES_GENERATED",
+            f"{log_prefix}Generadas queries por nivel: Prioritarias={len(prioritarias)}, Apoyo={len(apoyo)}, Dominios={len(dominios)}, Broad={len(broad_queries)}",
             isbn=isbn
         )
 
@@ -829,6 +845,10 @@ class RunService:
                 broad_queries_done = 0
                 for q in broad_queries:
                     self._check_cancellation(run_id)
+                    # Skip if broad query is not safe (generic title without author)
+                    if not query_builder.is_safe_broad_query(title, q, author):
+                        logger.info(f"Skipping unsafe broad query: '{q}'")
+                        continue
                     # Broad queries run on their own budget of up to 10 queries, ignoring max_queries!
                     if broad_queries_done >= 10:
                         break
@@ -1144,6 +1164,10 @@ class RunService:
                 broad_queries_done = 0
                 for q in broad_queries:
                     self._check_cancellation(run_id)
+                    # Skip if broad query is not safe (generic title without author)
+                    if not query_builder.is_safe_broad_query(title, q, author):
+                        logger.info(f"Skipping unsafe broad query: '{q}'")
+                        continue
                     # Broad queries run on their own budget of up to 10 queries, ignoring max_queries!
                     if broad_queries_done >= 10:
                         break
@@ -1939,5 +1963,48 @@ class RunService:
         except Exception as e:
             import logging
             logging.getLogger("encuentro-noticias").warning(f"Error doing auto sheet compaction: {e}")
+
+    def _sanitize_processed_books(self, sheet_id: str, processed_books: List[Tuple[int, str, str]], run_id: str):
+        if not processed_books:
+            return
+        try:
+            import logging
+            log = logging.getLogger("encuentro-noticias")
+            log.info(f"Running book status sanitation for {len(processed_books)} books...")
+            
+            client = sheets_service.get_client()
+            spreadsheet = client.open_by_key(sheet_id)
+            worksheet = spreadsheet.worksheet("Libros")
+            records = worksheet.get_all_records()
+            
+            processed_indices = {b[0] for b in processed_books}
+            
+            for index, row in enumerate(records, start=2):
+                if index in processed_indices:
+                    status = str(row.get("Estado", "")).strip().lower()
+                    if status == "procesando":
+                        title = str(row.get("Título del libro", ""))
+                        isbn = str(row.get("ISBN", ""))
+                        log.warning(f"Sanitizing stuck book: '{title}' at row {index} from 'procesando' to 'error'")
+                        observation = "Búsqueda finalizada con error técnico: estado no cerrado correctamente."
+                        sheets_service.update_book_status(
+                            sheet_id=sheet_id,
+                            row_index=index,
+                            status="error",
+                            last_run=get_now_madrid_str(),
+                            reviews_found=0,
+                            observations=observation
+                        )
+                        logger_service.log(
+                            level="WARNING",
+                            action="BOOK_STATUS_SANITIZED",
+                            message=f"Estado del libro '{title}' (ISBN: {isbn}) saneado a 'error' porque quedó atascado en 'procesando'.",
+                            isbn=isbn,
+                            sheet_id=sheet_id,
+                            run_id=run_id
+                        )
+        except Exception as e:
+            import logging
+            logging.getLogger("encuentro-noticias").error(f"Error running book status sanitation: {e}")
 
 run_service = RunService()

@@ -1080,8 +1080,8 @@ def test_build_broad_queries():
     
     broad = query_builder.build_broad_queries("YOUCAT Biblia", "VV.AA.", "978-84-1339-264-6")
     
-    # 1. Contains lowercase youcat biblia
-    assert "youcat biblia" in broad
+    # 1. Contains youcat biblia (case-insensitive)
+    assert any("youcat biblia" in q.lower() for q in broad)
     
     # 2. No VV.AA. or variations
     for q in broad:
@@ -1113,20 +1113,23 @@ def test_broad_news_search_triggers_and_budget_guaranteed():
     
     def side_effect_search(query, *args, **kwargs):
         # Normal phase queries (like those in prioritarias) return empty list
-        # Broad phase queries (like "youcat biblia" lowercase without quotes) return candidates
-        if query == "youcat biblia" or query == "youcat biblia noticia" or query == "youcat biblia artículo":
+        # Broad phase queries (like "YOUCAT Biblia Joven noticia") return candidates
+        q_clean = query.lower()
+        if "noticia" in q_clean or "artículo" in q_clean or "articulo" in q_clean or "nueva" in q_clean:
             return mock_rss_broad
         return mock_rss_normal
 
+    mock_config = {
+         "MAX_QUERIES_PER_BOOK": 1, # extremely low limit to test budget bypass
+         "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES": 1,
+         "MIN_MATCH_SCORE": 10,
+         "MAX_CANDIDATES_PER_BOOK": 5,
+         "SEARCH_PROVIDER_MODE": "google_news_only",
+         "ENABLE_CASCADE_SEARCH": "true"
+     }
+
     with patch("app.services.source_discovery.source_discovery.find_candidates", return_value=[]), \
-         patch("app.services.sheets_service.sheets_service.get_config_dict", return_value={
-             "MAX_QUERIES_PER_BOOK": 1, # extremely low limit to test budget bypass
-             "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES": 1,
-             "MIN_MATCH_SCORE": 10,
-             "MAX_CANDIDATES_PER_BOOK": 5,
-             "SEARCH_PROVIDER_MODE": "google_news_only",
-             "ENABLE_CASCADE_SEARCH": "true"
-         }), \
+         patch("app.services.sheets_service.sheets_service.get_config_dict", return_value=mock_config), \
          patch("app.services.sheets_service.sheets_service.get_all_reviews", return_value=[]), \
          patch("app.services.search_service.search_service.search_with_fallback", side_effect=side_effect_search) as mock_search, \
          patch("app.services.article_extractor.article_extractor.extract", return_value={
@@ -1158,7 +1161,7 @@ def test_broad_news_search_triggers_and_budget_guaranteed():
              sheet_id="sheet_id",
              row_index=2,
              isbn="123456",
-             title="YOUCAT Biblia",
+             title="YOUCAT Biblia Joven",
              author="VV.AA.",
              max_pages=1,
              max_candidates=5,
@@ -1166,6 +1169,7 @@ def test_broad_news_search_triggers_and_budget_guaranteed():
              openai_model="gpt-4o",
              existing_hashes=set(),
              existing_secondary_keys=set(),
+             run_config=mock_config,
              dry_run=False
          )
          
@@ -1203,7 +1207,7 @@ def test_broad_news_search_triggers_and_budget_guaranteed():
          queries_payload = json.loads(detail_str)
          assert "prioritarias" in queries_payload
          assert "broad_queries" in queries_payload
-         assert "youcat biblia" in queries_payload["broad_queries"]
+         assert any("youcat biblia" in q.lower() for q in queries_payload["broad_queries"])
 
          # Verification 4: GOOGLE_NEWS_BROAD_STARTED is logged
          args, kwargs = find_log_call("GOOGLE_NEWS_BROAD_STARTED")

@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     LOG_MAX_ROWS: int = 1000
     DESCARTES_RETENTION_DAYS: int = 30
     DESCARTES_MAX_ROWS: int = 1000
+    DEBUG_SEARCH_QUERIES: bool = False
 
 
 

@@ -141,11 +141,188 @@ SCOPES = [
     'https://www.googleapis.com/auth/drive'
 ]
 
+import time
+
+class RetryWorksheetProxy:
+    def __init__(self, worksheet, service):
+        self._worksheet = worksheet
+        self._service = service
+
+    def __getattr__(self, name):
+        attr = getattr(self._worksheet, name)
+        # Wrap all worksheet methods that query or write
+        if name in (
+            "get_all_values", "col_values", "update", "append_rows", "append_row",
+            "batch_update", "get_all_records", "resize", "row_values", "cell_values"
+        ):
+            def wrapped(*args, **kwargs):
+                return self._service._execute_with_google_retry(
+                    f"worksheet.{name}",
+                    lambda: attr(*args, **kwargs),
+                    is_write=(name in ("append_row", "append_rows", "update", "batch_update"))
+                )
+            return wrapped
+        return attr
+
+    def __setattr__(self, name, value):
+        if name in ("_worksheet", "_service"):
+            super().__setattr__(name, value)
+        else:
+            setattr(self._worksheet, name, value)
+
+    @property
+    def title(self):
+        return self._worksheet.title
+
+    @property
+    def id(self):
+        return self._worksheet.id
+
+    @property
+    def row_count(self):
+        return self._worksheet.row_count
+
+    @property
+    def col_count(self):
+        return self._worksheet.col_count
+
+
+class RetrySpreadsheetProxy:
+    def __init__(self, spreadsheet, service):
+        self._spreadsheet = spreadsheet
+        self._service = service
+
+    def __getattr__(self, name):
+        attr = getattr(self._spreadsheet, name)
+        if name == "worksheet":
+            def wrapped(title, *args, **kwargs):
+                ws = self._service._execute_with_google_retry(
+                    f"spreadsheet.worksheet({title})",
+                    lambda: attr(title, *args, **kwargs)
+                )
+                return RetryWorksheetProxy(ws, self._service)
+            return wrapped
+        if name == "worksheets":
+            def wrapped(*args, **kwargs):
+                wss = self._service._execute_with_google_retry(
+                    "spreadsheet.worksheets",
+                    lambda: attr(*args, **kwargs)
+                )
+                return [RetryWorksheetProxy(ws, self._service) for ws in wss]
+            return wrapped
+        if name == "add_worksheet":
+            def wrapped(*args, **kwargs):
+                ws = self._service._execute_with_google_retry(
+                    "spreadsheet.add_worksheet",
+                    lambda: attr(*args, **kwargs),
+                    is_write=True
+                )
+                return RetryWorksheetProxy(ws, self._service)
+            return wrapped
+        if name == "duplicate_sheet":
+            def wrapped(*args, **kwargs):
+                ws = self._service._execute_with_google_retry(
+                    "spreadsheet.duplicate_sheet",
+                    lambda: attr(*args, **kwargs),
+                    is_write=True
+                )
+                return RetryWorksheetProxy(ws, self._service)
+            return wrapped
+        if name in ("batch_update", "del_worksheet"):
+            def wrapped(*args, **kwargs):
+                return self._service._execute_with_google_retry(
+                    f"spreadsheet.{name}",
+                    lambda: attr(*args, **kwargs),
+                    is_write=True
+                )
+            return wrapped
+        return attr
+
+    def __setattr__(self, name, value):
+        if name in ("_spreadsheet", "_service"):
+            super().__setattr__(name, value)
+        else:
+            setattr(self._spreadsheet, name, value)
+
+    @property
+    def title(self):
+        return self._spreadsheet.title
+
+    @property
+    def id(self):
+        return self._spreadsheet.id
+
+
+class RetryClientProxy:
+    def __init__(self, client, service):
+        self._client = client
+        self._service = service
+
+    def __getattr__(self, name):
+        attr = getattr(self._client, name)
+        if name == "open_by_key":
+            def wrapped(key, *args, **kwargs):
+                ss = self._service._execute_with_google_retry(
+                    "client.open_by_key",
+                    lambda: attr(key, *args, **kwargs)
+                )
+                return RetrySpreadsheetProxy(ss, self._service)
+            return wrapped
+        return attr
+
+    def __setattr__(self, name, value):
+        if name in ("_client", "_service"):
+            super().__setattr__(name, value)
+        else:
+            setattr(self._client, name, value)
+
+
 class SheetsService:
     def __init__(self):
         self._client = None
         self.old_modo_prueba = None
         self._log_lock = threading.Lock()
+
+    def _execute_with_google_retry(self, operation_name: str, fn, max_retries: int = 3, is_write: bool = False):
+        retries = 0
+        backoff_times = [2.0, 5.0, 10.0]
+        while True:
+            try:
+                res = fn()
+                if retries > 0:
+                    print(f"GOOGLE_SHEETS_RETRY_SUCCESS: Operation '{operation_name}' succeeded after {retries} retries.")
+                    logger.info(f"[GOOGLE_SHEETS_RETRY_SUCCESS] Operation '{operation_name}' succeeded after {retries} retries.")
+                return res
+            except gspread.exceptions.APIError as e:
+                err_msg = str(e)
+                resp = getattr(e, "response", None)
+                status_code = getattr(resp, "status_code", None)
+                
+                is_quota_error = (
+                    status_code == 429 or
+                    "429" in err_msg or
+                    "quota exceeded" in err_msg.lower() or
+                    "rate limit" in err_msg.lower() or
+                    "requests per minute" in err_msg.lower() or
+                    "read requests per minute per user" in err_msg.lower()
+                )
+                
+                if is_quota_error and retries < max_retries:
+                    wait_time = backoff_times[retries] if retries < len(backoff_times) else 10.0
+                    print(f"GOOGLE_SHEETS_RETRY: Operation '{operation_name}' failed with quota/rate limit error. Retrying in {wait_time}s... Attempt {retries+1}/{max_retries}. Error: {e}")
+                    logger.warning(
+                        f"[GOOGLE_SHEETS_RETRY] Google Sheets API quota/limit exceeded for '{operation_name}'. "
+                        f"Attempt {retries + 1}/{max_retries}. Waiting {wait_time}s before retry. Error: {e}"
+                    )
+                    time.sleep(wait_time)
+                    retries += 1
+                else:
+                    print(f"GOOGLE_SHEETS_RETRY_FAILED: Operation '{operation_name}' failed permanently. Error: {e}")
+                    logger.error(
+                        f"[GOOGLE_SHEETS_RETRY_FAILED] Google Sheets operation '{operation_name}' failed permanently. "
+                        f"Retries attempted: {retries}. Error: {e}"
+                    )
+                    raise e
 
     def get_client(self) -> gspread.Client:
         if self._client is None:
@@ -154,7 +331,7 @@ class SheetsService:
                 raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 is not configured in environment variables.")
             credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
             self._client = gspread.authorize(credentials)
-        return self._client
+        return RetryClientProxy(self._client, self)
 
     def ensure_sheet(self, sheet_id: str) -> Dict[str, Any]:
         """
@@ -672,7 +849,8 @@ class SheetsService:
             {"Clave": "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", "Valor": getattr(settings, "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", True), "Descripción": "Activar búsqueda interna si el total de candidatos es bajo"},
             {"Clave": "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", "Valor": getattr(settings, "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", True), "Descripción": "Ejecutar siempre búsqueda interna en dominios activos (true=siempre, false=solo si pocos candidatos)"},
             {"Clave": "LOG_RETENTION_DAYS", "Valor": settings.LOG_RETENTION_DAYS, "Descripción": "Días de retención de logs en la pestaña Logs"},
-            {"Clave": "DESCARTES_RETENTION_DAYS", "Valor": getattr(settings, "DESCARTES_RETENTION_DAYS", 30), "Descripción": "Días de retención de descartes en la pestaña Descartes"}
+            {"Clave": "DESCARTES_RETENTION_DAYS", "Valor": getattr(settings, "DESCARTES_RETENTION_DAYS", 30), "Descripción": "Días de retención de descartes en la pestaña Descartes"},
+            {"Clave": "DEBUG_SEARCH_QUERIES", "Valor": "FALSE", "Descripción": "Si está activado, se registra una fila de log por cada query individual de búsqueda en la hoja Logs."}
         ]
 
         # Re-write Config keeping only allowed basic keys
