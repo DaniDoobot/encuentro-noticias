@@ -3962,3 +3962,148 @@ def test_sync_update_fuentes_uses_dynamic_headers():
         assert cell_values[2] == "completado"
         assert cell_values[4] == "2026-07-02"
         assert cell_values[5] == ""
+
+
+def test_schema_index_sources_request_defaults():
+    from app.schemas import IndexSourcesRequest
+    req = IndexSourcesRequest()
+    assert req.limit_domains is None
+    assert req.force_refresh is False
+    assert req.limit_domains != 10
+
+
+def test_sources_index_limits_resolution():
+    from app.routers.sources import execute_indexing_job
+    from unittest.mock import patch, MagicMock
+    import json
+    
+    mock_sources = [{"domain": f"dom_{i}.com", "active": True} for i in range(10)]
+    
+    mock_ws = MagicMock()
+    mock_ws.get_all_records.return_value = [{"Dominio": f"dom_{i}.com"} for i in range(10)]
+    mock_client = MagicMock()
+    mock_client.open_by_key.return_value.worksheet.return_value = mock_ws
+    
+    # Test case 1: Config INDEX_MAX_SOURCES_PER_RUN=0, req.limit_domains=None (absent) => no limit (10 sources)
+    with patch("app.services.sheets_service.sheets_service.get_config_dict", return_value={"INDEX_MAX_SOURCES_PER_RUN": 0}),          patch("app.services.sheets_service.sheets_service.get_client", return_value=mock_client),          patch("app.services.sheets_service.sheets_service._get_worksheet_headers"),          patch("app.services.sheets_service.sheets_service.get_active_sources", return_value=mock_sources),          patch("app.services.sheets_service.sheets_service.update_source_index_status"),          patch("app.services.domain_indexer.domain_indexer.index_all", return_value=[]) as mock_index_all,          patch("app.routers.sources.update_job_status") as mock_update_status,          patch("app.services.logger_service.logger_service.log") as mock_log:
+         
+         execute_indexing_job("job_resolve_1", limit_domains=None, force_refresh=False, sheet_id="sheet_id")
+         
+         args, kwargs = mock_index_all.call_args
+         assert len(kwargs["sources"]) == 10
+         
+         resolved_calls = [c for c in mock_log.call_args_list if c[1].get("action") == "INDEX_LIMIT_RESOLVED"]
+         assert len(resolved_calls) == 1
+         detail = json.loads(resolved_calls[0][1]["detail"])
+         assert detail["req_limit_domains"] is None
+         assert detail["config_INDEX_MAX_SOURCES_PER_RUN"] == 0
+         assert detail["effective_limit"] == 0
+         assert detail["domains_total"] == 10
+
+    # Test case 2: Config INDEX_MAX_SOURCES_PER_RUN=0, req.limit_domains=0 => no limit (10 sources)
+    with patch("app.services.sheets_service.sheets_service.get_config_dict", return_value={"INDEX_MAX_SOURCES_PER_RUN": 0}),          patch("app.services.sheets_service.sheets_service.get_client", return_value=mock_client),          patch("app.services.sheets_service.sheets_service._get_worksheet_headers"),          patch("app.services.sheets_service.sheets_service.get_active_sources", return_value=mock_sources),          patch("app.services.sheets_service.sheets_service.update_source_index_status"),          patch("app.services.domain_indexer.domain_indexer.index_all", return_value=[]),          patch("app.routers.sources.update_job_status"),          patch("app.services.logger_service.logger_service.log") as mock_log:
+         
+         execute_indexing_job("job_resolve_2", limit_domains=0, force_refresh=False, sheet_id="sheet_id")
+         
+         resolved_calls = [c for c in mock_log.call_args_list if c[1].get("action") == "INDEX_LIMIT_RESOLVED"]
+         detail = json.loads(resolved_calls[0][1]["detail"])
+         assert detail["req_limit_domains"] == 0
+         assert detail["effective_limit"] == 0
+         assert detail["domains_total"] == 10
+
+    # Test case 3: Config INDEX_MAX_SOURCES_PER_RUN=3, req.limit_domains=None => limit to 3
+    with patch("app.services.sheets_service.sheets_service.get_config_dict", return_value={"INDEX_MAX_SOURCES_PER_RUN": 3}),          patch("app.services.sheets_service.sheets_service.get_client", return_value=mock_client),          patch("app.services.sheets_service.sheets_service._get_worksheet_headers"),          patch("app.services.sheets_service.sheets_service.get_active_sources", return_value=mock_sources),          patch("app.services.sheets_service.sheets_service.update_source_index_status"),          patch("app.services.domain_indexer.domain_indexer.index_all", return_value=[]) as mock_index_all_3,          patch("app.routers.sources.update_job_status"),          patch("app.services.logger_service.logger_service.log") as mock_log:
+         
+         execute_indexing_job("job_resolve_3", limit_domains=None, force_refresh=False, sheet_id="sheet_id")
+         
+         args, kwargs = mock_index_all_3.call_args
+         assert len(kwargs["sources"]) == 3
+         
+         resolved_calls = [c for c in mock_log.call_args_list if c[1].get("action") == "INDEX_LIMIT_RESOLVED"]
+         detail = json.loads(resolved_calls[0][1]["detail"])
+         assert detail["config_INDEX_MAX_SOURCES_PER_RUN"] == 3
+         assert detail["effective_limit"] == 3
+         assert detail["domains_total"] == 3
+
+    # Test case 4: req.limit_domains=5 even if config is 0 => limit to 5
+    with patch("app.services.sheets_service.sheets_service.get_config_dict", return_value={"INDEX_MAX_SOURCES_PER_RUN": 0}),          patch("app.services.sheets_service.sheets_service.get_client", return_value=mock_client),          patch("app.services.sheets_service.sheets_service._get_worksheet_headers"),          patch("app.services.sheets_service.sheets_service.get_active_sources", return_value=mock_sources),          patch("app.services.sheets_service.sheets_service.update_source_index_status"),          patch("app.services.domain_indexer.domain_indexer.index_all", return_value=[]) as mock_index_all_5,          patch("app.routers.sources.update_job_status"),          patch("app.services.logger_service.logger_service.log") as mock_log:
+         
+         execute_indexing_job("job_resolve_4", limit_domains=5, force_refresh=False, sheet_id="sheet_id")
+         
+         args, kwargs = mock_index_all_5.call_args
+         assert len(kwargs["sources"]) == 5
+         
+         resolved_calls = [c for c in mock_log.call_args_list if c[1].get("action") == "INDEX_LIMIT_RESOLVED"]
+         detail = json.loads(resolved_calls[0][1]["detail"])
+         assert detail["req_limit_domains"] == 5
+         assert detail["effective_limit"] == 5
+         assert detail["domains_total"] == 5
+
+
+def test_post_sources_index_endpoint_async_and_double_indexing():
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.config import settings
+    from app.routers.sources import job_registry
+    from unittest.mock import patch
+    
+    client = TestClient(app)
+    
+    headers = {"X-Admin-Token": settings.ADMIN_TOKEN or "dummy_token"}
+    
+    with patch("app.services.sheets_service.sheets_service.get_client"), \
+         patch("app.services.sheets_service.sheets_service.invalidate_sources_cache"), \
+         patch("app.routers.sources.run_indexing_background") as mock_run_background:
+         
+         try:
+             job_registry.clear()
+             # First call should succeed and launch background thread immediately
+             response = client.post("/sources/index", json={"force_refresh": False}, headers=headers)
+             assert response.status_code == 200
+             data = response.json()
+             assert "job_id" in data
+             assert data["status"] == "running"
+             assert data["message"] == "Indexación iniciada en segundo plano"
+             assert mock_run_background.called
+             
+             # Second call should fail with 409 Conflict because there's already a running job
+             response_dup = client.post("/sources/index", json={"force_refresh": False}, headers=headers)
+             assert response_dup.status_code == 409
+             assert "Ya hay una tarea de indexación en ejecución" in response_dup.json()["detail"]
+         finally:
+             job_registry.clear()
+
+
+def test_sources_index_preview_endpoint():
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.config import settings
+    from unittest.mock import patch, MagicMock
+    
+    client = TestClient(app)
+    
+    mock_sources = [{"domain": f"dom_{i}.com", "active": True} for i in range(10)]
+    mock_ws = MagicMock()
+    mock_ws.get_all_records.return_value = [{"Dominio": f"dom_{i}.com"} for i in range(10)]
+    mock_client = MagicMock()
+    mock_client.open_by_key.return_value.worksheet.return_value = mock_ws
+    
+    headers = {"X-Admin-Token": settings.ADMIN_TOKEN or "dummy_token"}
+    
+    with patch("app.services.sheets_service.sheets_service.get_config_dict", return_value={"INDEX_MAX_SOURCES_PER_RUN": 3}),          patch("app.services.sheets_service.sheets_service.get_client", return_value=mock_client),          patch("app.services.sheets_service.sheets_service.invalidate_sources_cache"),          patch("app.services.sheets_service.sheets_service.get_active_sources", return_value=mock_sources):
+         
+         response = client.get("/sources/index/preview", headers=headers)
+         assert response.status_code == 200
+         data = response.json()
+         assert data["sources_total"] == 10
+         assert data["sources_selected"] == 10
+         assert data["config_INDEX_MAX_SOURCES_PER_RUN"] == 3
+         assert data["effective_limit"] == 3
+         assert data["domains_to_index"] == ["dom_0.com", "dom_1.com", "dom_2.com"]
+         
+         # Query param limit_domains overrides config
+         response_override = client.get("/sources/index/preview?limit_domains=5", headers=headers)
+         assert response_override.status_code == 200
+         data_override = response_override.json()
+         assert data_override["effective_limit"] == 5
+         assert len(data_override["domains_to_index"]) == 5

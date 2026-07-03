@@ -627,8 +627,7 @@ function indexSources() {
   }
   
   var payload = {
-    "limit_domains": 10,
-    "force_refresh": true
+    "force_refresh": false
   };
   
   var headers = {

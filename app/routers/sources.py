@@ -1,4 +1,5 @@
 import uuid
+import json
 import threading
 import logging
 import datetime
@@ -65,21 +66,48 @@ def execute_indexing_job(job_id: str, limit_domains: Optional[int], force_refres
         sources = sheets_service.get_active_sources(sheet_id)
         sources_selected = len(sources)
         
-        max_sources_per_run = config.get("INDEX_MAX_SOURCES_PER_RUN", 0)
-        
-        # Limit the number of domains if requested
-        final_limit = limit_domains if limit_domains is not None else max_sources_per_run
-        if final_limit > 0:
-            sources = sources[:final_limit]
+        req_limit = limit_domains
+        config_limit_val = config.get("INDEX_MAX_SOURCES_PER_RUN", 0)
+        try:
+            config_limit = int(config_limit_val) if config_limit_val not in (None, "") else 0
+        except Exception:
+            config_limit = 0
+            
+        if req_limit is not None:
+            effective_limit = req_limit
+        else:
+            effective_limit = config_limit
+
+        if effective_limit > 0:
+            sources = sources[:effective_limit]
+        else:
+            effective_limit = 0
             
         domains_total = len(sources)
+        
+        logger_service.log(
+            level="INFO",
+            action="INDEX_LIMIT_RESOLVED",
+            message=f"Resolución de límite de fuentes: req={req_limit}, config={config_limit}, efectivo={effective_limit}",
+            detail=json.dumps({
+                "req_limit_domains": req_limit,
+                "config_INDEX_MAX_SOURCES_PER_RUN": config_limit,
+                "effective_limit": effective_limit,
+                "sources_total": sources_total,
+                "sources_selected": sources_selected,
+                "domains_total": domains_total,
+                "domains_to_index": [s["domain"] for s in sources]
+            }),
+            sheet_id=sheet_id,
+            run_id=job_id
+        )
         
         update_job_status(
             job_id,
             sources_total=sources_total,
             sources_selected=sources_selected,
             domains_total=domains_total,
-            max_sources_per_run=max_sources_per_run
+            max_sources_per_run=effective_limit
         )
 
         def log_fn(msg: str):
@@ -262,10 +290,27 @@ def post_sources_index(req: IndexSourcesRequest):
     """
     Launches or runs a domain index task for active sources in Google Sheets.
     """
+    # 1. Protect against double indexation
+    with job_registry_lock:
+        is_running = any(job.get("status") == "running" for job in job_registry.values())
+    if is_running or sheets_service.is_indexing_active:
+        running_job = None
+        with job_registry_lock:
+            for job in job_registry.values():
+                if job.get("status") == "running":
+                    running_job = job
+                    break
+        msg = "Ya hay una tarea de indexación en ejecución."
+        if running_job:
+            msg += f" Job ID activo: {running_job['job_id']}"
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=msg
+        )
+
     job_id = f"idx_{uuid.uuid4().hex[:8]}"
     limit = req.limit_domains  # Can be None!
     force = req.force_refresh if req.force_refresh is not None else False
-    background = req.background if req.background is not None else False
     
     # Check if google credentials are valid
     try:
@@ -297,24 +342,18 @@ def post_sources_index(req: IndexSourcesRequest):
             "errors": []
         }
         
-    if background:
-        thread = threading.Thread(
-            target=run_indexing_background,
-            args=(job_id, limit, force, settings.GOOGLE_SHEET_ID)
-        )
-        thread.daemon = True
-        thread.start()
-        
-        return {
-            "success": True,
-            "job_id": job_id,
-            "status": "running",
-            "message": f"Indexación iniciada en segundo plano con ID {job_id}."
-        }
-    else:
-        # Run synchronously
-        res = execute_indexing_job(job_id, limit, force, settings.GOOGLE_SHEET_ID)
-        return res
+    thread = threading.Thread(
+        target=run_indexing_background,
+        args=(job_id, limit, force, settings.GOOGLE_SHEET_ID)
+    )
+    thread.daemon = True
+    thread.start()
+    
+    return {
+        "job_id": job_id,
+        "status": "running",
+        "message": "Indexación iniciada en segundo plano"
+    }
 
 
 @router.get("/sources/index/status")
@@ -339,6 +378,65 @@ def get_sources_index_status(job_id: Optional[str] = None):
         # Return latest job by started_at descending
         latest_job = max(job_registry.values(), key=lambda j: j["started_at"])
         return latest_job
+
+
+@router.get("/sources/index/preview")
+def get_sources_index_preview(limit_domains: Optional[int] = None):
+    """
+    Returns a preview of the domains that would be indexed under current config and requests.
+    Does not run any execution, write status or modify logs.
+    """
+    sheet_id = settings.GOOGLE_SHEET_ID
+    
+    # Invalidate cache of sources and config to get fresh values
+    sheets_service.invalidate_sources_cache(sheet_id)
+    if sheet_id in sheets_service._config_cache:
+        del sheets_service._config_cache[sheet_id]
+        
+    config = sheets_service.get_config_dict(sheet_id)
+    
+    # Read Fuentes raw to calculate sources_total
+    client = sheets_service.get_client()
+    spreadsheet = client.open_by_key(sheet_id)
+    worksheet = spreadsheet.worksheet("Fuentes")
+    records = worksheet.get_all_records()
+    
+    sources_total = 0
+    for r in records:
+        if str(r.get("Dominio", "")).strip():
+            sources_total += 1
+            
+    # Now get active and index-enabled sources
+    sources = sheets_service.get_active_sources(sheet_id)
+    sources_selected = len(sources)
+    
+    config_limit_val = config.get("INDEX_MAX_SOURCES_PER_RUN", 0)
+    try:
+        config_limit = int(config_limit_val) if config_limit_val not in (None, "") else 0
+    except Exception:
+        config_limit = 0
+        
+    if limit_domains is not None:
+        effective_limit = limit_domains
+    else:
+        effective_limit = config_limit
+        
+    # Apply limit
+    if effective_limit > 0:
+        sources_to_index = sources[:effective_limit]
+    else:
+        sources_to_index = sources
+        effective_limit = 0
+        
+    domains_to_index = [s["domain"] for s in sources_to_index]
+    
+    return {
+        "sources_total": sources_total,
+        "sources_selected": sources_selected,
+        "config_INDEX_MAX_SOURCES_PER_RUN": config_limit,
+        "effective_limit": effective_limit,
+        "domains_to_index": domains_to_index
+    }
 
 
 @router.get("/sources/status", response_model=SourcesStatusResponse)
