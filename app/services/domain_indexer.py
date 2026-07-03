@@ -381,6 +381,12 @@ class DomainIndexer:
 
         cache_service.init_db(db_path)
 
+        method = domain_config.get("discovery_method", "auto") or "auto"
+        method = method.lower().strip()
+        if method == "disabled":
+            logger.info(f"DOMAIN_INDEX: {domain} discovery_method is disabled, skipping.")
+            return {"domain": domain, "urls_found": 0, "urls_stored": 0, "errors": [], "skipped": True}
+
         if not force_refresh and not cache_service.needs_refresh(domain, refresh_days):
             logger.info(f"DOMAIN_INDEX: {domain} up-to-date, skipping.")
             return {"domain": domain, "urls_found": 0, "urls_stored": 0, "errors": [], "skipped": True}
@@ -415,75 +421,45 @@ class DomainIndexer:
         discovery_method = "none"
         last_error_msg = ""
         
+        # Log SOURCE_DISCOVERY_STARTED
+        from app.services.logger_service import logger_service
+        logger_service.log(
+            "INFO", "SOURCE_DISCOVERY_STARTED",
+            f"Iniciando descubrimiento de URLs para {domain} usando método: {method}",
+            sheet_id=sheet_id, run_id=run_id
+        )
+
         # Phase A: Sitemap Crawling
-        sitemaps_to_try = list(sitemaps_found_in_robots)
-        
-        config_sitemap = domain_config.get("sitemap_url") or ""
-        if config_sitemap:
-            if config_sitemap not in sitemaps_to_try:
-                sitemaps_to_try.insert(0, config_sitemap)
-                
-        common_sitemap_urls = [
-            f"https://{domain}/sitemap.xml",
-            f"https://{domain}/sitemap_index.xml",
-            f"https://{domain}/wp-sitemap.xml",
-            f"https://{domain}/post-sitemap.xml",
-            f"https://{domain}/page-sitemap.xml",
-            f"https://{domain}/category-sitemap.xml",
-            f"https://{domain}/sitemap-posts.xml",
-            f"https://{domain}/news-sitemap.xml",
-        ]
-        
-        # If we have no sitemaps from robots.txt/config, use common paths directly
-        if not sitemaps_to_try:
-            sitemaps_to_try = list(common_sitemap_urls)
-            is_common_fallback = True
+        sitemaps_to_try = []
+        if method in ("auto", "sitemap"):
+            sitemaps_to_try = list(sitemaps_found_in_robots)
+            config_sitemap = domain_config.get("sitemap_url") or ""
+            if config_sitemap:
+                if config_sitemap not in sitemaps_to_try:
+                    sitemaps_to_try.insert(0, config_sitemap)
+                    
+            common_sitemap_urls = [
+                f"https://{domain}/sitemap.xml",
+                f"https://{domain}/sitemap_index.xml",
+                f"https://{domain}/wp-sitemap.xml",
+                f"https://{domain}/post-sitemap.xml",
+                f"https://{domain}/page-sitemap.xml",
+                f"https://{domain}/category-sitemap.xml",
+                f"https://{domain}/sitemap-posts.xml",
+                f"https://{domain}/news-sitemap.xml",
+            ]
+            if not sitemaps_to_try:
+                sitemaps_to_try = list(common_sitemap_urls)
+                is_common_fallback = True
+            else:
+                is_common_fallback = False
         else:
             is_common_fallback = False
             
         sitemap_items = []
-        for s_url in sitemaps_to_try:
-            _log(f"Trying sitemap: {s_url}")
-            r = _get(s_url, timeout=timeout)
-            if r:
-                text_stripped = r.text.strip()
-                if "xml" in r.headers.get("content-type", "") or text_stripped.startswith("<"):
-                    try:
-                        items = _parse_sitemap_xml(r.text, domain, max_urls)
-                        if items:
-                            sitemap_items.extend(items)
-                            sitemaps_contacted.append(s_url)
-                            if not is_common_fallback and s_url in sitemaps_found_in_robots:
-                                discovery_method = "robots_txt"
-                            else:
-                                discovery_method = "common_sitemap"
-                            _log(f"Sitemap {s_url} succeeded: found {len(items)} URLs")
-                            
-                            # Log SOURCE_SITEMAP_DISCOVERED
-                            from app.services.logger_service import logger_service
-                            logger_service.log(
-                                "INFO", "SOURCE_SITEMAP_DISCOVERED",
-                                f"Sitemap descubierta e indexada para {domain}: {s_url} ({len(items)} URLs encontradas)",
-                                sheet_id=sheet_id, run_id=run_id
-                            )
-                            break
-                    except Exception as e:
-                        last_error_msg = f"Sitemap parse error on {s_url}: {e}"
-                        errors.append(f"sitemap_parse_error_{s_url}")
-                else:
-                    last_error_msg = f"Sitemap {s_url} returned non-XML content"
-                    errors.append(f"sitemap_invalid_content_{s_url}")
-            else:
-                last_error_msg = f"Sitemap {s_url} could not be retrieved"
-                errors.append(f"sitemap_not_retrieved_{s_url}")
-                
-        # If sitemap crawling yielded no URLs, try common sitemap URLs if we haven't already
-        if not sitemap_items and not is_common_fallback:
-            _log("Robots.txt sitemaps yielded 0 URLs. Trying common sitemap paths...")
-            for s_url in common_sitemap_urls:
-                if s_url in sitemaps_to_try:
-                    continue
-                _log(f"Trying common sitemap: {s_url}")
+        if method in ("auto", "sitemap"):
+            for s_url in sitemaps_to_try:
+                _log(f"Trying sitemap: {s_url}")
                 r = _get(s_url, timeout=timeout)
                 if r:
                     text_stripped = r.text.strip()
@@ -493,11 +469,13 @@ class DomainIndexer:
                             if items:
                                 sitemap_items.extend(items)
                                 sitemaps_contacted.append(s_url)
-                                discovery_method = "common_sitemap"
-                                _log(f"Common sitemap {s_url} succeeded: found {len(items)} URLs")
+                                if not is_common_fallback and s_url in sitemaps_found_in_robots:
+                                    discovery_method = "robots_txt"
+                                else:
+                                    discovery_method = "common_sitemap"
+                                _log(f"Sitemap {s_url} succeeded: found {len(items)} URLs")
                                 
                                 # Log SOURCE_SITEMAP_DISCOVERED
-                                from app.services.logger_service import logger_service
                                 logger_service.log(
                                     "INFO", "SOURCE_SITEMAP_DISCOVERED",
                                     f"Sitemap descubierta e indexada para {domain}: {s_url} ({len(items)} URLs encontradas)",
@@ -507,11 +485,54 @@ class DomainIndexer:
                         except Exception as e:
                             last_error_msg = f"Sitemap parse error on {s_url}: {e}"
                             errors.append(f"sitemap_parse_error_{s_url}")
-                            
+                    else:
+                        last_error_msg = f"Sitemap {s_url} returned non-XML content"
+                        errors.append(f"sitemap_invalid_content_{s_url}")
+                else:
+                    last_error_msg = f"Sitemap {s_url} could not be retrieved"
+                    errors.append(f"sitemap_not_retrieved_{s_url}")
+                    
+            # If sitemap crawling yielded no URLs, try common sitemap URLs if we haven't already
+            if not sitemap_items and not is_common_fallback:
+                _log("Robots.txt sitemaps yielded 0 URLs. Trying common sitemap paths...")
+                for s_url in common_sitemap_urls:
+                    if s_url in sitemaps_to_try:
+                        continue
+                    _log(f"Trying common sitemap: {s_url}")
+                    r = _get(s_url, timeout=timeout)
+                    if r:
+                        text_stripped = r.text.strip()
+                        if "xml" in r.headers.get("content-type", "") or text_stripped.startswith("<"):
+                            try:
+                                items = _parse_sitemap_xml(r.text, domain, max_urls)
+                                if items:
+                                    sitemap_items.extend(items)
+                                    sitemaps_contacted.append(s_url)
+                                    discovery_method = "common_sitemap"
+                                    _log(f"Common sitemap {s_url} succeeded: found {len(items)} URLs")
+                                    
+                                    # Log SOURCE_SITEMAP_DISCOVERED
+                                    logger_service.log(
+                                        "INFO", "SOURCE_SITEMAP_DISCOVERED",
+                                        f"Sitemap descubierta e indexada para {domain}: {s_url} ({len(items)} URLs encontradas)",
+                                        sheet_id=sheet_id, run_id=run_id
+                                    )
+                                    break
+                            except Exception as e:
+                                last_error_msg = f"Sitemap parse error on {s_url}: {e}"
+                                errors.append(f"sitemap_parse_error_{s_url}")
+
+        if method in ("auto", "sitemap") and not sitemap_items:
+            logger_service.log(
+                "WARNING", "SOURCE_DISCOVERY_SITEMAP_FAILED",
+                f"Fallo en descubrimiento por Sitemap para {domain}.",
+                sheet_id=sheet_id, run_id=run_id
+            )
+
         all_items.extend(sitemap_items)
 
         # Phase B: RSS fallback
-        if len(all_items) == 0:
+        if len(all_items) == 0 and method in ("auto", "rss"):
             _log("Sitemaps yielded 0 URLs. Trying RSS paths...")
             rss_paths_to_try = []
             config_rss = domain_config.get("rss_url") or ""
@@ -542,7 +563,6 @@ class DomainIndexer:
                             _log(f"RSS feed {r_url} succeeded: found {len(rss_items)} entries")
                             
                             # Log SOURCE_RSS_DISCOVERED
-                            from app.services.logger_service import logger_service
                             logger_service.log(
                                 "INFO", "SOURCE_RSS_DISCOVERED",
                                 f"RSS descubierta e indexada para {domain}: {r_url} ({len(rss_items)} URLs encontradas)",
@@ -555,8 +575,21 @@ class DomainIndexer:
                 else:
                     errors.append(f"rss_not_retrieved_{r_url}")
 
+        if method in ("auto", "rss") and method != "auto" and len(all_items) == 0:
+            logger_service.log(
+                "WARNING", "SOURCE_DISCOVERY_RSS_FAILED",
+                f"Fallo en descubrimiento por RSS para {domain}.",
+                sheet_id=sheet_id, run_id=run_id
+            )
+        elif method == "auto" and len(sitemap_items) == 0 and len(all_items) == 0:
+            logger_service.log(
+                "WARNING", "SOURCE_DISCOVERY_RSS_FAILED",
+                f"Fallo en descubrimiento por RSS para {domain}.",
+                sheet_id=sheet_id, run_id=run_id
+            )
+
         # Phase C: WordPress REST API fallback
-        if len(all_items) == 0:
+        if len(all_items) == 0 and method in ("auto", "wordpress"):
             _log("Sitemaps and RSS yielded 0 URLs. Trying WordPress REST API...")
             try:
                 wp_url = f"https://{domain}/wp-json/wp/v2/posts?per_page=100"
@@ -584,6 +617,86 @@ class DomainIndexer:
                             _log(f"WordPress REST API succeeded: found {len(wp_items)} posts")
             except Exception as e:
                 errors.append(f"wordpress_rest_failed: {e}")
+
+        if method in ("auto", "wordpress") and len(all_items) == 0:
+            logger_service.log(
+                "WARNING", "SOURCE_DISCOVERY_WORDPRESS_FAILED",
+                f"Fallo en descubrimiento por WordPress REST para {domain}.",
+                sheet_id=sheet_id, run_id=run_id
+            )
+
+        # Phase D: crawl_seed
+        if len(all_items) == 0 and method in ("auto", "crawl_seed"):
+            seed_url = domain_config.get("seed_url") or f"https://{domain}"
+            _log(f"Trying crawl_seed with URL: {seed_url}")
+            r_seed = _get(seed_url, timeout=timeout)
+            if r_seed:
+                try:
+                    from bs4 import BeautifulSoup
+                    from urllib.parse import urljoin, urlparse
+                    soup = BeautifulSoup(r_seed.text, "html.parser")
+                    links_found = []
+                    seed_parsed = urlparse(seed_url)
+                    
+                    for a_tag in soup.find_all("a", href=True):
+                        href = a_tag["href"].strip()
+                        if not href:
+                            continue
+                        if href.startswith(("#", "javascript:", "mailto:", "tel:")):
+                            continue
+                            
+                        resolved_url = urljoin(seed_url, href)
+                        resolved_parsed = urlparse(resolved_url)
+                        
+                        # Verify same domain
+                        res_domain = resolved_parsed.netloc.lower().replace("www.", "")
+                        seed_domain = seed_parsed.netloc.lower().replace("www.", "")
+                        if res_domain != seed_domain:
+                            continue
+                            
+                        # Exclude obvious non-article pages/assets
+                        exclude_paths = ["/tag/", "/category/", "/login", "/privacy", "/cookies", "/search", "/feed", "/rss", "/wp-admin", "/contacto", "/sobre-nosotros", "/about"]
+                        if any(exp in resolved_parsed.path.lower() for exp in exclude_paths):
+                            continue
+                            
+                        # Verify it's a cultural/article URL using standard filters
+                        if not _is_cultural_url(resolved_url):
+                            continue
+                            
+                        normalized = _normalize_url(resolved_url)
+                        # Avoid duplicates
+                        if normalized not in [x["url"] for x in links_found]:
+                            link_title = a_tag.get_text().strip() or _title_from_slug(normalized)
+                            links_found.append({
+                                "url": normalized,
+                                "title": link_title,
+                                "pub_date": "",
+                                "provider": "crawl_seed"
+                            })
+                            
+                    if links_found:
+                        all_items.extend(links_found[:max_urls])
+                        discovery_method = "crawl_seed"
+                        _log(f"crawl_seed succeeded: found {len(links_found)} links")
+                        
+                        logger_service.log(
+                            "INFO", "SOURCE_CRAWL_SEED_DISCOVERED",
+                            f"crawl_seed exitoso para {domain} usando {seed_url} ({len(links_found)} URLs encontradas)",
+                            sheet_id=sheet_id, run_id=run_id
+                        )
+                except Exception as e:
+                    last_error_msg = f"crawl_seed parse error on {seed_url}: {e}"
+                    errors.append(f"crawl_seed_parse_error_{seed_url}")
+            else:
+                last_error_msg = f"crawl_seed {seed_url} could not be retrieved"
+                errors.append(f"crawl_seed_not_retrieved_{seed_url}")
+
+        if method == "crawl_seed" and len(all_items) == 0:
+            logger_service.log(
+                "WARNING", "SOURCE_DISCOVERY_CRAWL_SEED_FAILED",
+                f"Fallo en descubrimiento por crawl_seed para {domain}.",
+                sheet_id=sheet_id, run_id=run_id
+            )
 
         # Deduplicate by URL
         seen: set = set()
@@ -728,8 +841,24 @@ class DomainIndexer:
         )
 
         # Store domain status in SQLite domain_status table
-        if len(unique_items) == 0 and not errors:
-            errors.append("no_urls_found")
+        if len(unique_items) == 0:
+            if "no_urls_found" not in errors:
+                errors.append("no_urls_found")
+
+        # Store domain status in SQLite domain_status table
+        if len(unique_items) == 0:
+            logger_service.log(
+                "WARNING", "SOURCE_DISCOVERY_COMPLETED_WITH_ZERO_URLS",
+                f"Descubrimiento completado con 0 URLs para el dominio {domain}",
+                sheet_id=sheet_id, run_id=run_id
+            )
+            logger_service.log(
+                "WARNING", "SOURCE_DISCOVERY_NO_URLS",
+                f"No se encontraron URLs para el dominio {domain}: sitemap no disponible, RSS no disponible, WordPress REST falló.",
+                sheet_id=sheet_id, run_id=run_id
+            )
+            if "no_urls_found" not in errors:
+                errors.append("no_urls_found")
 
         try:
             cache_service.upsert_domain_status(
@@ -758,15 +887,21 @@ class DomainIndexer:
             run_id=run_id
         )
 
+        from app.services.sheets_service import get_now_madrid_str
+        last_activity_str = get_now_madrid_str()
+
         _log(f"Done: {len(unique_items)} URLs found, {stored} new stored, {len(errors)} errors")
         return {
             "domain": domain,
+            "row_index": domain_config.get("row_index"),
             "urls_found": len(unique_items),
             "urls_stored": stored,
+            "urls_enriched": enrich_count,
             "errors": errors,
             "skipped": False,
             "last_discovery_method": discovery_method,
             "last_error": last_error_msg,
+            "last_activity": last_activity_str
         }
 
     def index_all(
@@ -807,11 +942,13 @@ class DomainIndexer:
                 logger.error(f"DOMAIN_INDEX error indexing {domain}: {e}")
                 err_stats = {
                     "domain": domain,
+                    "row_index": source.get("row_index"),
                     "urls_found": 0,
                     "urls_stored": 0,
                     "urls_enriched": 0,
                     "errors": [str(e)],
                     "skipped": False,
+                    "last_activity": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
                 }
                 results.append(err_stats)
                 if on_domain_complete:

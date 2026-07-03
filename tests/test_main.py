@@ -1125,7 +1125,8 @@ def test_broad_news_search_triggers_and_budget_guaranteed():
          "MIN_MATCH_SCORE": 10,
          "MAX_CANDIDATES_PER_BOOK": 5,
          "SEARCH_PROVIDER_MODE": "google_news_only",
-         "ENABLE_CASCADE_SEARCH": "true"
+         "ENABLE_CASCADE_SEARCH": "true",
+         "DEBUG_SEARCH_QUERIES": "true"
      }
 
     with patch("app.services.source_discovery.source_discovery.find_candidates", return_value=[]), \
@@ -1634,8 +1635,20 @@ def test_update_source_index_status_updates_sheet():
         def update(self, range_name, values, **kwargs):
             self.updated_range = range_name
             self.updated_values = values
+    headers = ["Dominio", "Última indexación", "URLs indexadas", "Errores"]
+    
+    class FakeFuentesWorksheet:
+        def __init__(self):
+            self.updated_cells = None
+        def get_all_records(self):
+            return mock_records
+        def row_values(self, idx):
+            return headers
+        def update_cells(self, cells, **kwargs):
+            self.updated_cells = cells
             
     fake_ws = FakeFuentesWorksheet()
+    sheets_service._headers_cache.clear()
     
     with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
         mock_spreadsheet = MagicMock()
@@ -1650,9 +1663,10 @@ def test_update_source_index_status_updates_sheet():
             errors=[]
         )
         
-        # Row 2 (first domain in mock_records) should be updated to E2:G2 (cols 5, 6, 7)
-        assert fake_ws.updated_range == "E2:G2"
-        assert fake_ws.updated_values == [["2026-06-30T17:20:40", 989, ""]]
+        cell_vals = {c.col: c.value for c in fake_ws.updated_cells}
+        assert cell_vals[2] == "2026-06-30T17:20:40"
+        assert cell_vals[3] == 989
+        assert cell_vals[4] == ""
 
 
 def test_update_status_even_with_partial_errors():
@@ -1661,16 +1675,20 @@ def test_update_status_even_with_partial_errors():
     mock_records = [
         {"Dominio": "abc.es", "Última indexación": "", "URLs indexadas": "", "Errores": ""}
     ]
+    headers = ["Dominio", "Última indexación", "URLs indexadas", "Errores"]
     
     class FakeFuentesWorksheet:
         def __init__(self):
-            self.updated_values = None
+            self.updated_cells = None
         def get_all_records(self):
             return mock_records
-        def update(self, range_name, values, **kwargs):
-            self.updated_values = values
+        def row_values(self, idx):
+            return headers
+        def update_cells(self, cells, **kwargs):
+            self.updated_cells = cells
             
     fake_ws = FakeFuentesWorksheet()
+    sheets_service._headers_cache.clear()
     
     with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
         mock_spreadsheet = MagicMock()
@@ -1686,7 +1704,10 @@ def test_update_status_even_with_partial_errors():
             errors=["sitemap_parse_error", "timeout"]
         )
         
-        assert fake_ws.updated_values == [["2026-06-30T16:55:21", 541, "sitemap_parse_error, timeout"]]
+        cell_vals = {c.col: c.value for c in fake_ws.updated_cells}
+        assert cell_vals[2] == "2026-06-30T16:55:21"
+        assert cell_vals[3] == 541
+        assert cell_vals[4] == "sitemap_parse_error, timeout"
 
 
 def test_sync_status_endpoint():
@@ -1721,7 +1742,12 @@ def test_background_job_updates_realtime():
          patch("app.services.sheets_service.sheets_service.get_active_sources", return_value=mock_sources), \
          patch("app.services.cache_service.cache_service.get_domain_stats", return_value={"urls": 12}), \
          patch("app.services.domain_indexer.domain_indexer.index_all", return_value=mock_index_results) as mock_index, \
-         patch("app.services.sheets_service.sheets_service.update_source_index_status") as mock_update:
+         patch("app.services.sheets_service.sheets_service.update_source_index_status") as mock_update, \
+         patch("app.services.sheets_service.sheets_service.get_client") as mock_get_client:
+         
+         mock_ws = MagicMock()
+         mock_ws.get_all_records.return_value = [{"Dominio": "religionenlibertad.com"}]
+         mock_get_client.return_value.open_by_key.return_value.worksheet.return_value = mock_ws
          
          # Stub index_all to trigger on_domain_complete manually
          def fake_index_all(*args, **kwargs):
@@ -1741,13 +1767,13 @@ def test_background_job_updates_realtime():
          
          # update_source_index_status should have been called in real-time
          assert mock_update.called
-         mock_update.assert_called_with(
-             sheet_id="sheet_id",
-             domain="religionenlibertad.com",
-             last_indexed=ANY,
-             urls_indexed=12,
-             errors=["some_error"]
-         )
+         args, kwargs = mock_update.call_args
+         assert kwargs["sheet_id"] == "sheet_id"
+         assert kwargs["domain"] == "religionenlibertad.com"
+         assert kwargs["errors"] == ["some_error"]
+         assert kwargs["status_str"] == "completado_sin_urls"
+         assert kwargs["progreso"] == "100%"
+         assert kwargs["urls_found"] == 12
 
 
 def test_sync_sources_status_initialises_cache_service():
@@ -1763,6 +1789,8 @@ def test_sync_sources_status_initialises_cache_service():
             return mock_records
         def update_cells(self, cells, **kwargs):
             pass
+        def row_values(self, idx):
+            return ["Dominio", "Última indexación", "URLs indexadas", "Errores"]
             
     fake_ws = FakeFuentesWorksheet()
     
@@ -1794,6 +1822,8 @@ def test_sync_status_endpoint_initialization():
             return mock_records
         def update_cells(self, cells, **kwargs):
             pass
+        def row_values(self, idx):
+            return ["Dominio", "Última indexación", "URLs indexadas", "Errores"]
             
     fake_ws = FakeFuentesWorksheet()
     
@@ -2585,12 +2615,13 @@ def test_ensure_sheet_creates_simplified_headers_and_migrates_existing():
         assert "URL normalizada" not in mock_por_pub.values[0]
         assert "Estado publicación" in mock_por_pub.values[0]
         
-        # 4. Assert "Fuentes" has exactly 7 columns
-        assert len(mock_fuentes.values[0]) == 7
+        # 4. Assert "Fuentes" has exactly 18 columns
+        assert len(mock_fuentes.values[0]) == 18
         assert "Sitemap URL" not in mock_fuentes.values[0]
         assert "RSS URL" not in mock_fuentes.values[0]
         assert "Buscador interno" not in mock_fuentes.values[0]
-        assert mock_fuentes.values[0] == ["Dominio", "Activo", "Tipo", "Notas", "Última indexación", "URLs indexadas", "Errores"]
+        assert mock_fuentes.values[0][0] == "¿Indexar?"
+        assert mock_fuentes.values[0][1] == "Dominio"
 def test_panel_b5_numeric_validation():
     """B5 del Panel debe recibir validación NUMBER_BETWEEN (1-5000), no BOOLEAN.
     B6 y B7 deben recibir validación BOOLEAN (checkboxes).
@@ -3573,3 +3604,361 @@ def test_run_completion_robustness():
          # The run must have been updated to failed status and not remain running/pending (Condition 9, 10)
          assert current_runs[run_id]["status"] == "failed"
          assert "API Error" in current_runs[run_id]["message"]
+
+
+# --- NEW TEST CASES (FUENTES, LIMITS, 429, SEED CRAWL, DYNAMIC HEADERS) ---
+
+def test_ensure_sheet_fuentes_migration():
+    from app.services.sheets_service import SheetsService
+    from unittest.mock import patch, MagicMock
+    
+    existing_headers = ["Dominio", "Activo", "Tipo", "Notes", "URLs indexadas", "Errores"]
+    existing_rows = [
+        ["abc.es", "TRUE", "cultural", "nota 1", "42", "ninguno"],
+        ["def.com", "FALSE", "prensa", "nota 2", "0", "error x"]
+    ]
+    
+    class FakeWorksheet:
+        def __init__(self):
+            self.title = "Fuentes"
+            self.cleared = False
+            self.resized = False
+            self.updated_values = None
+            self.id = 9999
+            self.col_count = 18
+        def row_values(self, idx):
+            return existing_headers
+        def get_all_values(self):
+            return [existing_headers] + existing_rows
+        def clear(self):
+            self.cleared = True
+        def resize(self, **kwargs):
+            self.resized = True
+        def update(self, range_name, values, **kwargs):
+            self.updated_values = values
+        def get_all_records(self):
+            records = []
+            headers = self.get_all_values()[0]
+            for row in self.get_all_values()[1:]:
+                rec = {}
+                for idx, val in enumerate(row):
+                    if idx < len(headers):
+                        rec[headers[idx]] = val
+                records.append(rec)
+            return records
+        def append_row(self, row, value_input_option=None):
+            pass
+        def append_rows(self, rows, value_input_option=None):
+            pass
+        def append_row(self, row, value_input_option=None):
+            pass
+        def append_rows(self, rows, value_input_option=None):
+            pass
+            
+    fake_ws = FakeWorksheet()
+    
+    service = SheetsService()
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
+        mock_spreadsheet = MagicMock()
+        mock_spreadsheet.worksheets.return_value = [fake_ws]
+        mock_spreadsheet.worksheet.side_effect = lambda name: fake_ws if name == "Fuentes" else MagicMock()
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+        
+        service.ensure_sheet("dummy_sheet_id")
+        
+        assert fake_ws.cleared
+        migrated_rows = fake_ws.updated_values
+        assert migrated_rows is not None
+        assert migrated_rows[1][0] is True  # ¿Indexar? is True because Activo was TRUE
+        assert migrated_rows[1][1] == "abc.es"
+        assert migrated_rows[1][2] == "TRUE"
+        assert migrated_rows[1][12] == "42"  # URLs encontradas
+        assert migrated_rows[1][13] == "42"  # URLs almacenadas
+        assert migrated_rows[1][8] == "auto"  # Método descubrimiento default
+        assert migrated_rows[2][0] is False  # Activo was FALSE
+        assert migrated_rows[2][1] == "def.com"
+        assert migrated_rows[2][2] == "FALSE"
+        assert migrated_rows[2][12] == "0"  # URLs encontradas
+
+
+def test_get_active_sources_indexar_activo():
+    from app.services.sheets_service import SheetsService
+    from unittest.mock import patch, MagicMock
+    
+    service = SheetsService()
+    service._sources_cache.clear()
+    
+    records = [
+        {"¿Indexar?": "TRUE", "Dominio": "si-index.com", "Activo": "TRUE", "Tipo": "cultural"},
+        {"¿Indexar?": "FALSE", "Dominio": "no-index.com", "Activo": "TRUE", "Tipo": "cultural"},
+        {"¿Indexar?": "TRUE", "Dominio": "inactivo.com", "Activo": "FALSE", "Tipo": "cultural"}
+    ]
+    
+    class FakeWorksheet:
+        def row_values(self, idx):
+            return ["¿Indexar?", "Dominio", "Activo", "Tipo"]
+        def get_all_records(self):
+            return records
+            
+    fake_ws = FakeWorksheet()
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
+        mock_spreadsheet = MagicMock()
+        mock_spreadsheet.worksheet.return_value = fake_ws
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+        
+        active_sources = service.get_active_sources("some_sheet")
+        
+        assert len(active_sources) == 1
+        assert active_sources[0]["domain"] == "si-index.com"
+
+
+def test_index_max_sources_per_run_none():
+    from app.routers.sources import execute_indexing_job
+    from unittest.mock import patch, MagicMock
+    
+    mock_sources = [{"domain": f"dom_{i}.com", "active": True} for i in range(15)]
+    
+    mock_ws = MagicMock()
+    mock_ws.get_all_records.return_value = [{"Dominio": f"dom_{i}.com"} for i in range(15)]
+    mock_client = MagicMock()
+    mock_client.open_by_key.return_value.worksheet.return_value = mock_ws
+
+    with patch("app.services.sheets_service.sheets_service.get_config_dict", return_value={"INDEX_MAX_SOURCES_PER_RUN": 0}), \
+         patch("app.services.sheets_service.sheets_service.get_client", return_value=mock_client), \
+         patch("app.services.sheets_service.sheets_service._get_worksheet_headers"), \
+         patch("app.services.sheets_service.sheets_service.get_active_sources", return_value=mock_sources), \
+         patch("app.services.sheets_service.sheets_service.update_source_index_status"), \
+         patch("app.services.domain_indexer.domain_indexer.index_all", return_value=[]) as mock_index_all, \
+         patch("app.routers.sources.update_job_status") as mock_update_status:
+         
+         execute_indexing_job(
+             job_id="job_none",
+             limit_domains=None,
+             force_refresh=False,
+             sheet_id="sheet_id"
+         )
+         
+         args, kwargs = mock_index_all.call_args
+         assert len(kwargs["sources"]) == 15
+         mock_update_status.assert_any_call(
+             "job_none",
+             sources_total=15,
+             sources_selected=15,
+             domains_total=15,
+             max_sources_per_run=0
+         )
+
+
+def test_index_max_sources_per_run_limit():
+    from app.routers.sources import execute_indexing_job
+    from unittest.mock import patch, MagicMock
+    
+    mock_sources = [{"domain": f"dom_{i}.com", "active": True} for i in range(15)]
+    
+    mock_ws = MagicMock()
+    mock_ws.get_all_records.return_value = [{"Dominio": f"dom_{i}.com"} for i in range(15)]
+    mock_client = MagicMock()
+    mock_client.open_by_key.return_value.worksheet.return_value = mock_ws
+
+    with patch("app.services.sheets_service.sheets_service.get_config_dict", return_value={"INDEX_MAX_SOURCES_PER_RUN": 3}), \
+         patch("app.services.sheets_service.sheets_service.get_client", return_value=mock_client), \
+         patch("app.services.sheets_service.sheets_service._get_worksheet_headers"), \
+         patch("app.services.sheets_service.sheets_service.get_active_sources", return_value=mock_sources), \
+         patch("app.services.sheets_service.sheets_service.update_source_index_status"), \
+         patch("app.services.domain_indexer.domain_indexer.index_all", return_value=[]) as mock_index_all, \
+         patch("app.routers.sources.update_job_status") as mock_update_status:
+         
+         execute_indexing_job(
+             job_id="job_limit",
+             limit_domains=None,
+             force_refresh=False,
+             sheet_id="sheet_id"
+         )
+         
+         args, kwargs = mock_index_all.call_args
+         assert len(kwargs["sources"]) == 3
+         mock_update_status.assert_any_call(
+             "job_limit",
+             sources_total=15,
+             sources_selected=15,
+             domains_total=3,
+             max_sources_per_run=3
+         )
+
+
+def test_domain_indexer_zero_urls_diagnosis(tmp_path):
+    from app.services.domain_indexer import domain_indexer
+    from app.services.cache_service import cache_service
+    from unittest.mock import patch
+    
+    db_file = tmp_path / "test_domain_indexer.db"
+    cache_service.init_db(str(db_file))
+    
+    config = {
+        "DOMAIN_INDEX_DB_PATH": str(db_file),
+        "DOMAIN_INDEX_MAX_URLS_PER_DOMAIN": 10,
+        "DOMAIN_INDEX_REFRESH_DAYS": 30,
+        "ENRICH_INDEXED_URLS": False
+    }
+    
+    domain_config = {
+        "domain": "zerourls.com",
+        "discovery_method": "auto",
+        "row_index": 5
+    }
+    
+    with patch("app.services.domain_indexer._get", return_value=None), \
+         patch("app.services.logger_service.logger_service.log") as mock_log:
+         
+         stats = domain_indexer.index_domain(domain_config, config, force_refresh=True)
+         
+         assert stats["urls_found"] == 0
+         assert "no_urls_found" in stats["errors"]
+         
+         db_status = cache_service.get_domain_stats("zerourls.com")
+         assert db_status["urls"] == 0
+         
+         logged_actions = []
+         for call in mock_log.call_args_list:
+             args, kwargs = call
+             action = kwargs.get("action")
+             if not action and len(args) > 1:
+                 action = args[1]
+             if action:
+                 logged_actions.append(action)
+         assert "SOURCE_DISCOVERY_COMPLETED_WITH_ZERO_URLS" in logged_actions
+         assert "SOURCE_DISCOVERY_NO_URLS" in logged_actions
+
+
+def test_domain_indexer_crawl_seed(tmp_path):
+    from app.services.domain_indexer import domain_indexer
+    from app.services.cache_service import cache_service
+    from unittest.mock import patch
+    
+    db_file = tmp_path / "test_crawl_seed.db"
+    cache_service.init_db(str(db_file))
+    
+    config = {
+        "DOMAIN_INDEX_DB_PATH": str(db_file),
+        "DOMAIN_INDEX_MAX_URLS_PER_DOMAIN": 5,
+        "DOMAIN_INDEX_REFRESH_DAYS": 30,
+        "ENRICH_INDEXED_URLS": False
+    }
+    
+    domain_config = {
+        "domain": "seeddomain.com",
+        "discovery_method": "crawl_seed",
+        "seed_url": "https://seeddomain.com/inicio",
+        "row_index": 8
+    }
+    
+    html_content = """
+    <html>
+      <body>
+        <a href="/articulos/libro-misterioso">Enlace 1</a>
+        <a href="https://seeddomain.com/resenas/azaña">Enlace 2</a>
+        <a href="https://externaldomain.com/some/article">Enlace Externo</a>
+        <a href="/tag/politica">Tag a excluir</a>
+        <a href="https://seeddomain.com/login">Login a excluir</a>
+      </body>
+    </html>
+    """
+    
+    class FakeResponse:
+        def __init__(self):
+            self.text = html_content
+            self.status_code = 200
+            
+    with patch("app.services.domain_indexer._get", return_value=FakeResponse()), \
+         patch("app.services.domain_indexer._is_cultural_url", return_value=True), \
+         patch("app.services.logger_service.logger_service.log") as mock_log:
+         
+         stats = domain_indexer.index_domain(domain_config, config, force_refresh=True)
+         
+         assert stats["urls_found"] == 2
+         assert stats["last_discovery_method"] == "crawl_seed"
+         assert any("SOURCE_CRAWL_SEED_DISCOVERED" in str(c) for c in mock_log.call_args_list)
+
+
+def test_run_service_429_handles_robustly():
+    from app.services.run_service import run_service
+    from app.services.sheets_service import sheets_service
+    from unittest.mock import patch, ANY
+    import gspread
+    
+    class FakeResponse:
+        status_code = 429
+        text = "Rate limit exceeded"
+        
+    fake_response = FakeResponse()
+    api_error = gspread.exceptions.APIError(fake_response)
+    
+    with patch("app.services.sheets_service.sheets_service.update_book_status") as mock_update_status, \
+         patch("app.services.query_builder.query_builder.build_queries", side_effect=api_error), \
+         patch("app.services.logger_service.logger_service.log") as mock_log:
+         
+         res = run_service._process_book(
+             run_id="run_429",
+             sheet_id="sheet_id",
+             row_index=12,
+             isbn="",
+             title="El libro de prueba",
+             author="Autor de prueba",
+             max_pages=1,
+             max_candidates=1,
+             min_score=10,
+             openai_model="gpt-4o",
+             existing_hashes=set(),
+             existing_secondary_keys=set(),
+             run_config={},
+             dry_run=False
+         )
+         
+         mock_update_status.assert_called_with(
+             sheet_id="sheet_id",
+             row_index=12,
+             status="error",
+             last_run=ANY,
+             reviews_found=0,
+             observations="Búsqueda realizada sin ISBN. Búsqueda finalizada con error técnico: cuota de Google Sheets excedida."
+         )
+         assert res["final_status"] == "error"
+
+
+def test_sync_update_fuentes_uses_dynamic_headers():
+    from app.services.sheets_service import sheets_service
+    from unittest.mock import patch, MagicMock
+    
+    headers = ["Dominio", "Estado indexación", "Activo", "Última indexación", "Errores"]
+    
+    class FakeFuentesWorksheet:
+        def __init__(self):
+            self.updated_cells = None
+        def row_values(self, idx):
+            return headers
+        def update_cells(self, cells, **kwargs):
+            self.updated_cells = cells
+            
+    fake_ws = FakeFuentesWorksheet()
+    sheets_service._headers_cache.clear()
+    
+    with patch("app.services.sheets_service.SheetsService.get_client") as mock_client:
+        mock_spreadsheet = MagicMock()
+        mock_spreadsheet.worksheet.return_value = fake_ws
+        mock_client.return_value.open_by_key.return_value = mock_spreadsheet
+        
+        sheets_service.update_source_index_status(
+            sheet_id="some_sheet",
+            domain="dynamichd.com",
+            last_indexed="2026-07-02",
+            urls_indexed=100,
+            errors=[],
+            row_index=4,
+            status_str="completado",
+            last_activity="2026-07-02"
+        )
+        
+        cell_values = {c.col: c.value for c in fake_ws.updated_cells}
+        assert cell_values[2] == "completado"
+        assert cell_values[4] == "2026-07-02"
+        assert cell_values[5] == ""

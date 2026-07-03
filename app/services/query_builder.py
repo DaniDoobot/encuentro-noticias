@@ -292,12 +292,36 @@ class QueryBuilder:
 
         # Build prioritarias & apoyo for all title/author combinations
         if has_author:
+            # Build prioritarias in tiers (core title+author combinations with primary spellings first)
+            core_queries = []
+            suffix_queries = []
+            
+            primary_authors = authors[:2]
+            secondary_authors = authors[2:]
+            
+            # Tier 1a: Core combinations with primary author spellings
+            for t_var in title_variants:
+                for a_var in primary_authors:
+                    core_queries.append(f'"{t_var}" "{a_var}"')
+                    
+            # Tier 1b: ISBN queries
+            isbn_queries = []
+            if has_isbn:
+                isbn_queries.append(f'"{isbn_clean}"')
+                isbn_queries.append(f'"{isbn_clean}" "{title_clean}"')
+                
+            # Tier 1c: Core combinations with secondary author spellings
+            secondary_core = []
+            for t_var in title_variants:
+                for a_var in secondary_authors:
+                    secondary_core.append(f'"{t_var}" "{a_var}"')
+            
+            # Tier 2: Suffix queries (reseña, crítica, libro) for all combinations
             for t_var in title_variants:
                 for a_var in authors:
-                    prioritarias.extend([
+                    suffix_queries.extend([
                         f'"{t_var}" "{a_var}" reseña',
                         f'"{t_var}" "{a_var}" crítica',
-                        f'"{t_var}" "{a_var}"',
                         f'"{t_var}" "{a_var}" libro'
                     ])
                     apoyo.extend([
@@ -309,15 +333,14 @@ class QueryBuilder:
                         f'"{t_var}" "{a_var}" crítica -comprar -amazon -fnac -casadellibro -iberlibro',
                         f'"{t_var}" "{a_var}" review'
                     ])
-            # General author independent variants in prioritarias / apoyo
-            prioritarias.extend([
+            
+            general_queries = [
                 f'"{title_clean}" review',
                 f'"{title_clean}" crítica literaria'
-            ])
+            ]
+            
+            prioritarias = core_queries + isbn_queries + secondary_core + suffix_queries + general_queries
             apoyo.append(f'"{title_clean}" recensión')
-            if has_isbn:
-                prioritarias.append(f'"{isbn_clean}"')
-                prioritarias.append(f'"{isbn_clean}" "{title_clean}"')
 
             if review_domains:
                 for domain in review_domains:

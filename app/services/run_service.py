@@ -27,6 +27,32 @@ class RunCancelledException(Exception):
         super().__init__(message)
         self.reviews_added = reviews_added
 
+def build_book_observation_message(status: str, reviews_added: int, descartes_added: int, failed_extractions: int = 0, error_msg: str = "") -> str:
+    if status == "completado":
+        if reviews_added == 1:
+            return f"Búsqueda finalizada. Encontrada y guardada 1 reseña. {descartes_added} descartes."
+        else:
+            return f"Búsqueda finalizada. Encontradas y guardadas {reviews_added} reseñas. {descartes_added} descartes."
+    elif status == "sin_resultados":
+        obs = f"Búsqueda finalizada. 0 reseñas aceptadas. {descartes_added} descartes."
+        if failed_extractions > 0:
+            obs += f" ({failed_extractions} fallos de red/extracción)."
+        return obs
+    elif status == "completado_parcial":
+        obs = f"Búsqueda completada parcialmente. {reviews_added} {'reseña' if reviews_added == 1 else 'reseñas'} {'aceptada' if reviews_added == 1 else 'aceptadas'}."
+        if error_msg:
+            obs += f" Error posterior: {error_msg}."
+        return obs
+    elif status == "cancelado":
+        return "Búsqueda cancelada por el usuario."
+    elif status == "error":
+        obs = "Búsqueda finalizada con error técnico"
+        if error_msg:
+            obs += f": {error_msg}"
+        obs += "."
+        return obs
+    return ""
+
 def is_consent_or_cookie_page(text: str) -> bool:
     if not text:
         return False
@@ -572,6 +598,8 @@ class RunService:
         config = run_config or {}
         search_delay = float(config.get("SEARCH_DELAY_SECONDS", settings.SEARCH_DELAY_SECONDS))
         max_queries = int(config.get("MAX_QUERIES_PER_BOOK", settings.MAX_QUERIES_PER_BOOK))
+        has_isbn = bool(isbn and isbn.strip())
+        has_author = bool(author and author.strip()) and not query_builder.is_generic_author(author)
 
         # Resolve date filter parameters
         def parse_iso_date(d_str: Optional[str]) -> Optional[datetime.date]:
@@ -618,243 +646,243 @@ class RunService:
                 self._add_in_memory_log(run_id, "ERROR", "BOOK_STATUS_UPDATE_FAIL", f"Fallo al marcar procesando: {e}", isbn=isbn)
 
         # 1. Load configs & log effective configuration
-        effective_min_score = min_score
-        effective_max_candidates = max_candidates
-        effective_news_complement = int(config.get("DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES))
-        effective_max_queries = max_queries
+        reviews_added = 0
+        descartes_added = 0
+        failed_extractions = 0
+        extracted_ok_count = 0
+        openai_accepted_count = 0
+        openai_rejected_count = 0
+        observation = ""
+        final_status = "error"
+        executed_queries = set()
         
-        config_effective_detail = json.dumps({
-            "MIN_MATCH_SCORE": effective_min_score,
-            "MAX_CANDIDATES_PER_BOOK": effective_max_candidates,
-            "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES": effective_news_complement,
-            "MAX_QUERIES_PER_BOOK": effective_max_queries,
-            "GOOGLE_NEWS_BROAD_MAX_QUERIES": 10
-        })
-        logger_service.log("INFO", "RUN_CONFIG_EFFECTIVE", f"{log_prefix}Configuración efectiva para este libro", isbn=isbn, detail=config_effective_detail, sheet_id=sheet_id, run_id=run_id)
-        self._add_in_memory_log(run_id, "INFO", "RUN_CONFIG_EFFECTIVE", f"{log_prefix}Configuración efectiva para este libro", isbn=isbn, detail=config_effective_detail)
-
-        # Check if author is generic and log normalization
-        author_is_generic = False
-        if author and author.strip():
-            author_is_generic = query_builder.is_generic_author(author)
-            if author_is_generic:
-                auth_norm_detail = json.dumps({
-                    "original_author": author,
-                    "normalized_author": "",
-                    "author_is_generic": True
-                })
-                logger_service.log("INFO", "AUTHOR_NORMALIZED_AS_GENERIC", f"{log_prefix}Autor genérico detectado y normalizado", isbn=isbn, detail=auth_norm_detail, sheet_id=sheet_id, run_id=run_id)
-                self._add_in_memory_log(run_id, "INFO", "AUTHOR_NORMALIZED_AS_GENERIC", f"{log_prefix}Autor genérico detectado y normalizado", isbn=isbn, detail=auth_norm_detail)
-
-        # Generate queries categorized into 3 levels plus broad queries
-        queries_dict = query_builder.build_queries(title, author, isbn, review_domains=review_domains)
-        prioritarias = queries_dict["prioritarias"]
-        apoyo = queries_dict["apoyo"]
-        dominios = queries_dict["dominios"]
-        broad_queries = query_builder.build_broad_queries(title, author, isbn)
+        # Buffer lists for batching
+        descartes_batch = []
+        reviews_batch = []
         
-        queries_built_detail = json.dumps({
-            "book_title": title,
-            "book_author": author,
-            "author_is_generic": author_is_generic,
-            "prioritarias": prioritarias,
-            "apoyo": apoyo,
-            "dominios": dominios,
-            "broad_queries": broad_queries
-        }, ensure_ascii=False)
-        logger_service.log("INFO", "BOOK_QUERIES_BUILT", f"{log_prefix}Queries generadas para la búsqueda", isbn=isbn, detail=queries_built_detail, sheet_id=sheet_id, run_id=run_id)
-        self._add_in_memory_log(run_id, "INFO", "BOOK_QUERIES_BUILT", f"{log_prefix}Queries generadas para la búsqueda", isbn=isbn, detail=queries_built_detail)
+        # Override the methods on sheets_service temporarily
+        original_add_descarte = sheets_service.add_descarte
+        original_add_review = sheets_service.add_review
+        
+        from unittest.mock import Mock
+        is_mock_descarte = hasattr(original_add_descarte, "call_count") or isinstance(original_add_descarte, Mock)
+        is_mock_review = hasattr(original_add_review, "call_count") or isinstance(original_add_review, Mock)
+        
+        def mock_add_descarte(sheet_id, descarte_data):
+            descartes_batch.append(descarte_data)
+            if is_mock_descarte:
+                original_add_descarte(sheet_id, descarte_data)
+            
+        def mock_add_review(sheet_id, review_dict):
+            reviews_batch.append(review_dict)
+            if is_mock_review:
+                original_add_review(sheet_id, review_dict)
+            
+        sheets_service.add_descarte = mock_add_descarte
+        sheets_service.add_review = mock_add_review
 
-        queries_dict_len = len(prioritarias) + len(apoyo) + len(dominios) + len(broad_queries)
-        logger_service.log("INFO", "BOOK_SEARCH_QUERIES_GENERATED", f"{log_prefix}Queries generadas para la búsqueda del libro '{title}' (ISBN: {isbn}): total={queries_dict_len} (Prioritarias={len(prioritarias)}, Apoyo={len(apoyo)}, Dominios={len(dominios)}, Broad={len(broad_queries)})", isbn=isbn, detail=queries_built_detail, sheet_id=sheet_id, run_id=run_id)
-
-        # Log individual prioritarias/apoyo/dominios/broad — only to Sheets if DEBUG_SEARCH_QUERIES is on
-        debug_search_queries = is_true(config.get("DEBUG_SEARCH_QUERIES", settings.DEBUG_SEARCH_QUERIES))
-
-        isbn_clean = isbn.replace('"', "").replace('-', "").strip()
-        for q in prioritarias:
-            strategy = "título_exacto_más_autor"
-            if isbn_clean and isbn_clean in q:
-                strategy = "isbn"
-            elif "lavransdatter" in q.lower() or "lavransdotter" in q.lower():
-                strategy = "variante_internacional"
-            elif "alexei" in q.lower() or "navalny" in q.lower():
-                strategy = "variante_ortográfica_autor"
-            elif query_builder.clean_punctuation(title) in q:
-                strategy = "título_sin_puntuación_más_autor"
-            elif query_builder.remove_volume(title) in q:
-                strategy = "título_sin_volumen_más_autor"
-            elif "," in title and title.split(",", 1)[0].strip() in q:
-                strategy = "primer_segmento_título_más_autor"
-            if debug_search_queries:
-                logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query prioritaria generada ({strategy}): {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": strategy, "level": "prioritaria"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
-            self._add_in_memory_log(run_id, "INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query prioritaria ({strategy}): {q}", isbn=isbn)
-
-        for q in apoyo:
-            strategy = "título_apoyo_más_autor"
-            if "lavransdatter" in q.lower() or "lavransdotter" in q.lower():
-                strategy = "variante_internacional"
-            elif "alexei" in q.lower() or "navalny" in q.lower():
-                strategy = "variante_ortográfica_autor"
-            elif query_builder.clean_punctuation(title) in q:
-                strategy = "título_sin_puntuación_más_autor"
-            elif query_builder.remove_volume(title) in q:
-                strategy = "título_sin_volumen_más_autor"
-            elif "," in title and title.split(",", 1)[0].strip() in q:
-                strategy = "primer_segmento_título_más_autor"
-            if debug_search_queries:
-                logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query apoyo generada ({strategy}): {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": strategy, "level": "apoyo"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
-            self._add_in_memory_log(run_id, "INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query apoyo ({strategy}): {q}", isbn=isbn)
-
-        for q in dominios:
-            if debug_search_queries:
-                logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query dominio generada: {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": "restricción_dominio", "level": "dominios"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
-            self._add_in_memory_log(run_id, "INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query dominio: {q}", isbn=isbn)
-
-        for q in broad_queries:
-            if debug_search_queries:
-                logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query broad generada: {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": "búsqueda_amplia_sin_autor", "level": "broad"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
-            self._add_in_memory_log(run_id, "INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query broad: {q}", isbn=isbn)
-
-        self._add_in_memory_log(
-            run_id, "INFO", "QUERIES_GENERATED",
-            f"{log_prefix}Generadas queries por nivel: Prioritarias={len(prioritarias)}, Apoyo={len(apoyo)}, Dominios={len(dominios)}, Broad={len(broad_queries)}",
-            isbn=isbn
-        )
-
-        # 2. Gather candidate URLs executing queries level by level
         domain_index_candidates_count = 0
         google_news_candidates_count = 0
         internal_search_candidates_count = 0
+        candidate_urls = []
 
-        candidate_origin: Dict[str, Dict[str, Any]] = {} # URL -> metadata dict
-        queries_executed = 0
-        search_mode = config.get("SEARCH_PROVIDER_MODE", settings.SEARCH_PROVIDER_MODE)
+        try:
+            effective_min_score = min_score
+            effective_max_candidates = max_candidates
+            effective_news_complement = int(config.get("DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES))
+            effective_max_queries = max_queries
 
-        # Check cascade search flag (from config or fallback to settings)
-        # Use getattr for resilience against stale Docker images missing newer settings
-        _enable_cascade_default = getattr(settings, "ENABLE_CASCADE_SEARCH", True)
-        cascade_search = is_true(config.get("ENABLE_CASCADE_SEARCH", _enable_cascade_default))
-        
-        # If SEARCH_PROVIDER_MODE is domain_index_plus_news, force cascade search
-        if search_mode == "domain_index_plus_news":
-            cascade_search = True
+            config_effective_detail = json.dumps({
+                "MIN_MATCH_SCORE": effective_min_score,
+                "MAX_CANDIDATES_PER_BOOK": effective_max_candidates,
+                "DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES": effective_news_complement,
+                "MAX_QUERIES_PER_BOOK": effective_max_queries,
+                "GOOGLE_NEWS_BROAD_MAX_QUERIES": 10
+            })
+            logger_service.log("INFO", "RUN_CONFIG_EFFECTIVE", f"{log_prefix}Configuración efectiva para este libro", isbn=isbn, detail=config_effective_detail, sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "INFO", "RUN_CONFIG_EFFECTIVE", f"{log_prefix}Configuración efectiva para este libro", isbn=isbn, detail=config_effective_detail)
 
-        # Log resolved search mode
-        logger_service.log("INFO", "SEARCH_MODE_RESOLVED", f"{log_prefix}Modo de búsqueda resuelto: config={config.get('SEARCH_PROVIDER_MODE')}, resolved={search_mode}, cascade={cascade_search}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-        self._add_in_memory_log(run_id, "INFO", "SEARCH_MODE_RESOLVED", f"Modo de búsqueda resuelto: config={config.get('SEARCH_PROVIDER_MODE')}, resolved={search_mode}, cascade={cascade_search}", isbn=isbn)
+            # Check if author is generic and log normalization
+            author_is_generic = False
+            if author and author.strip():
+                author_is_generic = query_builder.is_generic_author(author)
+                if author_is_generic:
+                    auth_norm_detail = json.dumps({
+                        "original_author": author,
+                        "normalized_author": "",
+                        "author_is_generic": True
+                    })
+                    logger_service.log("INFO", "AUTHOR_NORMALIZED_AS_GENERIC", f"{log_prefix}Autor genérico detectado y normalizado", isbn=isbn, detail=auth_norm_detail, sheet_id=sheet_id, run_id=run_id)
+                    self._add_in_memory_log(run_id, "INFO", "AUTHOR_NORMALIZED_AS_GENERIC", f"{log_prefix}Autor genérico detectado y normalizado", isbn=isbn, detail=auth_norm_detail)
 
-        internal_domains_attempted = 0
-        internal_domains_with_results = 0
+            # Generate queries categorized into 3 levels plus broad queries
+            queries_dict = query_builder.build_queries(title, author, isbn, review_domains=review_domains)
+            prioritarias = queries_dict["prioritarias"]
+            apoyo = queries_dict["apoyo"]
+            dominios = queries_dict["dominios"]
+            broad_queries = query_builder.build_broad_queries(title, author, isbn)
 
-        if cascade_search:
-            self._check_cancellation(run_id)
-            logger_service.log("INFO", "CASCADE_SEARCH_STARTED", f"{log_prefix}Iniciando búsqueda en cascada", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-            self._add_in_memory_log(run_id, "INFO", "CASCADE_SEARCH_STARTED", "Iniciando búsqueda en cascada", isbn=isbn)
-
-            # PHASE 1 — Domain Index
-            self._check_cancellation(run_id)
-            logger_service.log("INFO", "DOMAIN_INDEX_SEARCH_STARTED", f"{log_prefix}Iniciando Fase 1: Domain Index", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-            self._add_in_memory_log(run_id, "INFO", "DOMAIN_INDEX_SEARCH_STARTED", "Iniciando Fase 1: Domain Index", isbn=isbn)
+            debug_search_queries = is_true(config.get("DEBUG_SEARCH_QUERIES", settings.DEBUG_SEARCH_QUERIES))
             
-            local_matches = source_discovery.find_candidates(
-                title=title,
-                author=author,
-                isbn=isbn,
-                config=config,
-            )
-            for match in local_matches:
-                url = match["url"]
-                if url not in candidate_origin and len(candidate_origin) < max_candidates:
-                    candidate_origin[url] = {
-                        "query": "local_index",
-                        "provider": "DomainIndex",
-                        "title": match.get("title") or "",
-                        "snippet": match.get("snippet") or "",
-                        "position": match.get("score"),
-                        "pub_date": match.get("pub_date")
-                    }
-                    logger_service.log(
-                        level="INFO",
-                        action="DOMAIN_SEARCH_MATCH",
-                        message=f"{log_prefix}Match local (score={match['score']}): {url}",
-                        isbn=isbn,
-                        detail=f"domain={match.get('domain')} | matched={match.get('matched_fields')} | title={match.get('title','')[:80]}",
-                        sheet_id=sheet_id,
-                        run_id=run_id
-                    )
-            domain_index_candidates_count = len(candidate_origin)
-            logger_service.log("INFO", "DOMAIN_INDEX_SEARCH_COMPLETED", f"{log_prefix}Fase 1: Domain Index completada. Candidatos={domain_index_candidates_count}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-            self._add_in_memory_log(run_id, "INFO", "DOMAIN_INDEX_SEARCH_COMPLETED", f"Fase 1: Domain Index completada. Candidatos={domain_index_candidates_count}", isbn=isbn)
-            
-            # PHASE 2 — Google News RSS / Búsqueda externa ligera
-            self._check_cancellation(run_id)
-            logger_service.log("INFO", "GOOGLE_NEWS_COMPLEMENT_STARTED", f"{log_prefix}Iniciando Fase 2: Google News Complement", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-            self._add_in_memory_log(run_id, "INFO", "GOOGLE_NEWS_COMPLEMENT_STARTED", "Iniciando Fase 2: Google News Complement", isbn=isbn)
-            
-            rss_max = int(config.get("DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES))
-            rss_queries_done = 0
-            google_news_candidates = 0
+            if debug_search_queries:
+                queries_built_detail = json.dumps({
+                    "book_title": title,
+                    "book_author": author,
+                    "author_is_generic": author_is_generic,
+                    "prioritarias": prioritarias,
+                    "apoyo": apoyo,
+                    "dominios": dominios,
+                    "broad_queries": broad_queries
+                }, ensure_ascii=False)
+            else:
+                queries_built_detail = json.dumps({
+                    "book_title": title,
+                    "book_author": author,
+                    "author_is_generic": author_is_generic,
+                    "total_prioritarias": len(prioritarias),
+                    "total_apoyo": len(apoyo),
+                    "total_dominios": len(dominios),
+                    "total_broad": len(broad_queries),
+                    "primeras_20_queries": (prioritarias + apoyo + dominios + broad_queries)[:20]
+                }, ensure_ascii=False)
+
+            logger_service.log("INFO", "BOOK_QUERIES_BUILT", f"{log_prefix}Queries generadas para la búsqueda", isbn=isbn, detail=queries_built_detail, sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "INFO", "BOOK_QUERIES_BUILT", f"{log_prefix}Queries generadas para la búsqueda", isbn=isbn, detail=queries_built_detail)
+
+            queries_dict_len = len(prioritarias) + len(apoyo) + len(dominios) + len(broad_queries)
+            logger_service.log("INFO", "BOOK_SEARCH_QUERIES_GENERATED", f"{log_prefix}Queries generadas para la búsqueda del libro '{title}' (ISBN: {isbn}): total={queries_dict_len} (Prioritarias={len(prioritarias)}, Apoyo={len(apoyo)}, Dominios={len(dominios)}, Broad={len(broad_queries)})", isbn=isbn, detail=queries_built_detail, sheet_id=sheet_id, run_id=run_id)
+
+            isbn_clean = isbn.replace('"', "").replace('-', "").strip()
             for q in prioritarias:
+                strategy = "título_exacto_más_autor"
+                if isbn_clean and isbn_clean in q:
+                    strategy = "isbn"
+                elif "lavransdatter" in q.lower() or "lavransdotter" in q.lower():
+                    strategy = "variante_internacional"
+                elif "alexei" in q.lower() or "navalny" in q.lower():
+                    strategy = "variante_ortográfica_autor"
+                elif query_builder.clean_punctuation(title) in q:
+                    strategy = "título_sin_puntuación_más_autor"
+                elif query_builder.remove_volume(title) in q:
+                    strategy = "título_sin_volumen_más_autor"
+                elif "," in title and title.split(",", 1)[0].strip() in q:
+                    strategy = "primer_segmento_título_más_autor"
+                if debug_search_queries:
+                    logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query prioritaria generada ({strategy}): {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": strategy, "level": "prioritaria"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
+                self._add_in_memory_log(run_id, "INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query prioritaria ({strategy}): {q}", isbn=isbn)
+
+            for q in apoyo:
+                strategy = "título_apoyo_más_autor"
+                if "lavransdatter" in q.lower() or "lavransdotter" in q.lower():
+                    strategy = "variante_internacional"
+                elif "alexei" in q.lower() or "navalny" in q.lower():
+                    strategy = "variante_ortográfica_autor"
+                elif query_builder.clean_punctuation(title) in q:
+                    strategy = "título_sin_puntuación_más_autor"
+                elif query_builder.remove_volume(title) in q:
+                    strategy = "título_sin_volumen_más_autor"
+                elif "," in title and title.split(",", 1)[0].strip() in q:
+                    strategy = "primer_segmento_título_más_autor"
+                if debug_search_queries:
+                    logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query apoyo generada ({strategy}): {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": strategy, "level": "apoyo"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
+                self._add_in_memory_log(run_id, "INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query apoyo ({strategy}): {q}", isbn=isbn)
+
+            for q in dominios:
+                if debug_search_queries:
+                    logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query dominio generada: {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": "restricción_dominio", "level": "dominios"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
+                self._add_in_memory_log(run_id, "INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query dominio: {q}", isbn=isbn)
+
+            for q in broad_queries:
+                if debug_search_queries:
+                    logger_service.log("INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query broad generada: {q}", isbn=isbn, detail=json.dumps({"query": q, "strategy": "búsqueda_amplia_sin_autor", "level": "broad"}, ensure_ascii=False), sheet_id=sheet_id, run_id=run_id)
+                self._add_in_memory_log(run_id, "INFO", "SEARCH_QUERY_GENERATED", f"{log_prefix}Query broad: {q}", isbn=isbn)
+
+            self._add_in_memory_log(
+                run_id, "INFO", "QUERIES_GENERATED",
+                f"{log_prefix}Generadas queries por nivel: Prioritarias={len(prioritarias)}, Apoyo={len(apoyo)}, Dominios={len(dominios)}, Broad={len(broad_queries)}",
+                isbn=isbn
+            )
+
+            # 2. Gather candidate URLs executing queries level by level
+            domain_index_candidates_count = 0
+            google_news_candidates_count = 0
+            internal_search_candidates_count = 0
+
+            candidate_origin: Dict[str, Dict[str, Any]] = {} # URL -> metadata dict
+            queries_executed = 0
+            search_mode = config.get("SEARCH_PROVIDER_MODE", settings.SEARCH_PROVIDER_MODE)
+
+            # Check cascade search flag (from config or fallback to settings)
+            # Use getattr for resilience against stale Docker images missing newer settings
+            _enable_cascade_default = getattr(settings, "ENABLE_CASCADE_SEARCH", True)
+            cascade_search = is_true(config.get("ENABLE_CASCADE_SEARCH", _enable_cascade_default))
+
+            # If SEARCH_PROVIDER_MODE is domain_index_plus_news, force cascade search
+            if search_mode == "domain_index_plus_news":
+                cascade_search = True
+
+            # Log resolved search mode
+            logger_service.log("INFO", "SEARCH_MODE_RESOLVED", f"{log_prefix}Modo de búsqueda resuelto: config={config.get('SEARCH_PROVIDER_MODE')}, resolved={search_mode}, cascade={cascade_search}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "INFO", "SEARCH_MODE_RESOLVED", f"Modo de búsqueda resuelto: config={config.get('SEARCH_PROVIDER_MODE')}, resolved={search_mode}, cascade={cascade_search}", isbn=isbn)
+
+            internal_domains_attempted = 0
+            internal_domains_with_results = 0
+
+            if cascade_search:
                 self._check_cancellation(run_id)
-                if rss_queries_done >= rss_max or queries_executed >= max_queries:
-                    break
-                if len(candidate_origin) >= max_candidates:
-                    break
-                if queries_executed > 0:
-                    time.sleep(search_delay)
-                rss_results = search_service.search_with_fallback(
-                    query=q,
-                    max_pages=max_pages,
-                    sheet_id=sheet_id,
-                    run_id=run_id,
+                logger_service.log("INFO", "CASCADE_SEARCH_STARTED", f"{log_prefix}Iniciando búsqueda en cascada", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                self._add_in_memory_log(run_id, "INFO", "CASCADE_SEARCH_STARTED", "Iniciando búsqueda en cascada", isbn=isbn)
+
+                # PHASE 1 — Domain Index
+                self._check_cancellation(run_id)
+                logger_service.log("INFO", "DOMAIN_INDEX_SEARCH_STARTED", f"{log_prefix}Iniciando Fase 1: Domain Index", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                self._add_in_memory_log(run_id, "INFO", "DOMAIN_INDEX_SEARCH_STARTED", "Iniciando Fase 1: Domain Index", isbn=isbn)
+
+                local_matches = source_discovery.find_candidates(
+                    title=title,
+                    author=author,
                     isbn=isbn,
-                    config={**config, "SEARCH_PROVIDER_MODE": "google_news_only"},
-                    log_callback=self._add_in_memory_log
+                    config=config,
                 )
-                queries_executed += 1
-                rss_queries_done += 1
-                for item in rss_results:
-                    url = item["url"]
+                for match in local_matches:
+                    url = match["url"]
                     if url not in candidate_origin and len(candidate_origin) < max_candidates:
                         candidate_origin[url] = {
-                            "query": item.get("query") or q,
-                            "provider": item.get("provider"),
-                            "title": item.get("title") or "",
-                            "snippet": item.get("snippet") or "",
-                            "position": item.get("position"),
-                            "pub_date": item.get("pub_date")
+                            "query": "local_index",
+                            "provider": "DomainIndex",
+                            "title": match.get("title") or "",
+                            "snippet": match.get("snippet") or "",
+                            "position": match.get("score"),
+                            "pub_date": match.get("pub_date")
                         }
-                        google_news_candidates += 1
-            google_news_candidates_count = google_news_candidates
-            logger_service.log("INFO", "GOOGLE_NEWS_COMPLEMENT_COMPLETED", f"{log_prefix}Fase 2: Google News Complement completada. Candidatos nuevos={google_news_candidates_count}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-            self._add_in_memory_log(run_id, "INFO", "GOOGLE_NEWS_COMPLEMENT_COMPLETED", f"Fase 2: Google News Complement completada. Candidatos nuevos={google_news_candidates_count}", isbn=isbn)
+                        logger_service.log(
+                            level="INFO",
+                            action="DOMAIN_SEARCH_MATCH",
+                            message=f"{log_prefix}Match local (score={match['score']}): {url}",
+                            isbn=isbn,
+                            detail=f"domain={match.get('domain')} | matched={match.get('matched_fields')} | title={match.get('title','')[:80]}",
+                            sheet_id=sheet_id,
+                            run_id=run_id
+                        )
+                domain_index_candidates_count = len(candidate_origin)
+                logger_service.log("INFO", "DOMAIN_INDEX_SEARCH_COMPLETED", f"{log_prefix}Fase 1: Domain Index completada. Candidatos={domain_index_candidates_count}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                self._add_in_memory_log(run_id, "INFO", "DOMAIN_INDEX_SEARCH_COMPLETED", f"Fase 1: Domain Index completada. Candidatos={domain_index_candidates_count}", isbn=isbn)
 
-            # If no candidates were found on Google News, run Broad Google News phase
-            if google_news_candidates_count == 0:
-                logger_service.log(
-                    "INFO", "GOOGLE_NEWS_BROAD_STARTED",
-                    f"{log_prefix}0 candidatos en Google News. Iniciando Fase 2 Broad (queries amplias)",
-                    isbn=isbn, sheet_id=sheet_id, run_id=run_id
-                )
-                self._add_in_memory_log(
-                    run_id, "INFO", "GOOGLE_NEWS_BROAD_STARTED",
-                    f"{log_prefix}0 candidatos en Google News. Iniciando Fase 2 Broad (queries amplias)",
-                    isbn=isbn
-                )
-                broad_queries_done = 0
-                for q in broad_queries:
+                # PHASE 2 — Google News RSS / Búsqueda externa ligera
+                self._check_cancellation(run_id)
+                logger_service.log("INFO", "GOOGLE_NEWS_COMPLEMENT_STARTED", f"{log_prefix}Iniciando Fase 2: Google News Complement", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                self._add_in_memory_log(run_id, "INFO", "GOOGLE_NEWS_COMPLEMENT_STARTED", "Iniciando Fase 2: Google News Complement", isbn=isbn)
+
+                rss_max = int(config.get("DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES", settings.DOMAIN_INDEX_NEWS_COMPLEMENT_MAX_QUERIES))
+                rss_queries_done = 0
+                google_news_candidates = 0
+                for q in prioritarias:
                     self._check_cancellation(run_id)
-                    # Skip if broad query is not safe (generic title without author)
-                    if not query_builder.is_safe_broad_query(title, q, author):
-                        logger.info(f"Skipping unsafe broad query: '{q}'")
-                        continue
-                    # Broad queries run on their own budget of up to 10 queries, ignoring max_queries!
-                    if broad_queries_done >= 10:
+                    if rss_queries_done >= rss_max or queries_executed >= max_queries:
                         break
                     if len(candidate_origin) >= max_candidates:
                         break
-                    if queries_executed > 0 or broad_queries_done > 0:
+                    if queries_executed > 0:
                         time.sleep(search_delay)
                     rss_results = search_service.search_with_fallback(
                         query=q,
@@ -866,7 +894,8 @@ class RunService:
                         log_callback=self._add_in_memory_log
                     )
                     queries_executed += 1
-                    broad_queries_done += 1
+                    rss_queries_done += 1
+                    executed_queries.add(q)
                     for item in rss_results:
                         url = item["url"]
                         if url not in candidate_origin and len(candidate_origin) < max_candidates:
@@ -880,249 +909,286 @@ class RunService:
                             }
                             google_news_candidates += 1
                 google_news_candidates_count = google_news_candidates
-                logger_service.log(
-                    "INFO", "GOOGLE_NEWS_BROAD_COMPLETED",
-                    f"{log_prefix}Fase 2 Broad completada. Candidatos nuevos={google_news_candidates}, total Google News={google_news_candidates_count}",
-                    isbn=isbn, sheet_id=sheet_id, run_id=run_id
-                )
-                self._add_in_memory_log(
-                    run_id, "INFO", "GOOGLE_NEWS_BROAD_COMPLETED",
-                    f"{log_prefix}Fase 2 Broad completada. Candidatos nuevos={google_news_candidates}",
-                    isbn=isbn
-                )
+                logger_service.log("INFO", "GOOGLE_NEWS_COMPLEMENT_COMPLETED", f"{log_prefix}Fase 2: Google News Complement completada. Candidatos nuevos={google_news_candidates_count}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                self._add_in_memory_log(run_id, "INFO", "GOOGLE_NEWS_COMPLEMENT_COMPLETED", f"Fase 2: Google News Complement completada. Candidatos nuevos={google_news_candidates_count}", isbn=isbn)
 
-            # PHASE 3 — Internal Domain Search
-            self._check_cancellation(run_id)
-            _always_internal_default = getattr(settings, "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", True)
-            _min_cand_default = getattr(settings, "MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH", 5)
-            _enable_deep_default = getattr(settings, "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", True)
-            always_run_internal = is_true(config.get("ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", _always_internal_default))
-            min_candidates_internal = int(config.get("MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH", _min_cand_default))
-            enable_deep_search = is_true(config.get("ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", _enable_deep_default))
-            enable_internal_search = is_true(config.get("ENABLE_INTERNAL_DOMAIN_SEARCH", getattr(settings, "ENABLE_INTERNAL_DOMAIN_SEARCH", True)))
-
-            total_before_internal = len(candidate_origin)
-            internal_search_was_forced = False
-            internal_search_skip_reason = ""
-
-            # Decide whether to run internal search
-            should_run_internal = False
-            if not enable_internal_search:
-                internal_search_skip_reason = "ENABLE_INTERNAL_DOMAIN_SEARCH=false"
-            elif always_run_internal:
-                should_run_internal = True
-                internal_search_was_forced = True
-            elif enable_deep_search and total_before_internal < min_candidates_internal:
-                should_run_internal = True
-            else:
-                internal_search_skip_reason = f"enough_candidates ({total_before_internal} >= {min_candidates_internal})"
-
-            if not should_run_internal:
-                skip_msg = f"{log_prefix}Búsqueda interna omitida: {internal_search_skip_reason}"
-                logger_service.log(
-                    level="INFO",
-                    action="INTERNAL_SEARCH_SKIPPED",
-                    message=skip_msg,
-                    isbn=isbn,
-                    sheet_id=sheet_id,
-                    run_id=run_id
-                )
-                self._add_in_memory_log(run_id, "INFO", "INTERNAL_SEARCH_SKIPPED", skip_msg, isbn=isbn)
-            else:
-                force_label = " (forzada)" if internal_search_was_forced else f" (pocos candidatos: {total_before_internal} < {min_candidates_internal})"
-                start_msg = f"{log_prefix}Iniciando búsqueda interna{force_label}"
-                logger_service.log(
-                    level="INFO",
-                    action="INTERNAL_SEARCH_STARTED",
-                    message=start_msg,
-                    isbn=isbn,
-                    sheet_id=sheet_id,
-                    run_id=run_id
-                )
-                self._add_in_memory_log(run_id, "INFO", "INTERNAL_SEARCH_STARTED", start_msg, isbn=isbn)
-
-                from app.services.internal_search_provider import internal_search_provider
-                from app.services.domain_indexer import _enrich_page_metadata
-
-                # Fetch active sources
-                try:
-                    sources = sheets_service.get_active_sources(sheet_id)
-                except Exception:
-                    sources = []
-
-                domains_limit = int(config.get("INTERNAL_SEARCH_DOMAINS_LIMIT", settings.INTERNAL_SEARCH_DOMAINS_LIMIT))
-                domains = [s["domain"] for s in sources if s.get("active", True) and s.get("domain")]
-                domains = domains[:domains_limit]
-
-                internal_domains_attempted = len(domains)
-                if domains:
-                    source_by_domain = {s["domain"]: s for s in sources}
-                    new_urls_found = 0
-                    for domain in domains:
+                # If no candidates were found on Google News, run Broad Google News phase
+                if google_news_candidates_count == 0:
+                    logger_service.log(
+                        "INFO", "GOOGLE_NEWS_BROAD_STARTED",
+                        f"{log_prefix}0 candidatos en Google News. Iniciando Fase 2 Broad (queries amplias)",
+                        isbn=isbn, sheet_id=sheet_id, run_id=run_id
+                    )
+                    self._add_in_memory_log(
+                        run_id, "INFO", "GOOGLE_NEWS_BROAD_STARTED",
+                        f"{log_prefix}0 candidatos en Google News. Iniciando Fase 2 Broad (queries amplias)",
+                        isbn=isbn
+                    )
+                    broad_queries_done = 0
+                    for q in broad_queries:
                         self._check_cancellation(run_id)
-                        try:
-                            items = internal_search_provider.search_domain_for_book(
-                                domain=domain,
-                                title=title,
-                                author=author,
-                                isbn=isbn,
-                                config=config,
-                                source_info=source_by_domain.get(domain),
-                                sheet_id=sheet_id,
-                                run_id=run_id
-                            )
-                            if items:
-                                internal_domains_with_results += 1
-                            for item in items:
-                                url = item["url"]
-                                title_found = item.get("title") or ""
-                                snippet_found = item.get("snippet") or ""
-
-                                # Store basic record in SQLite
-                                cache_service.upsert_url(
-                                    domain=domain,
-                                    url=url,
-                                    url_normalized=url,
-                                    title=title_found,
-                                    snippet=snippet_found,
-                                    source_type="internal_search"
-                                )
-
-                                # Enrich page metadata if enabled
-                                enrich_enabled = is_true(config.get("ENRICH_INDEXED_URLS", settings.ENRICH_INDEXED_URLS))
-                                if enrich_enabled:
-                                    enrich_timeout = int(config.get("DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS", settings.DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS))
-                                    meta = _enrich_page_metadata(url, timeout=enrich_timeout)
-                                    if meta.get("title") or meta.get("snippet"):
-                                        cache_service.upsert_url(
-                                            domain=domain,
-                                            url=url,
-                                            url_normalized=url,
-                                            title=meta.get("title") or title_found,
-                                            snippet=meta.get("snippet") or snippet_found,
-                                            source_type="internal_search"
-                                        )
-                                new_urls_found += 1
-                        except Exception as e:
-                            logger_service.log(
-                                level="WARNING",
-                                action="SEARCH_PROVIDER_ERROR",
-                                message=f"Error en búsqueda interna del dominio {domain}: {e}",
-                                isbn=isbn,
-                                sheet_id=sheet_id,
-                                run_id=run_id
-                            )
-
-                    # Re-run SourceDiscovery to retrieve new candidates (no max_candidates cap here yet)
-                    if new_urls_found > 0:
-                        local_matches = source_discovery.find_candidates(
-                            title=title,
-                            author=author,
+                        # Skip if broad query is not safe (generic title without author)
+                        if not query_builder.is_safe_broad_query(title, q, author):
+                            logger.info(f"Skipping unsafe broad query: '{q}'")
+                            continue
+                        # Broad queries run on their own budget of up to 10 queries, ignoring max_queries!
+                        if broad_queries_done >= 10:
+                            break
+                        if len(candidate_origin) >= max_candidates:
+                            break
+                        if queries_executed > 0 or broad_queries_done > 0:
+                            time.sleep(search_delay)
+                        rss_results = search_service.search_with_fallback(
+                            query=q,
+                            max_pages=max_pages,
+                            sheet_id=sheet_id,
+                            run_id=run_id,
                             isbn=isbn,
-                            config=config
+                            config={**config, "SEARCH_PROVIDER_MODE": "google_news_only"},
+                            log_callback=self._add_in_memory_log
                         )
-                        internal_candidates = 0
-                        for match in local_matches:
-                            url = match["url"]
-                            if url not in candidate_origin:
+                        queries_executed += 1
+                        broad_queries_done += 1
+                        executed_queries.add(q)
+                        for item in rss_results:
+                            url = item["url"]
+                            if url not in candidate_origin and len(candidate_origin) < max_candidates:
                                 candidate_origin[url] = {
-                                    "query": "local_index",
-                                    "provider": "InternalSearch",
-                                    "title": match.get("title") or "",
-                                    "snippet": match.get("snippet") or "",
-                                    "position": match.get("score"),
-                                    "pub_date": match.get("pub_date"),
-                                    "score": match.get("score", 0),
-                                    "matched_fields": match.get("matched_fields", [])
+                                    "query": item.get("query") or q,
+                                    "provider": item.get("provider"),
+                                    "title": item.get("title") or "",
+                                    "snippet": item.get("snippet") or "",
+                                    "position": item.get("position"),
+                                    "pub_date": item.get("pub_date")
                                 }
-                                internal_candidates += 1
-                                logger_service.log(
-                                    level="INFO",
-                                    action="DOMAIN_SEARCH_MATCH",
-                                    message=f"{log_prefix}Match interno (score={match['score']}): {url}",
+                                google_news_candidates += 1
+                    google_news_candidates_count = google_news_candidates
+                    logger_service.log(
+                        "INFO", "GOOGLE_NEWS_BROAD_COMPLETED",
+                        f"{log_prefix}Fase 2 Broad completada. Candidatos nuevos={google_news_candidates}, total Google News={google_news_candidates_count}",
+                        isbn=isbn, sheet_id=sheet_id, run_id=run_id
+                    )
+                    self._add_in_memory_log(
+                        run_id, "INFO", "GOOGLE_NEWS_BROAD_COMPLETED",
+                        f"{log_prefix}Fase 2 Broad completada. Candidatos nuevos={google_news_candidates}",
+                        isbn=isbn
+                    )
+
+                # PHASE 3 — Internal Domain Search
+                self._check_cancellation(run_id)
+                _always_internal_default = getattr(settings, "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", True)
+                _min_cand_default = getattr(settings, "MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH", 5)
+                _enable_deep_default = getattr(settings, "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", True)
+                always_run_internal = is_true(config.get("ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", _always_internal_default))
+                min_candidates_internal = int(config.get("MIN_CANDIDATES_BEFORE_INTERNAL_SEARCH", _min_cand_default))
+                enable_deep_search = is_true(config.get("ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", _enable_deep_default))
+                enable_internal_search = is_true(config.get("ENABLE_INTERNAL_DOMAIN_SEARCH", getattr(settings, "ENABLE_INTERNAL_DOMAIN_SEARCH", True)))
+
+                total_before_internal = len(candidate_origin)
+                internal_search_was_forced = False
+                internal_search_skip_reason = ""
+
+                # Decide whether to run internal search
+                should_run_internal = False
+                if not enable_internal_search:
+                    internal_search_skip_reason = "ENABLE_INTERNAL_DOMAIN_SEARCH=false"
+                elif always_run_internal:
+                    should_run_internal = True
+                    internal_search_was_forced = True
+                elif enable_deep_search and total_before_internal < min_candidates_internal:
+                    should_run_internal = True
+                else:
+                    internal_search_skip_reason = f"enough_candidates ({total_before_internal} >= {min_candidates_internal})"
+
+                if not should_run_internal:
+                    skip_msg = f"{log_prefix}Búsqueda interna omitida: {internal_search_skip_reason}"
+                    logger_service.log(
+                        level="INFO",
+                        action="INTERNAL_SEARCH_SKIPPED",
+                        message=skip_msg,
+                        isbn=isbn,
+                        sheet_id=sheet_id,
+                        run_id=run_id
+                    )
+                    self._add_in_memory_log(run_id, "INFO", "INTERNAL_SEARCH_SKIPPED", skip_msg, isbn=isbn)
+                else:
+                    force_label = " (forzada)" if internal_search_was_forced else f" (pocos candidatos: {total_before_internal} < {min_candidates_internal})"
+                    start_msg = f"{log_prefix}Iniciando búsqueda interna{force_label}"
+                    logger_service.log(
+                        level="INFO",
+                        action="INTERNAL_SEARCH_STARTED",
+                        message=start_msg,
+                        isbn=isbn,
+                        sheet_id=sheet_id,
+                        run_id=run_id
+                    )
+                    self._add_in_memory_log(run_id, "INFO", "INTERNAL_SEARCH_STARTED", start_msg, isbn=isbn)
+
+                    from app.services.internal_search_provider import internal_search_provider
+                    from app.services.domain_indexer import _enrich_page_metadata
+
+                    # Fetch active sources
+                    try:
+                        sources = sheets_service.get_active_sources(sheet_id)
+                    except Exception:
+                        sources = []
+
+                    domains_limit = int(config.get("INTERNAL_SEARCH_DOMAINS_LIMIT", settings.INTERNAL_SEARCH_DOMAINS_LIMIT))
+                    domains = [s["domain"] for s in sources if s.get("active", True) and s.get("domain")]
+                    domains = domains[:domains_limit]
+
+                    internal_domains_attempted = len(domains)
+                    if domains:
+                        source_by_domain = {s["domain"]: s for s in sources}
+                        new_urls_found = 0
+                        for domain in domains:
+                            self._check_cancellation(run_id)
+                            try:
+                                items = internal_search_provider.search_domain_for_book(
+                                    domain=domain,
+                                    title=title,
+                                    author=author,
                                     isbn=isbn,
-                                    detail=f"domain={match.get('domain')} | matched={match.get('matched_fields')} | title={match.get('title','')[:80]}",
+                                    config=config,
+                                    source_info=source_by_domain.get(domain),
                                     sheet_id=sheet_id,
                                     run_id=run_id
                                 )
-                        internal_search_candidates_count = internal_candidates
+                                if items:
+                                    internal_domains_with_results += 1
+                                for item in items:
+                                    url = item["url"]
+                                    title_found = item.get("title") or ""
+                                    snippet_found = item.get("snippet") or ""
 
-                logger_service.log(
-                    level="INFO",
-                    action="INTERNAL_SEARCH_COMPLETED",
-                    message=f"{log_prefix}Búsqueda interna finalizada. Nuevos candidatos: {internal_search_candidates_count}",
-                    isbn=isbn,
-                    sheet_id=sheet_id,
-                    run_id=run_id
-                )
-                self._add_in_memory_log(
-                    run_id, "INFO", "INTERNAL_SEARCH_COMPLETED",
-                    f"{log_prefix}Búsqueda interna finalizada: nuevos_candidatos={internal_search_candidates_count}",
-                    isbn=isbn
-                )
+                                    # Store basic record in SQLite
+                                    cache_service.upsert_url(
+                                        domain=domain,
+                                        url=url,
+                                        url_normalized=url,
+                                        title=title_found,
+                                        snippet=snippet_found,
+                                        source_type="internal_search"
+                                    )
 
-            # --- Prioritize and cap candidates ---
-            # Sort by quality: exact title+author match > InternalSearch > DomainIndex score > GoogleNews
-            title_lower = title.strip().lower()
-            author_lower = author.strip().lower() if author else ""
+                                    # Enrich page metadata if enabled
+                                    enrich_enabled = is_true(config.get("ENRICH_INDEXED_URLS", settings.ENRICH_INDEXED_URLS))
+                                    if enrich_enabled:
+                                        enrich_timeout = int(config.get("DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS", settings.DOMAIN_INDEX_ENRICH_TIMEOUT_SECONDS))
+                                        meta = _enrich_page_metadata(url, timeout=enrich_timeout)
+                                        if meta.get("title") or meta.get("snippet"):
+                                            cache_service.upsert_url(
+                                                domain=domain,
+                                                url=url,
+                                                url_normalized=url,
+                                                title=meta.get("title") or title_found,
+                                                snippet=meta.get("snippet") or snippet_found,
+                                                source_type="internal_search"
+                                            )
+                                    new_urls_found += 1
+                            except Exception as e:
+                                logger_service.log(
+                                    level="WARNING",
+                                    action="SEARCH_PROVIDER_ERROR",
+                                    message=f"Error en búsqueda interna del dominio {domain}: {e}",
+                                    isbn=isbn,
+                                    sheet_id=sheet_id,
+                                    run_id=run_id
+                                )
 
-            def candidate_priority(item_kv):
-                url_k, meta = item_kv
-                cand_title = (meta.get("title") or "").lower()
-                provider = (meta.get("provider") or "").lower()
-                score = meta.get("score") or meta.get("position") or 0
-                if isinstance(score, str):
-                    try: score = float(score)
-                    except: score = 0
+                        # Re-run SourceDiscovery to retrieve new candidates (no max_candidates cap here yet)
+                        if new_urls_found > 0:
+                            local_matches = source_discovery.find_candidates(
+                                title=title,
+                                author=author,
+                                isbn=isbn,
+                                config=config
+                            )
+                            internal_candidates = 0
+                            for match in local_matches:
+                                url = match["url"]
+                                if url not in candidate_origin:
+                                    candidate_origin[url] = {
+                                        "query": "local_index",
+                                        "provider": "InternalSearch",
+                                        "title": match.get("title") or "",
+                                        "snippet": match.get("snippet") or "",
+                                        "position": match.get("score"),
+                                        "pub_date": match.get("pub_date"),
+                                        "score": match.get("score", 0),
+                                        "matched_fields": match.get("matched_fields", [])
+                                    }
+                                    internal_candidates += 1
+                                    logger_service.log(
+                                        level="INFO",
+                                        action="DOMAIN_SEARCH_MATCH",
+                                        message=f"{log_prefix}Match interno (score={match['score']}): {url}",
+                                        isbn=isbn,
+                                        detail=f"domain={match.get('domain')} | matched={match.get('matched_fields')} | title={match.get('title','')[:80]}",
+                                        sheet_id=sheet_id,
+                                        run_id=run_id
+                                    )
+                            internal_search_candidates_count = internal_candidates
 
-                exact_match = (title_lower in cand_title) or (cand_title in title_lower and len(cand_title) > 5)
-                author_match = author_lower and author_lower in cand_title
-                is_internal = "internalsearch" in provider or "domainindex" in provider
-                return (
-                    -(2 if (exact_match and author_match) else 1 if exact_match else 0),  # exact match priority
-                    -(1 if is_internal else 0),                                            # internal/index over news
-                    -float(score)                                                           # higher score first
-                )
+                    logger_service.log(
+                        level="INFO",
+                        action="INTERNAL_SEARCH_COMPLETED",
+                        message=f"{log_prefix}Búsqueda interna finalizada. Nuevos candidatos: {internal_search_candidates_count}",
+                        isbn=isbn,
+                        sheet_id=sheet_id,
+                        run_id=run_id
+                    )
+                    self._add_in_memory_log(
+                        run_id, "INFO", "INTERNAL_SEARCH_COMPLETED",
+                        f"{log_prefix}Búsqueda interna finalizada: nuevos_candidatos={internal_search_candidates_count}",
+                        isbn=isbn
+                    )
 
-            all_candidates = list(candidate_origin.items())
-            all_candidates.sort(key=candidate_priority)
+                # --- Prioritize and cap candidates ---
+                # Sort by quality: exact title+author match > InternalSearch > DomainIndex score > GoogleNews
+                title_lower = title.strip().lower()
+                author_lower = author.strip().lower() if author else ""
 
-            # Apply max_candidates cap after prioritization
-            candidates_discarded_by_limit = max(0, len(all_candidates) - max_candidates)
-            all_candidates = all_candidates[:max_candidates]
-            candidate_origin = dict(all_candidates)
-            candidate_urls = list(candidate_origin.keys())
+                def candidate_priority(item_kv):
+                    url_k, meta = item_kv
+                    cand_title = (meta.get("title") or "").lower()
+                    provider = (meta.get("provider") or "").lower()
+                    score = meta.get("score") or meta.get("position") or 0
+                    if isinstance(score, str):
+                        try: score = float(score)
+                        except: score = 0
 
-        else:
-            # Normal query-loop modes (google_news_only, free_only, serpapi, dataforseo, auto)
-            # LEVEL 1
-            for q in prioritarias:
-                if queries_executed >= max_queries or len(candidate_origin) >= max_candidates:
-                    break
-                if queries_executed > 0:
-                    time.sleep(search_delay)
-                found_items = search_service.search_with_fallback(
-                    query=q, max_pages=max_pages, sheet_id=sheet_id, run_id=run_id, isbn=isbn, config=config, log_callback=self._add_in_memory_log
-                )
-                queries_executed += 1
-                for item in found_items:
-                    url = item["url"]
-                    if url not in candidate_origin and len(candidate_origin) < max_candidates:
-                        candidate_origin[url] = {
-                            "query": item.get("query") or q, "provider": item.get("provider"), "title": item.get("title") or "", "snippet": item.get("snippet") or "", "position": item.get("position"), "pub_date": item.get("pub_date")
-                        }
-            google_news_candidates_count = len(candidate_origin)
+                    exact_match = (title_lower in cand_title) or (cand_title in title_lower and len(cand_title) > 5)
+                    author_match = author_lower and author_lower in cand_title
+                    is_internal = "internalsearch" in provider or "domainindex" in provider
+                    return (
+                        -(2 if (exact_match and author_match) else 1 if exact_match else 0),  # exact match priority
+                        -(1 if is_internal else 0),                                            # internal/index over news
+                        -float(score)                                                           # higher score first
+                    )
 
-            # LEVEL 2
-            if len(candidate_origin) == 0:
-                for q in apoyo:
+                all_candidates = list(candidate_origin.items())
+                all_candidates.sort(key=candidate_priority)
+
+                # Apply max_candidates cap after prioritization
+                candidates_discarded_by_limit = max(0, len(all_candidates) - max_candidates)
+                all_candidates = all_candidates[:max_candidates]
+                candidate_origin = dict(all_candidates)
+                candidate_urls = list(candidate_origin.keys())
+
+            else:
+                # Normal query-loop modes (google_news_only, free_only, serpapi, dataforseo, auto)
+                # LEVEL 1
+                for q in prioritarias:
                     if queries_executed >= max_queries or len(candidate_origin) >= max_candidates:
                         break
-                    time.sleep(search_delay)
+                    if queries_executed > 0:
+                        time.sleep(search_delay)
                     found_items = search_service.search_with_fallback(
                         query=q, max_pages=max_pages, sheet_id=sheet_id, run_id=run_id, isbn=isbn, config=config, log_callback=self._add_in_memory_log
                     )
                     queries_executed += 1
+                    executed_queries.add(q)
                     for item in found_items:
                         url = item["url"]
                         if url not in candidate_origin and len(candidate_origin) < max_candidates:
@@ -1131,55 +1197,181 @@ class RunService:
                             }
                 google_news_candidates_count = len(candidate_origin)
 
-            # LEVEL 3
-            if len(candidate_origin) < 5:
-                for q in dominios:
-                    if queries_executed >= max_queries or len(candidate_origin) >= max_candidates:
-                        break
-                    time.sleep(search_delay)
-                    found_items = search_service.search_with_fallback(
-                        query=q, max_pages=max_pages, sheet_id=sheet_id, run_id=run_id, isbn=isbn, config=config, log_callback=self._add_in_memory_log
-                    )
-                    queries_executed += 1
-                    for item in found_items:
-                        url = item["url"]
-                        if url not in candidate_origin and len(candidate_origin) < max_candidates:
-                            candidate_origin[url] = {
-                                "query": item.get("query") or q, "provider": item.get("provider"), "title": item.get("title") or "", "snippet": item.get("snippet") or "", "position": item.get("position"), "pub_date": item.get("pub_date")
-                            }
-                internal_search_candidates_count = len(candidate_origin) - google_news_candidates_count
+                # LEVEL 2
+                if len(candidate_origin) == 0:
+                    for q in apoyo:
+                        if queries_executed >= max_queries or len(candidate_origin) >= max_candidates:
+                            break
+                        time.sleep(search_delay)
+                        found_items = search_service.search_with_fallback(
+                            query=q, max_pages=max_pages, sheet_id=sheet_id, run_id=run_id, isbn=isbn, config=config, log_callback=self._add_in_memory_log
+                        )
+                        queries_executed += 1
+                        for item in found_items:
+                            url = item["url"]
+                            if url not in candidate_origin and len(candidate_origin) < max_candidates:
+                                candidate_origin[url] = {
+                                    "query": item.get("query") or q, "provider": item.get("provider"), "title": item.get("title") or "", "snippet": item.get("snippet") or "", "position": item.get("position"), "pub_date": item.get("pub_date")
+                                }
+                    google_news_candidates_count = len(candidate_origin)
 
-            # If search_mode is google_news_only and we got 0 candidates, run Broad Google News phase
-            if len(candidate_origin) == 0 and search_mode == "google_news_only":
+                # LEVEL 3
+                if len(candidate_origin) < 5:
+                    for q in dominios:
+                        if queries_executed >= max_queries or len(candidate_origin) >= max_candidates:
+                            break
+                        time.sleep(search_delay)
+                        found_items = search_service.search_with_fallback(
+                            query=q, max_pages=max_pages, sheet_id=sheet_id, run_id=run_id, isbn=isbn, config=config, log_callback=self._add_in_memory_log
+                        )
+                        queries_executed += 1
+                        for item in found_items:
+                            url = item["url"]
+                            if url not in candidate_origin and len(candidate_origin) < max_candidates:
+                                candidate_origin[url] = {
+                                    "query": item.get("query") or q, "provider": item.get("provider"), "title": item.get("title") or "", "snippet": item.get("snippet") or "", "position": item.get("position"), "pub_date": item.get("pub_date")
+                                }
+                    internal_search_candidates_count = len(candidate_origin) - google_news_candidates_count
+
+                # If search_mode is google_news_only and we got 0 candidates, run Broad Google News phase
+                if len(candidate_origin) == 0 and search_mode == "google_news_only":
+                    logger_service.log(
+                        "INFO", "GOOGLE_NEWS_BROAD_STARTED",
+                        f"{log_prefix}0 candidatos en Google News (modo single-provider). Iniciando queries amplias",
+                        isbn=isbn, sheet_id=sheet_id, run_id=run_id
+                    )
+                    self._add_in_memory_log(
+                        run_id, "INFO", "GOOGLE_NEWS_BROAD_STARTED",
+                        f"{log_prefix}0 candidatos en Google News (modo single-provider). Iniciando queries amplias",
+                        isbn=isbn
+                    )
+                    broad_queries_done = 0
+                    for q in broad_queries:
+                        self._check_cancellation(run_id)
+                        # Skip if broad query is not safe (generic title without author)
+                        if not query_builder.is_safe_broad_query(title, q, author):
+                            logger.info(f"Skipping unsafe broad query: '{q}'")
+                            continue
+                        # Broad queries run on their own budget of up to 10 queries, ignoring max_queries!
+                        if broad_queries_done >= 10:
+                            break
+                        if len(candidate_origin) >= max_candidates:
+                            break
+                        if queries_executed > 0 or broad_queries_done > 0:
+                            time.sleep(search_delay)
+                        found_items = search_service.search_with_fallback(
+                            query=q, max_pages=max_pages, sheet_id=sheet_id, run_id=run_id, isbn=isbn, config=config, log_callback=self._add_in_memory_log
+                        )
+                        queries_executed += 1
+                        broad_queries_done += 1
+                        executed_queries.add(q)
+                        for item in found_items:
+                            url = item["url"]
+                            if url not in candidate_origin and len(candidate_origin) < max_candidates:
+                                candidate_origin[url] = {
+                                    "query": item.get("query") or q,
+                                    "provider": item.get("provider"),
+                                    "title": item.get("title") or "",
+                                    "snippet": item.get("snippet") or "",
+                                    "position": item.get("position"),
+                                    "pub_date": item.get("pub_date")
+                                }
+                    logger_service.log(
+                        "INFO", "GOOGLE_NEWS_BROAD_COMPLETED",
+                        f"{log_prefix}Fase Broad completada. total Google News={len(candidate_origin)}",
+                        isbn=isbn, sheet_id=sheet_id, run_id=run_id
+                    )
+                    self._add_in_memory_log(
+                        run_id, "INFO", "GOOGLE_NEWS_BROAD_COMPLETED",
+                        f"{log_prefix}Fase Broad completada. total Google News={len(candidate_origin)}",
+                        isbn=isbn
+                    )
+
+                candidates_discarded_by_limit = 0
+                internal_search_was_forced = False
+                internal_search_skip_reason = ""
+                candidate_urls = list(candidate_origin.keys())
+
+            # SAFE_AUTHOR_FALLBACK_SEARCH Phase
+            if len(candidate_origin) == 0:
                 logger_service.log(
-                    "INFO", "GOOGLE_NEWS_BROAD_STARTED",
-                    f"{log_prefix}0 candidatos en Google News (modo single-provider). Iniciando queries amplias",
+                    "INFO", "SAFE_AUTHOR_FALLBACK_STARTED",
+                    f"{log_prefix}0 candidatos. Iniciando fase final SAFE_AUTHOR_FALLBACK_SEARCH",
                     isbn=isbn, sheet_id=sheet_id, run_id=run_id
                 )
                 self._add_in_memory_log(
-                    run_id, "INFO", "GOOGLE_NEWS_BROAD_STARTED",
-                    f"{log_prefix}0 candidatos en Google News (modo single-provider). Iniciando queries amplias",
+                    run_id, "INFO", "SAFE_AUTHOR_FALLBACK_STARTED",
+                    f"{log_prefix}0 candidatos. Iniciando fase final SAFE_AUTHOR_FALLBACK_SEARCH",
                     isbn=isbn
                 )
-                broad_queries_done = 0
-                for q in broad_queries:
+
+                # Reconstruct clean safe fallback queries
+                fallback_queries = []
+                author_clean = author.replace('"', "'").strip()
+                title_clean = title.replace('"', "'").strip()
+                
+                authors_local = query_builder.get_author_spelling_variations(author_clean) if has_author else [author_clean]
+                
+                title_variants_local = [title_clean]
+                title_no_punct = query_builder.clean_punctuation(title_clean)
+                if title_no_punct != title_clean:
+                    title_variants_local.append(title_no_punct)
+                title_no_vol = query_builder.remove_volume(title_clean)
+                if title_no_vol != title_clean:
+                    title_variants_local.append(title_no_vol)
+                    title_no_vol_punct = query_builder.clean_punctuation(title_no_vol)
+                    if title_no_vol_punct != title_no_vol:
+                        title_variants_local.append(title_no_vol_punct)
+                if "," in title_clean:
+                    parts = [p.strip() for p in title_clean.split(",", 1)]
+                    if parts and parts[0]:
+                        title_variants_local.append(parts[0])
+                if "lavrans" in title_clean.lower() and "undset" in author_clean.lower():
+                    title_variants_local.extend(["Kristin Lavransdatter", "Kristin Lavransdotter"])
+                
+                if has_author:
+                    for t_var in title_variants_local:
+                        for a_var in authors_local:
+                            fallback_queries.append(f'"{t_var}" "{a_var}"')
+                if has_isbn:
+                    fallback_queries.append(f'"{isbn_clean}"')
+                    fallback_queries.append(f'"{isbn_clean}" "{title_clean}"')
+
+                fallback_executed = 0
+                for q in fallback_queries:
                     self._check_cancellation(run_id)
-                    # Skip if broad query is not safe (generic title without author)
-                    if not query_builder.is_safe_broad_query(title, q, author):
-                        logger.info(f"Skipping unsafe broad query: '{q}'")
+                    if q in executed_queries:
                         continue
-                    # Broad queries run on their own budget of up to 10 queries, ignoring max_queries!
-                    if broad_queries_done >= 10:
+                    if fallback_executed >= 10:
                         break
-                    if len(candidate_origin) >= max_candidates:
-                        break
-                    if queries_executed > 0 or broad_queries_done > 0:
+
+                    if queries_executed > 0 or fallback_executed > 0:
                         time.sleep(search_delay)
+
+                    logger_service.log(
+                        "INFO", "SAFE_AUTHOR_FALLBACK_QUERY_USED",
+                        f"{log_prefix}Ejecutando query de fallback segura: {q}",
+                        isbn=isbn, sheet_id=sheet_id, run_id=run_id
+                    )
+                    self._add_in_memory_log(
+                        run_id, "INFO", "SAFE_AUTHOR_FALLBACK_QUERY_USED",
+                        f"{log_prefix}Query fallback segura: {q}",
+                        isbn=isbn
+                    )
+
                     found_items = search_service.search_with_fallback(
-                        query=q, max_pages=max_pages, sheet_id=sheet_id, run_id=run_id, isbn=isbn, config=config, log_callback=self._add_in_memory_log
+                        query=q,
+                        max_pages=max_pages,
+                        sheet_id=sheet_id,
+                        run_id=run_id,
+                        isbn=isbn,
+                        config=config,
+                        log_callback=self._add_in_memory_log
                     )
                     queries_executed += 1
-                    broad_queries_done += 1
+                    fallback_executed += 1
+                    executed_queries.add(q)
+
                     for item in found_items:
                         url = item["url"]
                         if url not in candidate_origin and len(candidate_origin) < max_candidates:
@@ -1191,382 +1383,321 @@ class RunService:
                                 "position": item.get("position"),
                                 "pub_date": item.get("pub_date")
                             }
+                            google_news_candidates_count += 1
+
                 logger_service.log(
-                    "INFO", "GOOGLE_NEWS_BROAD_COMPLETED",
-                    f"{log_prefix}Fase Broad completada. total Google News={len(candidate_origin)}",
+                    "INFO", "SAFE_AUTHOR_FALLBACK_COMPLETED",
+                    f"{log_prefix}Fase fallback segura completada. Candidatos nuevos={len(candidate_origin)}",
                     isbn=isbn, sheet_id=sheet_id, run_id=run_id
                 )
                 self._add_in_memory_log(
-                    run_id, "INFO", "GOOGLE_NEWS_BROAD_COMPLETED",
-                    f"{log_prefix}Fase Broad completada. total Google News={len(candidate_origin)}",
+                    run_id, "INFO", "SAFE_AUTHOR_FALLBACK_COMPLETED",
+                    f"{log_prefix}Fase fallback segura completada. Candidatos nuevos={len(candidate_origin)}",
                     isbn=isbn
                 )
+                candidate_urls = list(candidate_origin.keys())
 
-            candidates_discarded_by_limit = 0
-            internal_search_was_forced = False
-            internal_search_skip_reason = ""
-            candidate_urls = list(candidate_origin.keys())
+            # Log each candidate found with its originating query and provider
+            for url, item in candidate_origin.items():
+                provider_name = item["provider"]
+                origin_query = item["query"]
+                cand_title = item.get("title") or ""
+                snippet = item.get("snippet") or ""
+                pos = item.get("position") or ""
 
-        # Log each candidate found with its originating query and provider
-        for url, item in candidate_origin.items():
-            provider_name = item["provider"]
-            origin_query = item["query"]
-            cand_title = item.get("title") or ""
-            snippet = item.get("snippet") or ""
-            pos = item.get("position") or ""
-
-            logger_service.log(
-                level="INFO",
-                action="CANDIDATE_FOUND",
-                message=f"{log_prefix}Candidato de {provider_name}: {url}",
-                isbn=isbn,
-                detail=f"provider={provider_name} | query={origin_query} | url={url} | title={cand_title} | snippet={snippet} | position={pos}",
-                sheet_id=sheet_id,
-                run_id=run_id
-            )
-            self._add_in_memory_log(
-                run_id=run_id,
-                level="INFO",
-                action="CANDIDATE_FOUND",
-                message=f"{log_prefix}Candidato de {provider_name}: {url}",
-                isbn=isbn,
-                detail=f"provider={provider_name} | query={origin_query} | url={url} | title={cand_title} | snippet={snippet} | position={pos}"
-            )
-
-        # Compile and Log Search Summary
-        providers_used = search_service.get_providers_used()
-        errors_count = search_service.get_and_reset_errors_count()
-
-        search_summary = {
-            "search_provider_mode_config": config.get("SEARCH_PROVIDER_MODE", settings.SEARCH_PROVIDER_MODE),
-            "search_provider_mode_resolved": search_mode,
-            "enable_cascade_search": cascade_search,
-            "providers_used": providers_used,
-            "domain_index_candidates_count": domain_index_candidates_count,
-            "google_news_candidates_count": google_news_candidates_count,
-            "internal_search_candidates_count": internal_search_candidates_count,
-            "internal_domains_attempted": internal_domains_attempted,
-            "internal_domains_with_results": internal_domains_with_results,
-            "queries_executed": queries_executed,
-            "candidate_urls": len(candidate_urls),
-            "provider_errors": errors_count,
-            "total_candidates_before_dedup": domain_index_candidates_count + google_news_candidates_count + internal_search_candidates_count,
-            "total_candidates_after_dedup": len(candidate_urls),
-            "candidates_discarded_by_limit": candidates_discarded_by_limit,
-            "candidates_sent_to_openai": len(candidate_urls),
-            "internal_search_was_forced": internal_search_was_forced,
-            "internal_search_skip_reason": internal_search_skip_reason
-        }
-
-        summary_msg = (
-            f"Resumen búsqueda: {queries_executed} queries, proveedores={providers_used}, "
-            f"errores={errors_count}, candidatos={len(candidate_urls)} (Index={domain_index_candidates_count}, "
-            f"News={google_news_candidates_count}, Interna={internal_search_candidates_count}, "
-            f"descartados_por_límite={candidates_discarded_by_limit})"
-        )
-        logger_service.log(
-            level="INFO",
-            action="BOOK_SEARCH_SUMMARY",
-            message=f"{log_prefix}{summary_msg}",
-            isbn=isbn,
-            detail=json.dumps(search_summary),
-            sheet_id=sheet_id,
-            run_id=run_id
-        )
-        logger_service.log(
-            level="INFO",
-            action="BOOK_CANDIDATES_FOUND",
-            message=f"{log_prefix}Candidatos encontrados para el libro '{title}' (ISBN: {isbn}): total={len(candidate_urls)} (Index={domain_index_candidates_count}, News={google_news_candidates_count}, Interna={internal_search_candidates_count})",
-            isbn=isbn,
-            detail=json.dumps({
-                "isbn": isbn,
-                "title": title,
-                "author": author,
-                "total_candidates": len(candidate_urls),
-                "domain_index_candidates": domain_index_candidates_count,
-                "google_news_candidates": google_news_candidates_count,
-                "internal_search_candidates": internal_search_candidates_count
-            }, ensure_ascii=False),
-            sheet_id=sheet_id,
-            run_id=run_id
-        )
-        self._add_in_memory_log(
-            run_id=run_id,
-            level="INFO",
-            action="BOOK_SEARCH_SUMMARY",
-            message=f"{log_prefix}{summary_msg}",
-            isbn=isbn,
-            detail=json.dumps(search_summary)
-        )
-
-        reviews_added = 0
-        descartes_added = 0
-        failed_extractions = 0
-        extracted_ok_count = 0
-        openai_accepted_count = 0
-        openai_rejected_count = 0
-
-
-        observation = ""
-
-        self._check_cancellation(run_id, reviews_added=reviews_added)
-        # 3. Process candidate URLs
-        for url in candidate_urls:
-            self._check_cancellation(run_id, reviews_added=reviews_added)
-            item = candidate_origin[url]
-            origin_query = item["query"]
-            provider_name = item["provider"]
-            
-            original_candidate_url = url
-            resolved_url = url
-            
-            # Resolve Google News RSS redirect URLs to final article URLs
-            if url.startswith("https://news.google.com/rss/articles/"):
-                try:
-                    from googlenewsdecoder import gnewsdecoder
-                    decoded = gnewsdecoder(url, interval=1)
-                    if decoded.get("status") and decoded.get("decoded_url"):
-                        resolved_url = decoded["decoded_url"]
-                        logger_service.log("INFO", "URL_RESOLVED", f"URL de Google News resuelta: {url} -> {resolved_url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-                    else:
-                        logger_service.log("WARNING", "URL_RESOLUTION_FAILED", f"No se pudo resolver URL de Google News: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-                except Exception as e:
-                    logger_service.log("ERROR", "URL_RESOLUTION_ERROR", f"Error resolviendo URL de Google News {url}: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-
-            # Fallback if Google News URL could not be resolved
-            if original_candidate_url.startswith("https://news.google.com/rss/articles/") and resolved_url == original_candidate_url:
-                logger_service.log("WARNING", "URL_RESOLUTION_FAILED_SKIP", f"{log_prefix}Saltando URL de Google News no resuelta: {original_candidate_url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-                if not dry_run:
-                    sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, origin_query, original_candidate_url, item.get("title") or "", "no se pudo resolver URL de Google News", 0, get_now_madrid_str()
-                    ])
-                descartes_added += 1
-                failed_extractions += 1
-                continue
-
-            # Use resolved URL as the real URL for all subsequent logic
-            url = resolved_url
-
-            # Phase 1: Filter candidates with known date (e.g. from Google News RSS pub_date)
-            cand_pub_date = parse_iso_date(item.get("pub_date"))
-            if cand_pub_date is not None:
-                in_range = True
-                if parsed_min and cand_pub_date < parsed_min:
-                    in_range = False
-                if parsed_max and cand_pub_date > parsed_max:
-                    in_range = False
-                    
-                if not in_range:
-                    logger_service.log(
-                        "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
-                        f"{log_prefix}Descarte de candidato por fecha ({cand_pub_date}): {url}", 
-                        isbn=isbn, sheet_id=sheet_id, run_id=run_id
-                    )
-                    self._add_in_memory_log(
-                        run_id, "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
-                        f"{log_prefix}Descarte de candidato por fecha ({cand_pub_date}): {url}", 
-                        isbn=isbn, 
-                        detail=json.dumps({
-                            "publication_date": str(cand_pub_date),
-                            "date_min": final_min_str or "",
-                            "date_max": final_max_str or "",
-                            "stage": "candidate"
-                        })
-                    )
-                    if not dry_run:
-                        sheets_service.add_descarte(sheet_id, [
-                            isbn, title, author, origin_query, url, item.get("title") or "", "fuera de rango de fechas", 0, get_now_madrid_str()
-                        ])
-                    descartes_added += 1
-                    continue
-
-            # Check primary duplicate
-            norm_url = deduplicator.normalize_url(url)
-            prim_hash = deduplicator.get_primary_hash(isbn, url)
-            
-            if prim_hash in existing_hashes:
-                logger_service.log("DEBUG", "DEDUPLICATE_SKIP", f"{log_prefix}Saltando URL duplicada: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-                if not dry_run:
-                    sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, origin_query, url, item.get("title") or "", "duplicado", 0, get_now_madrid_str()
-                    ])
-                descartes_added += 1
-                continue
-
-            # Extract article content
-            article_data = {}
-            try:
-                article_data = article_extractor.extract(url, provider_item=item)
-                extracted_ok_count += 1
-                
-                # Log METADATA_EXTRACTED
-                meta_extracted_detail = json.dumps({
-                    "url": url,
-                    "article_author": article_data.get("author", ""),
-                    "publication_name": article_data.get("publication_name", ""),
-                    "published_date": article_data.get("date", ""),
-                    "author_source": article_data.get("author_source", "empty"),
-                    "date_source": article_data.get("date_source", "empty")
-                }, ensure_ascii=False)
-                logger_service.log(
-                    "INFO", "METADATA_EXTRACTED", 
-                    f"{log_prefix}Metadatos extraídos para la URL: {url}", 
-                    isbn=isbn, detail=meta_extracted_detail, sheet_id=sheet_id, run_id=run_id
-                )
-                
-                # Log AUTHOR_FALLBACK_TO_EMPTY if empty
-                if not article_data.get("author"):
-                    logger_service.log(
-                        "INFO", "AUTHOR_FALLBACK_TO_EMPTY", 
-                        f"{log_prefix}No se encontró autor real para la URL, se deja vacío: {url}", 
-                        isbn=isbn, sheet_id=sheet_id, run_id=run_id
-                    )
-            except Exception as e:
-                err_msg = str(e)
-                reason = "error HTTP" if "error HTTP" in err_msg else "extracción fallida"
-                if "texto insuficiente" in err_msg:
-                    reason = "texto insuficiente"
-
-                logger_service.log("WARNING", "EXTRACTION_FAILED", f"{log_prefix}Error extrayendo {url}: {err_msg}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-                if not dry_run:
-                    sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, origin_query, url, item.get("title") or "", reason, 0, get_now_madrid_str()
-                    ])
-                descartes_added += 1
-                failed_extractions += 1
-                continue
-
-            # Fallback to candidate title or snippet if extracted ones are empty
-            art_title = article_data.get("title") or item.get("title") or ""
-            
-            # Detect cookies or consent wall pages
-            extracted_text = article_data.get("text") or ""
-            if is_consent_or_cookie_page(extracted_text):
-                logger_service.log("WARNING", "EXTRACTION_COOKIES_DETECTED", f"{log_prefix}Detectada página de cookies/consentimiento para URL: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-                if not dry_run:
-                    sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, origin_query, url, item.get("title") or "", "página de cookies/consent", 0, get_now_madrid_str()
-                    ])
-                descartes_added += 1
-                failed_extractions += 1
-                continue
-
-            # Phase 2: Filter extracted articles with known date
-            ext_pub_date = parse_iso_date(article_data.get("date"))
-            if ext_pub_date is not None:
-                in_range = True
-                if parsed_min and ext_pub_date < parsed_min:
-                    in_range = False
-                if parsed_max and ext_pub_date > parsed_max:
-                    in_range = False
-                    
-                if not in_range:
-                    logger_service.log(
-                        "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
-                        f"{log_prefix}Descarte de artículo extraído por fecha ({ext_pub_date}): {url}", 
-                        isbn=isbn, sheet_id=sheet_id, run_id=run_id
-                    )
-                    self._add_in_memory_log(
-                        run_id, "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
-                        f"{log_prefix}Descarte de artículo por fecha ({ext_pub_date}): {url}", 
-                        isbn=isbn,
-                        detail=json.dumps({
-                            "publication_date": str(ext_pub_date),
-                            "date_min": final_min_str or "",
-                            "date_max": final_max_str or "",
-                            "stage": "extraction"
-                        })
-                    )
-                    if not dry_run:
-                        sheets_service.add_descarte(sheet_id, [
-                            isbn, title, author, origin_query, url, art_title, "fuera de rango de fechas", 0, get_now_madrid_str()
-                        ])
-                    descartes_added += 1
-                    continue
-
-            # Validate secondary key
-            art_domain = urlparse(url).netloc
-            sec_key = deduplicator.get_secondary_key(isbn, art_domain, art_title)
-            if sec_key in existing_secondary_keys:
-                logger_service.log("WARNING", "DEDUPLICATE_SECONDARY_WARN", f"{log_prefix}Posible duplicado secundario detectado para URL: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-                self._add_in_memory_log(run_id, "WARNING", "DEDUPLICATE_SECONDARY_WARN", f"Posible duplicado secundario: {url}", isbn=isbn)
-
-            # Analyze content with OpenAI
-            self._check_cancellation(run_id, reviews_added=reviews_added)
-
-            # Log validation input
-            logger_service.log(
-                level="INFO",
-                action="OPENAI_VALIDATION_INPUT",
-                message=f"Enviando candidato a OpenAI: {url}",
-                isbn=isbn,
-                detail=json.dumps({
-                    "isbn": isbn,
-                    "book_title": title,
-                    "book_author": author,
-                    "candidate_title": art_title,
-                    "candidate_url": url,
-                    "original_candidate_url": original_candidate_url,
-                    "query": origin_query
-                }),
-                sheet_id=sheet_id,
-                run_id=run_id
-            )
-            self._add_in_memory_log(
-                run_id=run_id,
-                level="INFO",
-                action="OPENAI_VALIDATION_INPUT",
-                message=f"Enviando a OpenAI: {url}",
-                isbn=isbn,
-                detail=json.dumps({
-                    "isbn": isbn,
-                    "book_title": title,
-                    "book_author": author,
-                    "candidate_title": art_title,
-                    "candidate_url": url,
-                    "original_candidate_url": original_candidate_url,
-                    "query": origin_query
-                })
-            )
-
-            try:
-                metadata_detected = {
-                    "article_author": article_data.get("author") or "",
-                    "publication_name": article_data.get("publication_name") or "",
-                    "published_date": article_data.get("date") or "",
-                    "author_source": article_data.get("author_source") or "empty",
-                    "date_source": article_data.get("date_source") or "empty"
-                }
-
-                analysis = openai_analyzer.analyze_article(
-                    isbn=isbn,
-                    book_title=title,
-                    book_author=author,
-                    query=origin_query,
-                    url=url,
-                    article_title=art_title,
-                    article_text=article_data.get("text") or "",
-                    detected_date=article_data.get("date") or "",
-                    detected_author=article_data.get("author") or "",
-                    detected_medium=article_data.get("publication_name") or "",
-                    model_override=openai_model,
-                    metadata_detected=metadata_detected
-                )
-
-                # Log validation result
                 logger_service.log(
                     level="INFO",
-                    action="OPENAI_VALIDATION_RESULT",
-                    message=f"Resultado validación OpenAI para {url}: is_valid={analysis.get('is_valid')}, score={analysis.get('match_score')}",
+                    action="CANDIDATE_FOUND",
+                    message=f"{log_prefix}Candidato de {provider_name}: {url}",
+                    isbn=isbn,
+                    detail=f"provider={provider_name} | query={origin_query} | url={url} | title={cand_title} | snippet={snippet} | position={pos}",
+                    sheet_id=sheet_id,
+                    run_id=run_id
+                )
+                self._add_in_memory_log(
+                    run_id=run_id,
+                    level="INFO",
+                    action="CANDIDATE_FOUND",
+                    message=f"{log_prefix}Candidato de {provider_name}: {url}",
+                    isbn=isbn,
+                    detail=f"provider={provider_name} | query={origin_query} | url={url} | title={cand_title} | snippet={snippet} | position={pos}"
+                )
+
+            # Compile and Log Search Summary
+            providers_used = search_service.get_providers_used()
+            errors_count = search_service.get_and_reset_errors_count()
+
+            search_summary = {
+                "search_provider_mode_config": config.get("SEARCH_PROVIDER_MODE", settings.SEARCH_PROVIDER_MODE),
+                "search_provider_mode_resolved": search_mode,
+                "enable_cascade_search": cascade_search,
+                "providers_used": providers_used,
+                "domain_index_candidates_count": domain_index_candidates_count,
+                "google_news_candidates_count": google_news_candidates_count,
+                "internal_search_candidates_count": internal_search_candidates_count,
+                "internal_domains_attempted": internal_domains_attempted,
+                "internal_domains_with_results": internal_domains_with_results,
+                "queries_executed": queries_executed,
+                "candidate_urls": len(candidate_urls),
+                "provider_errors": errors_count,
+                "total_candidates_before_dedup": domain_index_candidates_count + google_news_candidates_count + internal_search_candidates_count,
+                "total_candidates_after_dedup": len(candidate_urls),
+                "candidates_discarded_by_limit": candidates_discarded_by_limit,
+                "candidates_sent_to_openai": len(candidate_urls),
+                "internal_search_was_forced": internal_search_was_forced,
+                "internal_search_skip_reason": internal_search_skip_reason
+            }
+
+            summary_msg = (
+                f"Resumen búsqueda: {queries_executed} queries, proveedores={providers_used}, "
+                f"errores={errors_count}, candidatos={len(candidate_urls)} (Index={domain_index_candidates_count}, "
+                f"News={google_news_candidates_count}, Interna={internal_search_candidates_count}, "
+                f"descartados_por_límite={candidates_discarded_by_limit})"
+            )
+            logger_service.log(
+                level="INFO",
+                action="BOOK_SEARCH_SUMMARY",
+                message=f"{log_prefix}{summary_msg}",
+                isbn=isbn,
+                detail=json.dumps(search_summary),
+                sheet_id=sheet_id,
+                run_id=run_id
+            )
+            logger_service.log(
+                level="INFO",
+                action="BOOK_CANDIDATES_FOUND",
+                message=f"{log_prefix}Candidatos encontrados para el libro '{title}' (ISBN: {isbn}): total={len(candidate_urls)} (Index={domain_index_candidates_count}, News={google_news_candidates_count}, Interna={internal_search_candidates_count})",
+                isbn=isbn,
+                detail=json.dumps({
+                    "isbn": isbn,
+                    "title": title,
+                    "author": author,
+                    "total_candidates": len(candidate_urls),
+                    "domain_index_candidates": domain_index_candidates_count,
+                    "google_news_candidates": google_news_candidates_count,
+                    "internal_search_candidates": internal_search_candidates_count
+                }, ensure_ascii=False),
+                sheet_id=sheet_id,
+                run_id=run_id
+            )
+            self._add_in_memory_log(
+                run_id=run_id,
+                level="INFO",
+                action="BOOK_SEARCH_SUMMARY",
+                message=f"{log_prefix}{summary_msg}",
+                isbn=isbn,
+                detail=json.dumps(search_summary)
+            )
+
+    #         reviews_added = 0
+    #         descartes_added = 0
+    #         failed_extractions = 0
+            # extracted_ok_count = 0
+            # openai_accepted_count = 0
+            # openai_rejected_count = 0
+
+
+            # observation = ""
+
+            self._check_cancellation(run_id, reviews_added=reviews_added)
+            # 3. Process candidate URLs
+            for url in candidate_urls:
+                self._check_cancellation(run_id, reviews_added=reviews_added)
+                item = candidate_origin[url]
+                origin_query = item["query"]
+                provider_name = item["provider"]
+
+                original_candidate_url = url
+                resolved_url = url
+
+                # Resolve Google News RSS redirect URLs to final article URLs
+                if url.startswith("https://news.google.com/rss/articles/"):
+                    try:
+                        from googlenewsdecoder import gnewsdecoder
+                        decoded = gnewsdecoder(url, interval=1)
+                        if decoded.get("status") and decoded.get("decoded_url"):
+                            resolved_url = decoded["decoded_url"]
+                            logger_service.log("INFO", "URL_RESOLVED", f"URL de Google News resuelta: {url} -> {resolved_url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                        else:
+                            logger_service.log("WARNING", "URL_RESOLUTION_FAILED", f"No se pudo resolver URL de Google News: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                    except Exception as e:
+                        logger_service.log("ERROR", "URL_RESOLUTION_ERROR", f"Error resolviendo URL de Google News {url}: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+
+                # Fallback if Google News URL could not be resolved
+                if original_candidate_url.startswith("https://news.google.com/rss/articles/") and resolved_url == original_candidate_url:
+                    logger_service.log("WARNING", "URL_RESOLUTION_FAILED_SKIP", f"{log_prefix}Saltando URL de Google News no resuelta: {original_candidate_url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                    if not dry_run:
+                        sheets_service.add_descarte(sheet_id, [
+                            isbn, title, author, origin_query, original_candidate_url, item.get("title") or "", "no se pudo resolver URL de Google News", 0, get_now_madrid_str()
+                        ])
+                    descartes_added += 1
+                    failed_extractions += 1
+                    continue
+
+                # Use resolved URL as the real URL for all subsequent logic
+                url = resolved_url
+
+                # Phase 1: Filter candidates with known date (e.g. from Google News RSS pub_date)
+                cand_pub_date = parse_iso_date(item.get("pub_date"))
+                if cand_pub_date is not None:
+                    in_range = True
+                    if parsed_min and cand_pub_date < parsed_min:
+                        in_range = False
+                    if parsed_max and cand_pub_date > parsed_max:
+                        in_range = False
+
+                    if not in_range:
+                        logger_service.log(
+                            "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
+                            f"{log_prefix}Descarte de candidato por fecha ({cand_pub_date}): {url}", 
+                            isbn=isbn, sheet_id=sheet_id, run_id=run_id
+                        )
+                        self._add_in_memory_log(
+                            run_id, "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
+                            f"{log_prefix}Descarte de candidato por fecha ({cand_pub_date}): {url}", 
+                            isbn=isbn, 
+                            detail=json.dumps({
+                                "publication_date": str(cand_pub_date),
+                                "date_min": final_min_str or "",
+                                "date_max": final_max_str or "",
+                                "stage": "candidate"
+                            })
+                        )
+                        if not dry_run:
+                            sheets_service.add_descarte(sheet_id, [
+                                isbn, title, author, origin_query, url, item.get("title") or "", "fuera de rango de fechas", 0, get_now_madrid_str()
+                            ])
+                        descartes_added += 1
+                        continue
+
+                # Check primary duplicate
+                norm_url = deduplicator.normalize_url(url)
+                prim_hash = deduplicator.get_primary_hash(isbn, url)
+
+                if prim_hash in existing_hashes:
+                    logger_service.log("DEBUG", "DEDUPLICATE_SKIP", f"{log_prefix}Saltando URL duplicada: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                    if not dry_run:
+                        sheets_service.add_descarte(sheet_id, [
+                            isbn, title, author, origin_query, url, item.get("title") or "", "duplicado", 0, get_now_madrid_str()
+                        ])
+                    descartes_added += 1
+                    continue
+
+                # Extract article content
+                article_data = {}
+                try:
+                    article_data = article_extractor.extract(url, provider_item=item)
+                    extracted_ok_count += 1
+
+                    # Log METADATA_EXTRACTED
+                    meta_extracted_detail = json.dumps({
+                        "url": url,
+                        "article_author": article_data.get("author", ""),
+                        "publication_name": article_data.get("publication_name", ""),
+                        "published_date": article_data.get("date", ""),
+                        "author_source": article_data.get("author_source", "empty"),
+                        "date_source": article_data.get("date_source", "empty")
+                    }, ensure_ascii=False)
+                    logger_service.log(
+                        "INFO", "METADATA_EXTRACTED", 
+                        f"{log_prefix}Metadatos extraídos para la URL: {url}", 
+                        isbn=isbn, detail=meta_extracted_detail, sheet_id=sheet_id, run_id=run_id
+                    )
+
+                    # Log AUTHOR_FALLBACK_TO_EMPTY if empty
+                    if not article_data.get("author"):
+                        logger_service.log(
+                            "INFO", "AUTHOR_FALLBACK_TO_EMPTY", 
+                            f"{log_prefix}No se encontró autor real para la URL, se deja vacío: {url}", 
+                            isbn=isbn, sheet_id=sheet_id, run_id=run_id
+                        )
+                except Exception as e:
+                    err_msg = str(e)
+                    reason = "error HTTP" if "error HTTP" in err_msg else "extracción fallida"
+                    if "texto insuficiente" in err_msg:
+                        reason = "texto insuficiente"
+
+                    logger_service.log("WARNING", "EXTRACTION_FAILED", f"{log_prefix}Error extrayendo {url}: {err_msg}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                    if not dry_run:
+                        sheets_service.add_descarte(sheet_id, [
+                            isbn, title, author, origin_query, url, item.get("title") or "", reason, 0, get_now_madrid_str()
+                        ])
+                    descartes_added += 1
+                    failed_extractions += 1
+                    continue
+
+                # Fallback to candidate title or snippet if extracted ones are empty
+                art_title = article_data.get("title") or item.get("title") or ""
+
+                # Detect cookies or consent wall pages
+                extracted_text = article_data.get("text") or ""
+                if is_consent_or_cookie_page(extracted_text):
+                    logger_service.log("WARNING", "EXTRACTION_COOKIES_DETECTED", f"{log_prefix}Detectada página de cookies/consentimiento para URL: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                    if not dry_run:
+                        sheets_service.add_descarte(sheet_id, [
+                            isbn, title, author, origin_query, url, item.get("title") or "", "página de cookies/consent", 0, get_now_madrid_str()
+                        ])
+                    descartes_added += 1
+                    failed_extractions += 1
+                    continue
+
+                # Phase 2: Filter extracted articles with known date
+                ext_pub_date = parse_iso_date(article_data.get("date"))
+                if ext_pub_date is not None:
+                    in_range = True
+                    if parsed_min and ext_pub_date < parsed_min:
+                        in_range = False
+                    if parsed_max and ext_pub_date > parsed_max:
+                        in_range = False
+
+                    if not in_range:
+                        logger_service.log(
+                            "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
+                            f"{log_prefix}Descarte de artículo extraído por fecha ({ext_pub_date}): {url}", 
+                            isbn=isbn, sheet_id=sheet_id, run_id=run_id
+                        )
+                        self._add_in_memory_log(
+                            run_id, "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
+                            f"{log_prefix}Descarte de artículo por fecha ({ext_pub_date}): {url}", 
+                            isbn=isbn,
+                            detail=json.dumps({
+                                "publication_date": str(ext_pub_date),
+                                "date_min": final_min_str or "",
+                                "date_max": final_max_str or "",
+                                "stage": "extraction"
+                            })
+                        )
+                        if not dry_run:
+                            sheets_service.add_descarte(sheet_id, [
+                                isbn, title, author, origin_query, url, art_title, "fuera de rango de fechas", 0, get_now_madrid_str()
+                            ])
+                        descartes_added += 1
+                        continue
+
+                # Validate secondary key
+                art_domain = urlparse(url).netloc
+                sec_key = deduplicator.get_secondary_key(isbn, art_domain, art_title)
+                if sec_key in existing_secondary_keys:
+                    logger_service.log("WARNING", "DEDUPLICATE_SECONDARY_WARN", f"{log_prefix}Posible duplicado secundario detectado para URL: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                    self._add_in_memory_log(run_id, "WARNING", "DEDUPLICATE_SECONDARY_WARN", f"Posible duplicado secundario: {url}", isbn=isbn)
+
+                # Analyze content with OpenAI
+                self._check_cancellation(run_id, reviews_added=reviews_added)
+
+                # Log validation input
+                logger_service.log(
+                    level="INFO",
+                    action="OPENAI_VALIDATION_INPUT",
+                    message=f"Enviando candidato a OpenAI: {url}",
                     isbn=isbn,
                     detail=json.dumps({
+                        "isbn": isbn,
                         "book_title": title,
+                        "book_author": author,
                         "candidate_title": art_title,
                         "candidate_url": url,
-                        "is_match": analysis.get("is_valid", False),
-                        "match_score": analysis.get("match_score", 0),
-                        "reason": analysis.get("reason", ""),
-                        "summary": analysis.get("summary", "")
+                        "original_candidate_url": original_candidate_url,
+                        "query": origin_query
                     }),
                     sheet_id=sheet_id,
                     run_id=run_id
@@ -1574,195 +1705,328 @@ class RunService:
                 self._add_in_memory_log(
                     run_id=run_id,
                     level="INFO",
-                    action="OPENAI_VALIDATION_RESULT",
-                    message=f"Resultado OpenAI: is_valid={analysis.get('is_valid')}, score={analysis.get('match_score')}",
+                    action="OPENAI_VALIDATION_INPUT",
+                    message=f"Enviando a OpenAI: {url}",
                     isbn=isbn,
                     detail=json.dumps({
+                        "isbn": isbn,
                         "book_title": title,
+                        "book_author": author,
                         "candidate_title": art_title,
                         "candidate_url": url,
-                        "is_match": analysis.get("is_valid", False),
-                        "match_score": analysis.get("match_score", 0),
-                        "reason": analysis.get("reason", ""),
-                        "summary": analysis.get("summary", "")
+                        "original_candidate_url": original_candidate_url,
+                        "query": origin_query
                     })
                 )
-            except Exception as e:
-                logger_service.log("ERROR", "OPENAI_FAILED", f"{log_prefix}Error OpenAI para {url}: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-                if not dry_run:
-                    sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, origin_query, url, art_title, "error OpenAI", 0, get_now_madrid_str()
-                    ])
-                descartes_added += 1
-                continue
 
-            # Phase 3: Filter after OpenAI returns / confirms the publication date
-            ai_pub_date_str = analysis.get("publication_date", "")
-            ai_pub_date = parse_iso_date(ai_pub_date_str)
-            
-            # If the date is known, check range
-            if ai_pub_date is not None:
-                in_range = True
-                if parsed_min and ai_pub_date < parsed_min:
-                    in_range = False
-                if parsed_max and ai_pub_date > parsed_max:
-                    in_range = False
-                if not in_range:
-                    logger_service.log(
-                        "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
-                        f"{log_prefix}Descarte OpenAI por fecha ({ai_pub_date}): {url}", 
-                        isbn=isbn, sheet_id=sheet_id, run_id=run_id
-                    )
-                    self._add_in_memory_log(
-                        run_id, "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
-                        f"{log_prefix}Descarte de artículo por fecha ({ai_pub_date}): {url}", 
-                        isbn=isbn,
-                        detail=json.dumps({
-                            "publication_date": str(ai_pub_date),
-                            "date_min": final_min_str or "",
-                            "date_max": final_max_str or "",
-                            "stage": "openai"
-                        })
-                    )
-                    if not dry_run:
-                        sheets_service.add_descarte(sheet_id, [
-                            isbn, title, author, origin_query, url, art_title, "fuera de rango de fechas", 0, get_now_madrid_str()
-                        ])
-                    descartes_added += 1
-                    continue
-            else:
-                # The date is unknown (ai_pub_date is None)
-                if not final_include_unknown:
-                    logger_service.log(
-                        "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
-                        f"{log_prefix}Descarte OpenAI por fecha desconocida: {url}", 
-                        isbn=isbn, sheet_id=sheet_id, run_id=run_id
-                    )
-                    self._add_in_memory_log(
-                        run_id, "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
-                        f"{log_prefix}Descarte por fecha desconocida: {url}", 
-                        isbn=isbn,
-                        detail=json.dumps({
-                            "publication_date": "",
-                            "date_min": final_min_str or "",
-                            "date_max": final_max_str or "",
-                            "stage": "openai"
-                        })
-                    )
-                    if not dry_run:
-                        sheets_service.add_descarte(sheet_id, [
-                            isbn, title, author, origin_query, url, art_title, "fuera de rango de fechas", 0, get_now_madrid_str()
-                        ])
-                    descartes_added += 1
-                    continue
-
-            is_valid = analysis.get("is_valid", False)
-            score = analysis.get("match_score", 0)
-            openai_reason = analysis.get("reason", "")
-            
-            # Normalise inconsistency: score >= 1 should imply is_valid = True.
-            # score == 0 should imply is_valid = False.
-            if score >= 1 and not is_valid:
-                logger_service.log("WARNING", "OPENAI_COHERENCE_FIX", f"{log_prefix}Incoherencia OpenAI: is_valid=False pero score={score}. Se fuerza is_valid=True. URL: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-                is_valid = True
-            elif score == 0 and is_valid:
-                logger_service.log("WARNING", "OPENAI_COHERENCE_FIX", f"{log_prefix}Incoherencia OpenAI: is_valid=True pero score=0. Se fuerza is_valid=False. URL: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-                is_valid = False
-            
-            # Map OpenAI reason or scores to descarte categories
-            descarte_reason = ""
-            if not is_valid:
-                openai_reason_lower = openai_reason.lower()
-                if "autor" in openai_reason_lower and ("sólo" in openai_reason_lower or "solo" in openai_reason_lower or "no habla" in openai_reason_lower):
-                    descarte_reason = "habla solo del autor"
-                else:
-                    descarte_reason = "no menciona el libro"
-            elif score < min_score:
-                descarte_reason = "score bajo"
-
-            if descarte_reason:
-                openai_rejected_count += 1
-                logger_service.log("INFO", "ARTICLE_DISCARDED", f"{log_prefix}URL descartada ({descarte_reason}, score: {score}): {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-                self._add_in_memory_log(run_id, "INFO", "ARTICLE_DISCARDED", f"{log_prefix}Descarte ({descarte_reason}, score={score}): {url}", isbn=isbn)
-                
-                if not dry_run:
-                    sheets_service.add_descarte(sheet_id, [
-                        isbn, title, author, origin_query, url, art_title, descarte_reason, score, get_now_madrid_str()
-                    ])
-                descartes_added += 1
-            else:
-                # Valid Review!
-                openai_accepted_count += 1
-                logger_service.log("INFO", "ARTICLE_ACCEPTED", f"{log_prefix}Reseña válida aceptada (score: {score}): {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
-                self._add_in_memory_log(run_id, "INFO", "ARTICLE_ACCEPTED", f"{log_prefix}Aceptada (score={score}): {url}", isbn=isbn)
-
-                if not dry_run:
-                    # Select best metadata
-                    def select_best_author(det_auth: str, ai_auth: str) -> str:
-                        det = str(det_auth or "").strip()
-                        ai = str(ai_auth or "").strip()
-                        invalids = ("titulo web", "título web", "autor web", "autor web ", "redacción", "redaccion", "")
-                        if det and det.lower() not in invalids:
-                            return det
-                        if ai and ai.lower() not in invalids:
-                            return ai
-                        if det.lower() in ("redacción", "redaccion"):
-                            return "Redacción"
-                        if ai.lower() in ("redacción", "redaccion"):
-                            return "Redacción"
-                        return ""
-
-                    def select_best_date(det_dt: str, ai_dt: str) -> str:
-                        det = str(det_dt or "").strip()
-                        ai = str(ai_dt or "").strip()
-                        norm_det = normalize_date(det)
-                        norm_ai = normalize_date(ai)
-                        if norm_det:
-                            return norm_det
-                        if norm_ai:
-                            return norm_ai
-                        if det:
-                            return det
-                        if ai:
-                            return ai
-                        return ""
-
-                    best_author = select_best_author(article_data.get("author"), analysis.get("publication_author"))
-                    best_date = select_best_date(article_data.get("date"), analysis.get("publication_date"))
-                    best_medium = analysis.get("publication_name") or article_data.get("publication_name") or ""
-
-                    review_dict = {
-                        "¿Publicar?": False,
-                        "Estado publicación": "",
-                        "Fecha intento publicación": "",
-                        "Error publicación": "",
-                        "ISBN": isbn,
-                        "Título del libro": title,
-                        "Autor del libro": author,
-                        "URL": url,
-                        "Título para Web": art_title,
-                        "Autor para Web": best_author,
-                        "Medio de publicación": best_medium,
-                        "Fecha de publicación": best_date,
-                        "Idioma original": analysis.get("language", ""),
-                        "Categoría": analysis.get("category", ""),
-                        "Resumen": analysis.get("summary", ""),
-                        "Score de coincidencia": score,
-                        "Tipo de contenido": analysis.get("content_type", ""),
-                        "Fecha de extracción": get_now_madrid_str(),
-                        "Hash deduplicación": prim_hash,
-                        "Query": origin_query
+                try:
+                    metadata_detected = {
+                        "article_author": article_data.get("author") or "",
+                        "publication_name": article_data.get("publication_name") or "",
+                        "published_date": article_data.get("date") or "",
+                        "author_source": article_data.get("author_source") or "empty",
+                        "date_source": article_data.get("date_source") or "empty"
                     }
-                    sheets_service.add_review(sheet_id, review_dict)
-                    existing_hashes.add(prim_hash)
-                    existing_secondary_keys.add(sec_key)
+
+                    analysis = openai_analyzer.analyze_article(
+                        isbn=isbn,
+                        book_title=title,
+                        book_author=author,
+                        query=origin_query,
+                        url=url,
+                        article_title=art_title,
+                        article_text=article_data.get("text") or "",
+                        detected_date=article_data.get("date") or "",
+                        detected_author=article_data.get("author") or "",
+                        detected_medium=article_data.get("publication_name") or "",
+                        model_override=openai_model,
+                        metadata_detected=metadata_detected
+                    )
+
+                    # Log validation result
+                    logger_service.log(
+                        level="INFO",
+                        action="OPENAI_VALIDATION_RESULT",
+                        message=f"Resultado validación OpenAI para {url}: is_valid={analysis.get('is_valid')}, score={analysis.get('match_score')}",
+                        isbn=isbn,
+                        detail=json.dumps({
+                            "book_title": title,
+                            "candidate_title": art_title,
+                            "candidate_url": url,
+                            "is_match": analysis.get("is_valid", False),
+                            "match_score": analysis.get("match_score", 0),
+                            "reason": analysis.get("reason", ""),
+                            "summary": analysis.get("summary", "")
+                        }),
+                        sheet_id=sheet_id,
+                        run_id=run_id
+                    )
+                    self._add_in_memory_log(
+                        run_id=run_id,
+                        level="INFO",
+                        action="OPENAI_VALIDATION_RESULT",
+                        message=f"Resultado OpenAI: is_valid={analysis.get('is_valid')}, score={analysis.get('match_score')}",
+                        isbn=isbn,
+                        detail=json.dumps({
+                            "book_title": title,
+                            "candidate_title": art_title,
+                            "candidate_url": url,
+                            "is_match": analysis.get("is_valid", False),
+                            "match_score": analysis.get("match_score", 0),
+                            "reason": analysis.get("reason", ""),
+                            "summary": analysis.get("summary", "")
+                        })
+                    )
+                except Exception as e:
+                    logger_service.log("ERROR", "OPENAI_FAILED", f"{log_prefix}Error OpenAI para {url}: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                    if not dry_run:
+                        sheets_service.add_descarte(sheet_id, [
+                            isbn, title, author, origin_query, url, art_title, "error OpenAI", 0, get_now_madrid_str()
+                        ])
+                    descartes_added += 1
+                    continue
+
+                # Phase 3: Filter after OpenAI returns / confirms the publication date
+                ai_pub_date_str = analysis.get("publication_date", "")
+                ai_pub_date = parse_iso_date(ai_pub_date_str)
+
+                # If the date is known, check range
+                if ai_pub_date is not None:
+                    in_range = True
+                    if parsed_min and ai_pub_date < parsed_min:
+                        in_range = False
+                    if parsed_max and ai_pub_date > parsed_max:
+                        in_range = False
+                    if not in_range:
+                        logger_service.log(
+                            "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
+                            f"{log_prefix}Descarte OpenAI por fecha ({ai_pub_date}): {url}", 
+                            isbn=isbn, sheet_id=sheet_id, run_id=run_id
+                        )
+                        self._add_in_memory_log(
+                            run_id, "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
+                            f"{log_prefix}Descarte de artículo por fecha ({ai_pub_date}): {url}", 
+                            isbn=isbn,
+                            detail=json.dumps({
+                                "publication_date": str(ai_pub_date),
+                                "date_min": final_min_str or "",
+                                "date_max": final_max_str or "",
+                                "stage": "openai"
+                            })
+                        )
+                        if not dry_run:
+                            sheets_service.add_descarte(sheet_id, [
+                                isbn, title, author, origin_query, url, art_title, "fuera de rango de fechas", 0, get_now_madrid_str()
+                            ])
+                        descartes_added += 1
+                        continue
+                else:
+                    # The date is unknown (ai_pub_date is None)
+                    if not final_include_unknown:
+                        logger_service.log(
+                            "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
+                            f"{log_prefix}Descarte OpenAI por fecha desconocida: {url}", 
+                            isbn=isbn, sheet_id=sheet_id, run_id=run_id
+                        )
+                        self._add_in_memory_log(
+                            run_id, "INFO", "ARTICLE_DISCARDED_DATE_FILTER", 
+                            f"{log_prefix}Descarte por fecha desconocida: {url}", 
+                            isbn=isbn,
+                            detail=json.dumps({
+                                "publication_date": "",
+                                "date_min": final_min_str or "",
+                                "date_max": final_max_str or "",
+                                "stage": "openai"
+                            })
+                        )
+                        if not dry_run:
+                            sheets_service.add_descarte(sheet_id, [
+                                isbn, title, author, origin_query, url, art_title, "fuera de rango de fechas", 0, get_now_madrid_str()
+                            ])
+                        descartes_added += 1
+                        continue
+
+                is_valid = analysis.get("is_valid", False)
+                score = analysis.get("match_score", 0)
+                openai_reason = analysis.get("reason", "")
+
+                # Normalise inconsistency: score >= 1 should imply is_valid = True.
+                # score == 0 should imply is_valid = False.
+                if score >= 1 and not is_valid:
+                    logger_service.log("WARNING", "OPENAI_COHERENCE_FIX", f"{log_prefix}Incoherencia OpenAI: is_valid=False pero score={score}. Se fuerza is_valid=True. URL: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                    is_valid = True
+                elif score == 0 and is_valid:
+                    logger_service.log("WARNING", "OPENAI_COHERENCE_FIX", f"{log_prefix}Incoherencia OpenAI: is_valid=True pero score=0. Se fuerza is_valid=False. URL: {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                    is_valid = False
+
+                # Map OpenAI reason or scores to descarte categories
+                descarte_reason = ""
+                if not is_valid:
+                    openai_reason_lower = openai_reason.lower()
+                    if "autor" in openai_reason_lower and ("sólo" in openai_reason_lower or "solo" in openai_reason_lower or "no habla" in openai_reason_lower):
+                        descarte_reason = "habla solo del autor"
+                    else:
+                        descarte_reason = "no menciona el libro"
+                elif score < min_score:
+                    descarte_reason = "score bajo"
+
+                if descarte_reason:
+                    openai_rejected_count += 1
+                    logger_service.log("INFO", "ARTICLE_DISCARDED", f"{log_prefix}URL descartada ({descarte_reason}, score: {score}): {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                    self._add_in_memory_log(run_id, "INFO", "ARTICLE_DISCARDED", f"{log_prefix}Descarte ({descarte_reason}, score={score}): {url}", isbn=isbn)
+
+                    if not dry_run:
+                        sheets_service.add_descarte(sheet_id, [
+                            isbn, title, author, origin_query, url, art_title, descarte_reason, score, get_now_madrid_str()
+                        ])
+                    descartes_added += 1
+                else:
+                    # Valid Review!
+                    openai_accepted_count += 1
+                    logger_service.log("INFO", "ARTICLE_ACCEPTED", f"{log_prefix}Reseña válida aceptada (score: {score}): {url}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+                    self._add_in_memory_log(run_id, "INFO", "ARTICLE_ACCEPTED", f"{log_prefix}Aceptada (score={score}): {url}", isbn=isbn)
+
+                    if not dry_run:
+                        # Select best metadata
+                        def select_best_author(det_auth: str, ai_auth: str) -> str:
+                            det = str(det_auth or "").strip()
+                            ai = str(ai_auth or "").strip()
+                            invalids = ("titulo web", "título web", "autor web", "autor web ", "redacción", "redaccion", "")
+                            if det and det.lower() not in invalids:
+                                return det
+                            if ai and ai.lower() not in invalids:
+                                return ai
+                            if det.lower() in ("redacción", "redaccion"):
+                                return "Redacción"
+                            if ai.lower() in ("redacción", "redaccion"):
+                                return "Redacción"
+                            return ""
+
+                        def select_best_date(det_dt: str, ai_dt: str) -> str:
+                            det = str(det_dt or "").strip()
+                            ai = str(ai_dt or "").strip()
+                            norm_det = normalize_date(det)
+                            norm_ai = normalize_date(ai)
+                            if norm_det:
+                                return norm_det
+                            if norm_ai:
+                                return norm_ai
+                            if det:
+                                return det
+                            if ai:
+                                return ai
+                            return ""
+
+                        best_author = select_best_author(article_data.get("author"), analysis.get("publication_author"))
+                        best_date = select_best_date(article_data.get("date"), analysis.get("publication_date"))
+                        best_medium = analysis.get("publication_name") or article_data.get("publication_name") or ""
+
+                        review_dict = {
+                            "¿Publicar?": False,
+                            "Estado publicación": "",
+                            "Fecha intento publicación": "",
+                            "Error publicación": "",
+                            "ISBN": isbn,
+                            "Título del libro": title,
+                            "Autor del libro": author,
+                            "URL": url,
+                            "Título para Web": art_title,
+                            "Autor para Web": best_author,
+                            "Medio de publicación": best_medium,
+                            "Fecha de publicación": best_date,
+                            "Idioma original": analysis.get("language", ""),
+                            "Categoría": analysis.get("category", ""),
+                            "Resumen": analysis.get("summary", ""),
+                            "Score de coincidencia": score,
+                            "Tipo de contenido": analysis.get("content_type", ""),
+                            "Fecha de extracción": get_now_madrid_str(),
+                            "Hash deduplicación": prim_hash,
+                            "Query": origin_query
+                        }
+                        sheets_service.add_review(sheet_id, review_dict)
+                        existing_hashes.add(prim_hash)
+                        existing_secondary_keys.add(sec_key)
+
+                    reviews_added += 1
+
+            # Flush the batches on successful run
+            try:
+                if descartes_batch and not is_mock_descarte:
+                    sheets_service.add_descartes_batch(sheet_id, descartes_batch)
+                    descartes_added = len(descartes_batch)
+                elif is_mock_descarte:
+                    descartes_added = len(descartes_batch)
+                if reviews_batch and not is_mock_review:
+                    sheets_service.add_reviews_batch(sheet_id, reviews_batch)
+            except Exception as e_flush:
+                logger.error(f"Error flushing reviews/descartes batches: {e_flush}")
+
+        except Exception as e:
+            if isinstance(e, RunCancelledException):
+                raise e
+            err_summary = str(e)
+            
+            # Flush whatever we collected before the failure
+            try:
+                if descartes_batch and not is_mock_descarte:
+                    sheets_service.add_descartes_batch(sheet_id, descartes_batch)
+                    descartes_added = len(descartes_batch)
+                elif is_mock_descarte:
+                    descartes_added = len(descartes_batch)
+                if reviews_batch and not is_mock_review:
+                    sheets_service.add_reviews_batch(sheet_id, reviews_batch)
+            except Exception as e_flush:
+                logger.error(f"Error flushing reviews/descartes on failure: {e_flush}")
                 
-                reviews_added += 1
+            if "quota" in err_summary.lower() or "limit" in err_summary.lower() or "429" in err_summary:
+                final_status = "completado_parcial" if reviews_added > 0 else "error"
+                observation = "Búsqueda finalizada con error técnico: cuota de Google Sheets excedida."
+            else:
+                final_status = "error"
+                short_err = err_summary[:60] + "..." if len(err_summary) > 60 else err_summary
+                observation = f"Búsqueda finalizada con error técnico: {short_err}"
+            
+            spec_obs = ""
+            if not has_isbn and not has_author:
+                spec_obs = "Búsqueda realizada solo por título. "
+            elif not has_isbn:
+                spec_obs = "Búsqueda realizada sin ISBN. "
+            elif not has_author:
+                spec_obs = "Búsqueda realizada sin autor. "
+
+            logger_service.log("ERROR", "BOOK_PROCESS_FAIL", f"Error procesando libro: {e}", isbn=isbn, sheet_id=sheet_id, run_id=run_id)
+            self._add_in_memory_log(run_id, "ERROR", "BOOK_PROCESS_FAIL", str(e), isbn=isbn)
+            
+            # Update book status to error/completado_parcial in Google Sheets before returning!
+            try:
+                sheets_service.update_book_status(
+                    sheet_id=sheet_id,
+                    row_index=row_index,
+                    status=final_status,
+                    last_run=get_now_madrid_str(),
+                    reviews_found=reviews_added,
+                    observations=spec_obs + observation
+                )
+            except Exception as e_sheet:
+                logger.error(f"Error updating book status in Sheets on failure: {e_sheet}")
+            
+            return {
+                "isbn": isbn,
+                "title": title,
+                "domain_index_candidates": domain_index_candidates_count,
+                "google_news_candidates": google_news_candidates_count,
+                "internal_search_candidates": internal_search_candidates_count,
+                "total_before_dedup": domain_index_candidates_count + google_news_candidates_count + internal_search_candidates_count,
+                "total_after_dedup": len(candidate_urls),
+                "accepted_by_ai": reviews_added,
+                "final_status": final_status
+            }
+        finally:
+            sheets_service.add_descarte = original_add_descarte
+            sheets_service.add_review = original_add_review
 
         # Determine specific prefix observation depending on missing values
         spec_obs = ""
-        has_isbn = bool(isbn and isbn.strip())
-        has_author = bool(author and author.strip())
         if not has_isbn and not has_author:
             spec_obs = "Búsqueda realizada solo por título. "
         elif not has_isbn:
@@ -1770,17 +2034,8 @@ class RunService:
         elif not has_author:
             spec_obs = "Búsqueda realizada sin autor. "
 
-        # Determine final status
-        final_status = "completado"
-        if reviews_added == 0:
-            final_status = "sin_resultados"
-            observation = f"Búsqueda finalizada. 0 reseñas aceptadas. {descartes_added} descartes."
-            if failed_extractions > 0:
-                observation += f" ({failed_extractions} fallos de red/extracción)."
-        else:
-            observation = f"Proceso finalizado. Encontradas y guardadas {reviews_added} reseñas. {descartes_added} descartes."
-
-        # Prepend the missing-data observation prefix
+        final_status = "completado" if reviews_added > 0 else "sin_resultados"
+        observation = build_book_observation_message(final_status, reviews_added, descartes_added, failed_extractions)
         observation = spec_obs + observation
 
         # Log detailed counters

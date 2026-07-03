@@ -68,7 +68,8 @@ class LoggerService:
                     self._batch_key = batch_key
                     self._batch = []
                 self._batch.append(log_row)
-                if len(self._batch) >= self._batch_size:
+                target_batch_size = 100 if getattr(sheets_service, "is_indexing_active", False) else self._batch_size
+                if len(self._batch) >= target_batch_size:
                     self._flush_locked(batch_key)
 
     def flush_log_batch(self, sheet_id: str, run_id: str = ""):

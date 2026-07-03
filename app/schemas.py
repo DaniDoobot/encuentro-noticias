@@ -83,7 +83,7 @@ class DebugSearchResponse(BaseModel):
 
 
 class IndexSourcesRequest(BaseModel):
-    limit_domains: Optional[int] = Field(default=10, description="Max domains to index in this batch")
+    limit_domains: Optional[int] = Field(default=None, description="Max domains to index in this batch")
     force_refresh: Optional[bool] = Field(default=False, description="If true, bypasses refresh_days check")
     background: Optional[bool] = Field(default=False, description="If true, runs in background. If false (default), runs synchronously.")
 

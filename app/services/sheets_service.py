@@ -282,11 +282,46 @@ class SheetsService:
         self._client = None
         self.old_modo_prueba = None
         self._log_lock = threading.Lock()
+        self._last_request_time = 0.0
+        self._rate_limit_lock = threading.Lock()
+        self._config_cache = {}  # (sheet_id) -> (config_dict, timestamp)
+        self._sources_cache = {}  # (sheet_id) -> (sources_list, timestamp)
+        self._headers_cache = {}  # (sheet_id, ws_name) -> headers_list
+        self.is_indexing_active = False
 
-    def _execute_with_google_retry(self, operation_name: str, fn, max_retries: int = 3, is_write: bool = False):
+    def invalidate_sources_cache(self, sheet_id: str):
+        """Invalidates the cached active sources list."""
+        if sheet_id in self._sources_cache:
+            del self._sources_cache[sheet_id]
+
+    def _get_worksheet_headers(self, sheet_id: str, ws_name: str) -> List[str]:
+        cache_key = (sheet_id, ws_name)
+        if cache_key in self._headers_cache:
+            return self._headers_cache[cache_key]
+        
+        client = self.get_client()
+        spreadsheet = client.open_by_key(sheet_id)
+        worksheet = spreadsheet.worksheet(ws_name)
+        headers = worksheet.row_values(1)
+        self._headers_cache[cache_key] = headers
+        return headers
+
+    def _execute_with_google_retry(self, operation_name: str, fn, max_retries: int = 5, is_write: bool = False):
         retries = 0
-        backoff_times = [2.0, 5.0, 10.0]
+        backoff_times = [2.0, 5.0, 10.0, 20.0, 30.0]
         while True:
+            # Global rate limiter check
+            with self._rate_limit_lock:
+                now = time.time()
+                elapsed = now - self._last_request_time
+                min_interval = float(getattr(settings, "GOOGLE_SHEETS_MIN_INTERVAL_MS", 300)) / 1000.0
+                if elapsed < min_interval:
+                    sleep_time = min_interval - elapsed
+                    import random
+                    jitter = random.uniform(0.005, 0.015)
+                    time.sleep(sleep_time + jitter)
+                self._last_request_time = time.time()
+                
             try:
                 res = fn()
                 if retries > 0:
@@ -308,7 +343,7 @@ class SheetsService:
                 )
                 
                 if is_quota_error and retries < max_retries:
-                    wait_time = backoff_times[retries] if retries < len(backoff_times) else 10.0
+                    wait_time = backoff_times[retries] if retries < len(backoff_times) else 30.0
                     print(f"GOOGLE_SHEETS_RETRY: Operation '{operation_name}' failed with quota/rate limit error. Retrying in {wait_time}s... Attempt {retries+1}/{max_retries}. Error: {e}")
                     logger.warning(
                         f"[GOOGLE_SHEETS_RETRY] Google Sheets API quota/limit exceeded for '{operation_name}'. "
@@ -383,7 +418,11 @@ class SheetsService:
                 "Título detectado", "Motivo de descarte", "Score de coincidencia", "Fecha de extracción"
             ],
             "Fuentes": [
-                "Dominio", "Activo", "Tipo", "Notas", "Última indexación", "URLs indexadas", "Errores"
+                "¿Indexar?", "Dominio", "Activo", "Tipo", "Notas", 
+                "Sitemap manual", "RSS manual", "URL semilla", "Método descubrimiento",
+                "Estado indexación", "Job ID", "Progreso", 
+                "URLs encontradas", "URLs almacenadas", "URLs enriquecidas", 
+                "Última indexación", "Última actividad", "Errores"
             ],
             "Logs": [
                 "Fecha", "Nivel", "Acción", "ISBN", "Mensaje", "Detalle", "Run ID"
@@ -392,7 +431,7 @@ class SheetsService:
                 "Clave", "Valor", "Descripción"
             ]
         }
-
+ 
         created_tabs = []
         existing_sheets = {ws.title: ws for ws in spreadsheet.worksheets()}
         for tab_name, headers in tabs.items():
@@ -403,7 +442,7 @@ class SheetsService:
                 created_tabs.append(tab_name)
                 worksheet.insert_row(clean_row_values(headers), index=1)
                 continue
-
+ 
             # Ensure headers are correct and run safe migrator if order/columns mismatch
             if tab_name in ("Libros", "Reseñas por publicar", "Reseñas publicadas", "Descartes", "Fuentes"):
                 try:
@@ -440,6 +479,13 @@ class SheetsService:
                                     new_row.append(author_web_val)
                                 elif h == "¿Publicar?" and tab_name == "Reseñas por publicar":
                                     new_row.append(row_dict.get("¿Publicar?", False))
+                                elif tab_name == "Fuentes" and h == "¿Indexar?":
+                                    activo_val = str(row_dict.get("Activo", "TRUE")).strip().upper()
+                                    new_row.append(True if activo_val in ("TRUE", "1", "YES", "SÍ", "SI", "") else False)
+                                elif tab_name == "Fuentes" and h == "Método descubrimiento":
+                                    new_row.append(row_dict.get("Método descubrimiento", "auto") or "auto")
+                                elif tab_name == "Fuentes" and h in ("URLs encontradas", "URLs almacenadas"):
+                                    new_row.append(row_dict.get("URLs indexadas", "") or row_dict.get(h, ""))
                                 else:
                                     new_row.append(row_dict.get(h, ""))
                             new_rows.append(new_row)
@@ -615,6 +661,7 @@ class SheetsService:
             
         # Apply validations
         libros_ws = spreadsheet.worksheet("Libros")
+        fuentes_ws = spreadsheet.worksheet("Fuentes")
         try:
             ws_to_pub = spreadsheet.worksheet("Reseñas por publicar")
             ws_pub = spreadsheet.worksheet("Reseñas publicadas")
@@ -748,6 +795,42 @@ class SheetsService:
                             "showCustomUi": True
                         }
                     }
+                },
+                # Checkbox validation for Fuentes Column A (index 0: ¿Indexar?)
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": fuentes_ws.id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 1000,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 1
+                        },
+                        "rule": {
+                            "condition": {
+                                "type": "BOOLEAN"
+                            },
+                            "showCustomUi": True
+                        }
+                    }
+                },
+                # Checkbox validation for Fuentes Column C (index 2: Activo)
+                {
+                    "setDataValidation": {
+                        "range": {
+                            "sheetId": fuentes_ws.id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 1000,
+                            "startColumnIndex": 2,
+                            "endColumnIndex": 3
+                        },
+                        "rule": {
+                            "condition": {
+                                "type": "BOOLEAN"
+                            },
+                            "showCustomUi": True
+                        }
+                    }
                 }
             ]
             spreadsheet.batch_update({"requests": val_requests})
@@ -794,7 +877,7 @@ class SheetsService:
             "MIN_CANDIDATES_BEFORE_AI", "ENABLE_CASCADE_SEARCH",
             "ENABLE_DEEP_INTERNAL_SEARCH_ON_LOW_RESULTS", "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH",
             "LOG_RETENTION_DAYS", "DESCARTES_RETENTION_DAYS",
-            "BACKEND_BASE_URL"
+            "BACKEND_BASE_URL", "INDEX_MAX_SOURCES_PER_RUN"
         }
         
         # Migrate allowed technical keys to existing_basic
@@ -850,7 +933,8 @@ class SheetsService:
             {"Clave": "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", "Valor": getattr(settings, "ALWAYS_RUN_INTERNAL_DOMAIN_SEARCH", True), "Descripción": "Ejecutar siempre búsqueda interna en dominios activos (true=siempre, false=solo si pocos candidatos)"},
             {"Clave": "LOG_RETENTION_DAYS", "Valor": settings.LOG_RETENTION_DAYS, "Descripción": "Días de retención de logs en la pestaña Logs"},
             {"Clave": "DESCARTES_RETENTION_DAYS", "Valor": getattr(settings, "DESCARTES_RETENTION_DAYS", 30), "Descripción": "Días de retención de descartes en la pestaña Descartes"},
-            {"Clave": "DEBUG_SEARCH_QUERIES", "Valor": "FALSE", "Descripción": "Si está activado, se registra una fila de log por cada query individual de búsqueda en la hoja Logs."}
+            {"Clave": "DEBUG_SEARCH_QUERIES", "Valor": "FALSE", "Descripción": "Si está activado, se registra una fila de log por cada query individual de búsqueda en la hoja Logs."},
+            {"Clave": "INDEX_MAX_SOURCES_PER_RUN", "Valor": 0, "Descripción": "Cantidad máxima de fuentes a indexar por ejecución (0 o vacío para sin límite)"}
         ]
 
         # Re-write Config keeping only allowed basic keys
@@ -930,6 +1014,13 @@ class SheetsService:
         """
         Reads configurations from Config sheet, falls back to env settings.
         """
+        import time
+        now = time.time()
+        if sheet_id in self._config_cache:
+            cfg, ts = self._config_cache[sheet_id]
+            if now - ts < 10.0:  # 10s config cache
+                return cfg
+
         client = self.get_client()
         try:
             spreadsheet = client.open_by_key(sheet_id)
@@ -946,10 +1037,10 @@ class SheetsService:
                         config_dict[str(key).strip()] = val
             except Exception as e_user:
                 logger.warning(f"Could not read Config tab: {e_user}")
-
+ 
             logger.info(f"CONFIG_LOADED: read {len(config_dict)} keys from Config")
-
-            return {
+ 
+            res = {
                 "MODO_PRUEBA": parse_bool(config_dict.get("MODO_PRUEBA"), False),
                 "MAX_BOOKS_PER_RUN": parse_int(config_dict.get("MAX_BOOKS_PER_RUN"), settings.MAX_BOOKS_PER_RUN),
                 "MAX_SEARCH_PAGES_PER_QUERY": parse_int(config_dict.get("MAX_SEARCH_PAGES_PER_QUERY"), settings.MAX_SEARCH_PAGES_PER_QUERY),
@@ -997,10 +1088,13 @@ class SheetsService:
                 "DESCARTES_MAX_ROWS": parse_int(config_dict.get("DESCARTES_MAX_ROWS"), getattr(settings, "DESCARTES_MAX_ROWS", 1000)),
                 "LOG_RETENTION_DAYS": parse_int(config_dict.get("LOG_RETENTION_DAYS"), settings.LOG_RETENTION_DAYS),
                 "LOG_MAX_ROWS": parse_int(config_dict.get("LOG_MAX_ROWS"), settings.LOG_MAX_ROWS),
+                "INDEX_MAX_SOURCES_PER_RUN": parse_int(config_dict.get("INDEX_MAX_SOURCES_PER_RUN"), 0),
             }
+            self._config_cache[sheet_id] = (res, time.time())
+            return res
         except Exception:
             # Fallback to local configs if sheet configs fail to read
-            return {
+            fallback_res = {
                 "MODO_PRUEBA": False,
                 "MAX_BOOKS_PER_RUN": settings.MAX_BOOKS_PER_RUN,
                 "MAX_SEARCH_PAGES_PER_QUERY": settings.MAX_SEARCH_PAGES_PER_QUERY,
@@ -1049,7 +1143,9 @@ class SheetsService:
                 "DESCARTES_MAX_ROWS": getattr(settings, "DESCARTES_MAX_ROWS", 1000),
                 "LOG_RETENTION_DAYS": settings.LOG_RETENTION_DAYS,
                 "LOG_MAX_ROWS": settings.LOG_MAX_ROWS,
+                "INDEX_MAX_SOURCES_PER_RUN": 0,
             }
+            return fallback_res
 
     def get_pending_books(
         self,
@@ -1262,6 +1358,51 @@ class SheetsService:
             worksheet.append_row(full_row)
 
 
+    def add_reviews_batch(self, sheet_id: str, reviews_dicts: List[Dict[str, Any]]):
+        """
+        Appends or overwrites multiple rows in Reseñas por publicar in a single call.
+        """
+        if not reviews_dicts:
+            return
+        client = self.get_client()
+        spreadsheet = client.open_by_key(sheet_id)
+        worksheet = spreadsheet.worksheet("Reseñas por publicar")
+        headers = self._get_worksheet_headers(sheet_id, "Reseñas por publicar")
+        
+        def clean_val(val: Any) -> Any:
+            if isinstance(val, str):
+                s = val.strip()
+                if s.lower() in ("titulo web", "título web", "autor web", "autor web "):
+                    return ""
+                return s
+            return val
+
+        records = worksheet.get_all_records()
+        overwrite_row_index = None
+        for idx, row in enumerate(records):
+            if not self.is_row_real(row):
+                overwrite_row_index = idx + 2
+                break
+                
+        rows_to_write = []
+        for r_dict in reviews_dicts:
+            full_row = []
+            for h in headers:
+                val = r_dict.get(h)
+                if val is None:
+                    if h == "¿Publicar?":
+                        val = False
+                    else:
+                        val = ""
+                full_row.append(clean_val(val))
+            rows_to_write.append(clean_row_values(full_row))
+            
+        if overwrite_row_index:
+            range_end = overwrite_row_index + len(rows_to_write) - 1
+            worksheet.update(f"A{overwrite_row_index}:A{range_end}", rows_to_write)
+        else:
+            worksheet.append_rows(rows_to_write)
+
     def add_descarte(self, sheet_id: str, descarte_data: List[Any]):
         """
         Appends a row to Descartes.
@@ -1270,6 +1411,18 @@ class SheetsService:
         spreadsheet = client.open_by_key(sheet_id)
         worksheet = spreadsheet.worksheet("Descartes")
         worksheet.append_row(clean_row_values(descarte_data))
+
+    def add_descartes_batch(self, sheet_id: str, descartes_rows: List[List[Any]]):
+        """
+        Appends multiple rows to Descartes in a single call.
+        """
+        if not descartes_rows:
+            return
+        client = self.get_client()
+        spreadsheet = client.open_by_key(sheet_id)
+        worksheet = spreadsheet.worksheet("Descartes")
+        cleaned_rows = [clean_row_values(r) for r in descartes_rows]
+        worksheet.append_rows(cleaned_rows)
 
     def add_log(self, sheet_id: str, log_data: List[Any]):
         """
@@ -1424,6 +1577,13 @@ class SheetsService:
         """
         Reads the Fuentes tab and returns active domain configs.
         """
+        import time
+        now = time.time()
+        if sheet_id in self._sources_cache:
+            srcs, ts = self._sources_cache[sheet_id]
+            if now - ts < 15.0:  # 15s sources cache
+                return srcs
+
         try:
             client = self.get_client()
             spreadsheet = client.open_by_key(sheet_id)
@@ -1442,12 +1602,25 @@ class SheetsService:
             domain = clean_domain_string(domain_raw)
             if not domain:
                 continue
+            
             active_val = str(row.get("Activo", "true")).strip().lower()
-            if active_val not in ("true", "1", "yes", "sí", "si"):
+            indexar_val = str(row.get("¿Indexar?", "true")).strip().lower()
+            
+            is_active = active_val in ("true", "1", "yes", "sí", "si")
+            is_indexar = indexar_val in ("true", "1", "yes", "sí", "si")
+            
+            if not is_active or not is_indexar:
                 continue
+                
             hardcoded = DEFAULT_DOMAIN_CONFIGS.get(domain, {})
-            sitemap_url = str(row.get("Sitemap URL", "")).strip() or hardcoded.get("sitemap_url", "")
-            rss_url = str(row.get("RSS URL", "")).strip() or hardcoded.get("rss_url", "")
+            
+            sitemap_manual = str(row.get("Sitemap manual", "")).strip()
+            rss_manual = str(row.get("RSS manual", "")).strip()
+            seed_url = str(row.get("URL semilla", "")).strip()
+            discovery_method = str(row.get("Método descubrimiento", "auto")).strip().lower() or "auto"
+            
+            sitemap_url = sitemap_manual or str(row.get("Sitemap URL", "")).strip() or hardcoded.get("sitemap_url", "")
+            rss_url = rss_manual or str(row.get("RSS URL", "")).strip() or hardcoded.get("rss_url", "")
             buscador_interno = str(row.get("Buscador interno", "")).strip() or hardcoded.get("buscador_interno", "")
 
             sources.append({
@@ -1457,8 +1630,12 @@ class SheetsService:
                 "sitemap_url": sitemap_url,
                 "rss_url": rss_url,
                 "buscador_interno": buscador_interno,
+                "seed_url": seed_url,
+                "discovery_method": discovery_method,
                 "row_index": i,
             })
+            
+        self._sources_cache[sheet_id] = (sources, time.time())
         return sources
 
     def update_source_index_status(
@@ -1468,10 +1645,17 @@ class SheetsService:
         last_indexed: str,
         urls_indexed: int,
         errors: Any,
+        row_index: Optional[int] = None,
+        job_id: str = "",
+        status_str: str = "",
+        progreso: str = "",
+        urls_found: int = 0,
+        urls_stored: int = 0,
+        urls_enriched: int = 0,
+        last_activity: str = ""
     ) -> None:
         """
-        Updates Última indexación, URLs indexadas, Errores columns for a domain in Fuentes tab.
-        Columns: H=Última indexación, I=URLs indexadas, J=Errores
+        Updates the index status for a domain in the Fuentes tab using dynamic header lookup.
         """
         from app.services.logger_service import logger_service
         import json
@@ -1499,44 +1683,78 @@ class SheetsService:
             client = self.get_client()
             spreadsheet = client.open_by_key(sheet_id)
             worksheet = spreadsheet.worksheet("Fuentes")
-            records = worksheet.get_all_records()
+            headers = self._get_worksheet_headers(sheet_id, "Fuentes")
+            col_map = {h.strip(): idx + 1 for idx, h in enumerate(headers)}
 
-            updated = False
-            for i, row in enumerate(records, start=2):
-                row_dom_raw = str(row.get("Dominio", "")).strip()
-                if clean_domain_string(row_dom_raw) == clean_domain_string(domain):
-                    worksheet.update(f"E{i}:G{i}", [clean_row_values([last_indexed, urls_indexed, errors_str])])
-                    updated = True
+            # Find row index if not provided
+            if not row_index:
+                records = worksheet.get_all_records()
+                for i, row in enumerate(records, start=2):
+                    row_dom_raw = str(row.get("Dominio", "")).strip()
+                    if clean_domain_string(row_dom_raw) == clean_domain_string(domain):
+                        row_index = i
+                        break
 
-                    # Log SOURCE_SHEET_UPDATE_ROW
-                    logger_service.log(
-                        level="INFO",
-                        action="SOURCE_SHEET_UPDATE_ROW",
-                        message=f"Fila {i} actualizada en la pestaña Fuentes para el dominio {domain}",
-                        sheet_id=sheet_id,
-                        detail=json.dumps({
-                            "domain": domain,
-                            "row": i,
-                            "last_indexed": last_indexed,
-                            "urls_indexed": urls_indexed,
-                            "errors_count": len(errors) if isinstance(errors, list) else (1 if errors else 0)
-                        })
-                    )
-                    break
+            if row_index:
+                cells = []
+                def add_cell(col_name, val):
+                    if col_name in col_map:
+                        cells.append(gspread.Cell(row=row_index, col=col_map[col_name], value=clean_sheet_value(val)))
 
-            if not updated:
+                if status_str:
+                    add_cell("Estado indexación", status_str)
+                if job_id:
+                    add_cell("Job ID", job_id)
+                if progreso:
+                    add_cell("Progreso", progreso)
+                if urls_found:
+                    add_cell("URLs encontradas", urls_found)
+                if urls_stored:
+                    add_cell("URLs almacenadas", urls_stored)
+                if urls_enriched:
+                    add_cell("URLs enriquecidas", urls_enriched)
+                if last_indexed:
+                    add_cell("Última indexación", last_indexed)
+                if last_activity:
+                    add_cell("Última actividad", last_activity)
+                add_cell("Errores", errors_str)
+
+                # Backwards compatibility fallbacks
+                if "URLs indexadas" in col_map:
+                    add_cell("URLs indexadas", urls_stored or urls_indexed)
+                if "Última indexación" in col_map and not last_indexed:
+                    add_cell("Última indexación", last_activity)
+
+                if cells:
+                    worksheet.update_cells(cells, value_input_option='USER_ENTERED')
+
+                # Log SOURCE_SHEET_UPDATE_ROW
                 logger_service.log(
-                    level="WARNING",
-                    action="SOURCE_SHEET_UPDATE_FAILED",
-                    message=f"No se encontró el dominio {domain} en la pestaña Fuentes",
-                    sheet_id=sheet_id
+                    level="INFO",
+                    action="SOURCE_SHEET_UPDATE_ROW",
+                    message=f"Fila {row_index} actualizada en la pestaña Fuentes para el dominio {domain}",
+                    sheet_id=sheet_id,
+                    detail=json.dumps({
+                        "domain": domain,
+                        "row": row_index,
+                        "last_indexed": last_indexed or last_activity,
+                        "urls_indexed": urls_stored or urls_indexed,
+                        "errors_count": len(errors) if isinstance(errors, list) else (1 if errors else 0)
+                    })
                 )
-            else:
+
                 # Log SOURCE_SHEET_UPDATE_COMPLETED
                 logger_service.log(
                     level="INFO",
                     action="SOURCE_SHEET_UPDATE_COMPLETED",
                     message=f"Actualización completada para el dominio {domain}",
+                    sheet_id=sheet_id
+                )
+            else:
+                logger_service.log(
+                    level="WARNING",
+                    action="SOURCE_SHEET_UPDATE_FAILED",
+                    message=f"No se encontró el dominio {domain} en la pestaña Fuentes",
                     sheet_id=sheet_id
                 )
 
@@ -1575,6 +1793,8 @@ class SheetsService:
             spreadsheet = client.open_by_key(sheet_id)
             worksheet = spreadsheet.worksheet("Fuentes")
             records = worksheet.get_all_records()
+            headers = self._get_worksheet_headers(sheet_id, "Fuentes")
+            col_map = {h.strip(): idx + 1 for idx, h in enumerate(headers)}
 
             cells_to_update = []
             updated_count = 0
@@ -1609,12 +1829,18 @@ class SheetsService:
 
                 # We update the row if we have either index date or urls
                 if last_indexed or urls > 0:
-                    # Column E (5): Última indexación
-                    cells_to_update.append(gspread.Cell(row=i, col=5, value=clean_sheet_value(last_indexed)))
-                    # Column F (6): URLs indexadas
-                    cells_to_update.append(gspread.Cell(row=i, col=6, value=clean_sheet_value(urls)))
-                    # Column G (7): Errores
-                    cells_to_update.append(gspread.Cell(row=i, col=7, value=clean_sheet_value(errors_str)))
+                    if "Última indexación" in col_map:
+                        cells_to_update.append(gspread.Cell(row=i, col=col_map["Última indexación"], value=clean_sheet_value(last_indexed)))
+                    if "URLs indexadas" in col_map:
+                        cells_to_update.append(gspread.Cell(row=i, col=col_map["URLs indexadas"], value=clean_sheet_value(urls)))
+                    if "URLs encontradas" in col_map:
+                        cells_to_update.append(gspread.Cell(row=i, col=col_map["URLs encontradas"], value=clean_sheet_value(urls)))
+                    if "URLs almacenadas" in col_map:
+                        cells_to_update.append(gspread.Cell(row=i, col=col_map["URLs almacenadas"], value=clean_sheet_value(urls)))
+                    if "Errores" in col_map:
+                        cells_to_update.append(gspread.Cell(row=i, col=col_map["Errores"], value=clean_sheet_value(errors_str)))
+                    if "Estado indexación" in col_map:
+                        cells_to_update.append(gspread.Cell(row=i, col=col_map["Estado indexación"], value="completado" if errors == 0 else "error_parcial"))
 
                     updated_count += 1
 
@@ -2040,7 +2266,11 @@ class SheetsService:
                 "Título detectado", "Motivo de descarte", "Score de coincidencia", "Fecha de extracción"
             ],
             "Fuentes": [
-                "Dominio", "Activo", "Tipo", "Notas", "Última indexación", "URLs indexadas", "Errores"
+                "¿Indexar?", "Dominio", "Activo", "Tipo", "Notas", 
+                "Sitemap manual", "RSS manual", "URL semilla", "Método descubrimiento",
+                "Estado indexación", "Job ID", "Progreso", 
+                "URLs encontradas", "URLs almacenadas", "URLs enriquecidas", 
+                "Última indexación", "Última actividad", "Errores"
             ],
             "Logs": [
                 "Fecha", "Nivel", "Acción", "ISBN", "Mensaje", "Detalle", "Run ID"

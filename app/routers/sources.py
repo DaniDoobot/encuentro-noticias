@@ -36,16 +36,51 @@ def update_job_status(job_id: str, **kwargs):
 def run_indexing_background(job_id: str, limit_domains: int, force_refresh: bool, sheet_id: str):
     execute_indexing_job(job_id, limit_domains, force_refresh, sheet_id)
 
-def execute_indexing_job(job_id: str, limit_domains: int, force_refresh: bool, sheet_id: str) -> Dict[str, Any]:
+def execute_indexing_job(job_id: str, limit_domains: Optional[int], force_refresh: bool, sheet_id: str) -> Dict[str, Any]:
+    # Set indexing active flag on SheetsService
+    sheets_service.is_indexing_active = True
     try:
+        # Invalidate caches to read fresh values
+        sheets_service.invalidate_sources_cache(sheet_id)
+        if sheet_id in sheets_service._config_cache:
+            del sheets_service._config_cache[sheet_id]
+            
         config = sheets_service.get_config_dict(sheet_id)
+        
+        # Invalidate again after fetching config just in case, and read active sources
+        sheets_service.invalidate_sources_cache(sheet_id)
+        
+        # Read Fuentes raw to calculate sources_total
+        client = sheets_service.get_client()
+        spreadsheet = client.open_by_key(sheet_id)
+        worksheet = spreadsheet.worksheet("Fuentes")
+        records = worksheet.get_all_records()
+        
+        sources_total = 0
+        for r in records:
+            if str(r.get("Dominio", "")).strip():
+                sources_total += 1
+                
+        # Now get active and index-enabled sources
         sources = sheets_service.get_active_sources(sheet_id)
+        sources_selected = len(sources)
+        
+        max_sources_per_run = config.get("INDEX_MAX_SOURCES_PER_RUN", 0)
         
         # Limit the number of domains if requested
-        if limit_domains > 0:
-            sources = sources[:limit_domains]
+        final_limit = limit_domains if limit_domains is not None else max_sources_per_run
+        if final_limit > 0:
+            sources = sources[:final_limit]
             
-        update_job_status(job_id, domains_total=len(sources))
+        domains_total = len(sources)
+        
+        update_job_status(
+            job_id,
+            sources_total=sources_total,
+            sources_selected=sources_selected,
+            domains_total=domains_total,
+            max_sources_per_run=max_sources_per_run
+        )
 
         def log_fn(msg: str):
             logger_service.log(
@@ -80,21 +115,32 @@ def execute_indexing_job(job_id: str, limit_domains: int, force_refresh: bool, s
             if domain:
                 skipped = stats.get("skipped", False)
                 if not skipped:
-                    try:
-                        db_stats = cache_service.get_domain_stats(domain)
-                        urls_count = db_stats.get("urls", 0)
-                    except Exception:
-                        urls_count = stats.get("urls_found", 0)
-                    
                     errs_list = stats.get("errors", [])
-                    last_idx = stats.get("last_indexed") or datetime.datetime.utcnow().isoformat()
+                    row_index = stats.get("row_index")
+                    urls_found = stats.get("urls_found", 0)
+                    urls_stored = stats.get("urls_stored", 0)
+                    urls_enriched = stats.get("urls_enriched", 0)
+                    last_activity = stats.get("last_activity") or datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    if urls_stored == 0:
+                        status_str = "completado_sin_urls"
+                    else:
+                        status_str = "completado" if len(errs_list) == 0 else "error_parcial"
                     
                     sheets_service.update_source_index_status(
                         sheet_id=sheet_id,
                         domain=domain,
-                        last_indexed=last_idx,
-                        urls_indexed=urls_count,
-                        errors=errs_list
+                        last_indexed=last_activity,
+                        urls_indexed=urls_stored,
+                        errors=errs_list,
+                        row_index=row_index,
+                        job_id=job_id,
+                        status_str=status_str,
+                        progreso="100%",
+                        urls_found=urls_found,
+                        urls_stored=urls_stored,
+                        urls_enriched=urls_enriched,
+                        last_activity=last_activity
                     )
 
         def on_progress(found_inc: int, stored_inc: int, enriched_inc: int):
@@ -131,13 +177,7 @@ def execute_indexing_job(job_id: str, limit_domains: int, force_refresh: bool, s
                 
             skipped = res.get("skipped", False)
             errs_list = res.get("errors", [])
-            
-            # Get stats from DB to know the total URLs
-            try:
-                db_stats = cache_service.get_domain_stats(domain)
-                urls_count = db_stats.get("urls", 0)
-            except Exception:
-                urls_count = res.get("urls_found", 0)
+            urls_stored = res.get("urls_stored", 0)
             
             if skipped:
                 domains_skipped += 1
@@ -154,13 +194,10 @@ def execute_indexing_job(job_id: str, limit_domains: int, force_refresh: bool, s
             mapped_results.append({
                 "domain": domain,
                 "processed": not skipped,
-                "urls_indexed": urls_count,
+                "urls_indexed": urls_stored,
                 "status": status_str,
                 "errors": errs_list
             })
-
-            # Sheets are already updated in real-time inside on_domain_complete
-            pass
 
         logger_service.log(
             level="INFO",
@@ -216,6 +253,9 @@ def execute_indexing_job(job_id: str, limit_domains: int, force_refresh: bool, s
             if job_id in job_registry:
                 job_registry[job_id].update(err_state)
         return err_state
+    finally:
+        # Clear indexing active flag
+        sheets_service.is_indexing_active = False
 
 @router.post("/sources/index")
 def post_sources_index(req: IndexSourcesRequest):
@@ -223,7 +263,7 @@ def post_sources_index(req: IndexSourcesRequest):
     Launches or runs a domain index task for active sources in Google Sheets.
     """
     job_id = f"idx_{uuid.uuid4().hex[:8]}"
-    limit = req.limit_domains if req.limit_domains is not None else 10
+    limit = req.limit_domains  # Can be None!
     force = req.force_refresh if req.force_refresh is not None else False
     background = req.background if req.background is not None else False
     
@@ -236,6 +276,11 @@ def post_sources_index(req: IndexSourcesRequest):
             detail=f"Google Sheets service is not configured or available: {str(e)}"
         )
 
+    # Invalidate cache of sources and config before selecting sources
+    sheets_service.invalidate_sources_cache(settings.GOOGLE_SHEET_ID)
+    if settings.GOOGLE_SHEET_ID in sheets_service._config_cache:
+        del sheets_service._config_cache[settings.GOOGLE_SHEET_ID]
+
     # Initialize job in registry
     with job_registry_lock:
         job_registry[job_id] = {
@@ -243,7 +288,7 @@ def post_sources_index(req: IndexSourcesRequest):
             "status": "running",
             "started_at": datetime.datetime.utcnow().isoformat(),
             "finished_at": None,
-            "domains_total": limit,
+            "domains_total": limit or 0,
             "domains_completed": 0,
             "current_domain": "",
             "urls_found": 0,
