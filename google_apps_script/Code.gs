@@ -15,6 +15,8 @@ function onOpen() {
     .addItem('Borrar logs', 'cleanupLogs')
     .addItem('Borrar descartes', 'cleanupDescartes')
     .addItem('Limpiar filas vacías de publicación', 'cleanupEmptyPublicationRows')
+    .addSeparator()
+    .addItem('Autorizar seguimiento automático', 'autorizarSeguimientoAutomatico')
     .addToUi();
 }
 
@@ -209,11 +211,24 @@ function launchSearch() {
       var runId = data.run_id || data.id || "";
       
       PropertiesService.getScriptProperties().setProperty("LAST_SEARCH_RUN_ID", runId);
-      scheduleAutoStatusCheck_("search");
+      var polling = tryScheduleAutoStatusCheck_("search");
       
-      setPanelStatus_("Procesando...", runId, "Búsqueda iniciada correctamente.", "Ejecución activa: búsqueda en segundo plano");
+      var msg = "Búsqueda iniciada correctamente.";
+      var resumen = "Ejecución activa: búsqueda en segundo plano";
+      if (!polling.ok) {
+        msg = "Búsqueda iniciada correctamente. No se pudo activar el seguimiento automático. Usa 'Consultar estado' para actualizar manualmente.";
+        resumen = "Seguimiento automático no disponible";
+      }
       
-      SpreadsheetApp.getUi().alert("Búsqueda iniciada correctamente.\nBúsqueda ID: " + runId + "\nPuede refrescar el estado usando el botón 'Consultar estado'.");
+      setPanelStatus_("Procesando...", runId, msg, resumen);
+      
+      var alertMsg = "Búsqueda iniciada correctamente.\nBúsqueda ID: " + runId;
+      if (!polling.ok) {
+        alertMsg += "\n\nAVISO: No se pudo programar el seguimiento automático (" + polling.error + ").\nPuede refrescar el estado usando el botón 'Consultar estado'.";
+      } else {
+        alertMsg += "\n\nPuede refrescar el estado usando el botón 'Consultar estado'.";
+      }
+      SpreadsheetApp.getUi().alert(alertMsg);
     } else {
       setPanelStatus_("Error", "", "HTTP " + resCode + ": " + resText, "Error al iniciar búsqueda.");
       SpreadsheetApp.getUi().alert("Error en el backend (HTTP " + resCode + "):\n" + resText);
@@ -370,9 +385,24 @@ function publishReviews() {
       
       if (publishId) {
         PropertiesService.getScriptProperties().setProperty("LAST_PUBLISH_ID", publishId);
-        scheduleAutoStatusCheck_("publish");
-        setPanelStatus_("Procesando...", publishId, "Proceso de publicación iniciado en segundo plano.", "Ejecución activa: publicación en segundo plano");
-        SpreadsheetApp.getUi().alert("Publicación iniciada correctamente.\nPublicación ID: " + publishId + "\nPuede refrescar el estado usando 'Consultar publicación'.");
+        var polling = tryScheduleAutoStatusCheck_("publish");
+        
+        var msg = "Proceso de publicación iniciado en segundo plano.";
+        var resumen = "Ejecución activa: publicación en segundo plano";
+        if (!polling.ok) {
+          msg = "Publicación iniciada correctamente. No se pudo activar el seguimiento automático. Usa 'Consultar estado' para actualizar manualmente.";
+          resumen = "Seguimiento automático no disponible";
+        }
+        
+        setPanelStatus_("Procesando...", publishId, msg, resumen);
+        
+        var alertMsg = "Publicación iniciada correctamente.\nPublicación ID: " + publishId;
+        if (!polling.ok) {
+          alertMsg += "\n\nAVISO: No se pudo programar el seguimiento automático (" + polling.error + ").\nPuede refrescar el estado usando 'Consultar publicación'.";
+        } else {
+          alertMsg += "\n\nPuede refrescar el estado usando 'Consultar publicación'.";
+        }
+        SpreadsheetApp.getUi().alert(alertMsg);
       } else {
         var pubCount = data.published_count || 0;
         var errCount = data.errors_count || 0;
@@ -656,11 +686,24 @@ function indexSources() {
       var jobId = data.job_id || "";
       
       PropertiesService.getScriptProperties().setProperty("LAST_INDEX_JOB_ID", jobId);
-      scheduleAutoStatusCheck_("index");
+      var polling = tryScheduleAutoStatusCheck_("index");
       
-      setPanelStatus_("Procesando...", jobId, "Indexación de fuentes iniciada en segundo plano.", "Ejecución activa: indexación en segundo plano");
+      var msg = "Indexación de fuentes iniciada en segundo plano.";
+      var resumen = "Ejecución activa: indexación en segundo plano";
+      if (!polling.ok) {
+        msg = "Indexación iniciada correctamente. No se pudo activar el seguimiento automático. Usa 'Consultar estado' para actualizar manualmente.";
+        resumen = "Seguimiento automático no disponible";
+      }
       
-      SpreadsheetApp.getUi().alert("Indexación iniciada correctamente.\nJob ID: " + jobId + "\nPuede consultar el progreso con 'Consultar indexación'.");
+      setPanelStatus_("Procesando...", jobId, msg, resumen);
+      
+      var alertMsg = "Indexación iniciada correctamente.\nJob ID: " + jobId;
+      if (!polling.ok) {
+        alertMsg += "\n\nAVISO: No se pudo programar el seguimiento automático (" + polling.error + ").\nPuede consultar el progreso con 'Consultar indexación'.";
+      } else {
+        alertMsg += "\n\nPuede consultar el progreso con 'Consultar indexación'.";
+      }
+      SpreadsheetApp.getUi().alert(alertMsg);
     } else {
       setPanelStatus_("Error", "", "HTTP " + resCode + ": " + resText, "Error al iniciar indexación.");
       SpreadsheetApp.getUi().alert("Error al indexar (HTTP " + resCode + "):\n" + resText);
@@ -947,16 +990,20 @@ function scheduleAutoStatusCheck_(type) {
  * Elimina todos los triggers asociados a un tipo de proceso.
  */
 function deleteTriggersForType_(type) {
-  var functionName = "";
-  if (type === "search") functionName = "autoCheckSearchStatus_";
-  else if (type === "publish") functionName = "autoCheckPublishStatus_";
-  else if (type === "index") functionName = "autoCheckIndexStatus_";
-  if (!functionName) return;
-  var triggers = ScriptApp.getProjectTriggers();
-  for (var i = 0; i < triggers.length; i++) {
-    if (triggers[i].getHandlerFunction() === functionName) {
-      ScriptApp.deleteTrigger(triggers[i]);
+  try {
+    var functionName = "";
+    if (type === "search") functionName = "autoCheckSearchStatus_";
+    else if (type === "publish") functionName = "autoCheckPublishStatus_";
+    else if (type === "index") functionName = "autoCheckIndexStatus_";
+    if (!functionName) return;
+    var triggers = ScriptApp.getProjectTriggers();
+    for (var i = 0; i < triggers.length; i++) {
+      if (triggers[i].getHandlerFunction() === functionName) {
+        ScriptApp.deleteTrigger(triggers[i]);
+      }
     }
+  } catch (e) {
+    Logger.log("Error al borrar triggers para " + type + ": " + e.toString());
   }
 }
 
@@ -1064,4 +1111,33 @@ function autoCheckIndexStatus_() {
       }
     }
   } catch (e) { /* Ignorar errores de conexión temporales */ }
+}
+
+/**
+ * Helper común que intenta programar el seguimiento automático sin propagar excepciones.
+ */
+function tryScheduleAutoStatusCheck_(type) {
+  try {
+    scheduleAutoStatusCheck_(type);
+    return { ok: true };
+  } catch (e) {
+    Logger.log("Error de polling para " + type + ": " + e.toString());
+    return { ok: false, error: e.toString() };
+  }
+}
+
+/**
+ * Función pública para forzar la solicitud de autorización del permiso de triggers.
+ */
+function autorizarSeguimientoAutomatico() {
+  try {
+    ScriptApp.getProjectTriggers();
+    SpreadsheetApp.getUi().alert("Seguimiento automático autorizado correctamente.");
+  } catch (e) {
+    SpreadsheetApp.getUi().alert(
+      "Error al autorizar el seguimiento automático:\n\n" + 
+      e.toString() + 
+      "\n\nAsegúrate de conceder los permisos solicitados por Google."
+    );
+  }
 }
