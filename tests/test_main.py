@@ -3407,7 +3407,7 @@ def test_summary_cleaning_filters_forbidden_words():
              query="query",
              url="url",
              article_title="title",
-             article_text="text"
+             article_text="El artículo destaca el nombramiento de Unamuno. Esta mención al libro es muy lateral, justificando así un score de 40 por el tratamiento parcial de la obra. Unamuno es recordado en la Universidad de Salamanca."
          )
          
          # The second sentence should have been stripped out due to forbidden words: "justificando", "score", "tratamiento parcial"
@@ -3428,7 +3428,7 @@ def test_summary_cleaning_filters_forbidden_words():
          assert len(warning_calls) == 1
 
 
-def test_summary_cleaning_fallback_when_completely_filtered():
+def test_summary_cleaning_empty_when_no_valid_literal_sentence():
     from app.services.openai_analyzer import openai_analyzer
     from unittest.mock import patch, MagicMock
 
@@ -3465,18 +3465,69 @@ def test_summary_cleaning_fallback_when_completely_filtered():
              query="query",
              url="url",
              article_title="title",
-             article_text="text"
+             article_text="Justificando así un score de 40 por el tratamiento parcial de la relevancia."
          )
          
-         # Summary must fallback to default clean mention sentence
+         # Summary must be empty string as we don't invent content and the sentence contains forbidden words
          summary = res["summary"]
-         assert "San Manuel Bueno, mártir" in summary
-         assert "Miguel de Unamuno" in summary
-         assert "score" not in summary.lower()
-         assert "relevancia" not in summary.lower()
+         assert summary == ""
 
 
+def test_literal_summary_verification_success():
+    from app.services.openai_analyzer import openai_analyzer
+    from unittest.mock import patch, MagicMock
 
+    mock_client = MagicMock()
+    mock_choice = MagicMock()
+    mock_choice.message.parsed = MagicMock()
+    
+    # We simulate a summary containing literal sentences, some with bullet lists or quotation marks
+    mock_choice.message.parsed.model_dump.return_value = {
+        "is_valid": True,
+        "match_score": 80,
+        "reason": "La obra es reseñada con detalle.",
+        "detected_book_title": "El infinito en un junco",
+        "detected_book_author": "Irene Vallejo",
+        "content_type": "reseña",
+        "publication_name": "El País",
+        "publication_author": "Berna González Harbour",
+        "publication_date": "2026-07-01",
+        "language": "es",
+        "category": "Literatura",
+        "summary": '1. "El infinito en un junco es una obra maestra." - «El libro nos invita a viajar por la historia de los libros.»',
+        "score_justification": "Justificación interna."
+    }
+    mock_client.beta.chat.completions.parse.return_value = mock_client
+    mock_client.choices = [mock_choice]
+
+    # The article text contains these exact sentences (with some minor whitespace/newlines differences)
+    article_text = (
+        "El infinito en un junco es una obra maestra.\n\n"
+        "El libro nos invita a viajar por la historia de los libros."
+    )
+
+    with patch.object(openai_analyzer, "get_client", return_value=mock_client), \
+         patch("app.services.logger_service.logger_service.log"):
+         
+         res = openai_analyzer.analyze_article(
+             isbn="123456",
+             book_title="El infinito en un junco",
+             book_author="Irene Vallejo",
+             query="query",
+             url="url",
+             article_title="title",
+             article_text=article_text
+         )
+         
+         # The summary should clean prefix numbers and quotation marks, 
+         # match against the text (with whitespace normalization), and join them
+         summary = res["summary"]
+         assert "El infinito en un junco es una obra maestra." in summary
+         assert "El libro nos invita a viajar por la historia de los libros." in summary
+         assert '"' not in summary
+         assert "1." not in summary
+         assert "«" not in summary
+         assert "»" not in summary
 
 
 def test_query_builder_comma_volume_and_negative_filters():

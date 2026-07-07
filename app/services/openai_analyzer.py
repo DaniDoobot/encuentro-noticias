@@ -19,7 +19,7 @@ class BookValidationResult(BaseModel):
     publication_date: str = Field(description="Fecha de publicación detectada (en formato YYYY-MM-DD si es posible).")
     language: str = Field(description="Idioma original del artículo.")
     category: str = Field(description="Categoría a la que pertenece el artículo, debe ser exactamente una de: Cultura/Educación, Política, Economía, Historia, Religión, Sociedad, Ciencia, Tecnología, Literatura, Otros.")
-    summary: str = Field(description="Resumen publicable en español de 2 a 5 frases sobre qué se menciona en el artículo acerca del libro. Debe tener tono informativo, neutral y natural, centrado únicamente en la relación con la obra. No debe incluir scores, puntuaciones, porcentajes, justificaciones de la puntuación ni criterios de evaluación ni las palabras 'score' o 'relevancia'.")
+    summary: str = Field(description="Selección de entre 1 y 3 frases del cuerpo del artículo copiadas estrictamente de forma literal que hablen de la obra, separadas por espacios. Sin parafrasear, resumir ni reescribir. Si no hay frases válidas, dejar vacío.")
     score_justification: str = Field(description="Explicación detallada interna de por qué se ha asignado esta puntuación de relevancia o coincidencia. Este campo no es el resumen y no se publica en WordPress.")
 
 class OpenAIAnalyzer:
@@ -73,7 +73,7 @@ class OpenAIAnalyzer:
             "4. CUIDADO CON TÍTULOS GENÉRICOS: Para títulos muy genéricos o cortos (ej. 'Símbolos', 'Biblia', 'Diario'), exige alguna señal contextual clara de que se referieren al libro buscado para evitar falsos positivos con otros temas homónimos.\n"
             "5. La categoría ('category') DEBE ser estrictamente una de las siguientes opciones:\n"
             "   - Cultura/Educación, Política, Economía, Historia, Religión, Sociedad, Ciencia, Tecnología, Literatura, Otros.\n"
-            "6. El resumen ('summary') DEBE estar escrito en ESPAÑOL, tener entre 2 y 5 frases, ser de tono neutral e informativo y apto para su publicación en WordPress. Debe centrarse exclusivamente en qué dice el artículo sobre el libro. NO debe mencionar en absoluto scores, puntuaciones, porcentajes, criterios de evaluación ni justificaciones del score.\n"
+            "6. El campo 'summary' DEBE consistir únicamente en la selección de entre 1 y 3 frases textuales y literales del cuerpo del artículo que hablen directamente del libro evaluado. Las frases deben ser copiadas palabra por palabra sin resumir, parafrasear, corregir ni reescribir. Prioriza frases que mencionen el título del libro o al autor (si la relación es inequívoca) y aporten información sobre la obra (contenido, temática, valoración, recepción). No utilices títulos, menús, etiquetas ni texto promocional. Une las frases seleccionadas con espacios. Si no hay ninguna frase válida, deja el campo 'summary' completamente vacío.\n"
             "7. EXTRACCIÓN DE METADATOS DE AUTOR Y FECHA (CRÍTICO):\n"
             "   - NO inventes el autor ('publication_author') ni la fecha ('publication_date').\n"
             "   - Si no hay un autor de carne y hueso visible en el texto o en metadata_detected, deja 'publication_author' vacío, o usa 'Redacción' únicamente si ese término exacto aparece explícitamente en el texto.\n"
@@ -145,7 +145,7 @@ class OpenAIAnalyzer:
                     "publication_date": "2023-01-01",
                     "language": "es",
                     "category": "Literatura",
-                    "summary": "Resumen periodístico en español de 2 a 5 frases...",
+                    "summary": "1 a 3 frases textuales extraídas de forma literal del cuerpo del artículo...",
                     "score_justification": "Explicación de la puntuación..."
                 }, indent=2)
 
@@ -182,41 +182,61 @@ class OpenAIAnalyzer:
                 logger.error(f"OpenAI fallback query also failed: {e_fallback}")
                 raise RuntimeError(f"error OpenAI: {str(e_fallback)}")
 
-        # Defensive summary cleaning/validation logic
+        # Literal summary quote verification and cleaning logic
         summary_val = raw_result.get("summary", "")
-        summary_lower = summary_val.lower()
-        forbidden_words = ["score", "puntuación", "puntuacion", "porcentaje", "relevancia", "tratamiento parcial", "justifica", "criterio"]
-        has_forbidden = any(w in summary_lower for w in forbidden_words)
-
-        if has_forbidden:
-            logger.warning(f"Summary contains forbidden evaluation words: {summary_val}")
-            from app.services.logger_service import logger_service
-            logger_service.log(
-                level="WARNING",
-                action="OPENAI_SUMMARY_FORBIDDEN_WORDS",
-                message="El resumen generado por la IA contiene palabras de puntuación o score y será limpiado.",
-                isbn=isbn,
-                detail=json.dumps({
-                    "original_summary": summary_val,
-                    "forbidden_words_detected": [w for w in forbidden_words if w in summary_lower]
-                }, ensure_ascii=False)
-            )
-            # Split summary by sentences and filter out any sentence containing forbidden words
+        verified_summary = ""
+        
+        if summary_val and article_text:
             import re
-            sentences = re.split(r'(?<=[.!?])\s+', summary_val)
-            clean_sentences = []
+            # Split summary by sentences (supporting nested quotation marks / brackets)
+            sentences = re.split(r'(?<=[.!?])\s+|(?<=[.!?]["\'«»“”‘’\)\]])\s+', summary_val)
+            verified_sentences = []
+            
+            forbidden_words = ["score", "puntuación", "puntuacion", "porcentaje", "relevancia", "tratamiento parcial", "justifica", "criterio"]
+            
             for s in sentences:
-                s_lower = s.lower()
-                if not any(w in s_lower for w in forbidden_words):
-                    clean_sentences.append(s)
+                s = s.strip()
+                if not s:
+                    continue
+                # Clean prefix lists/bullet points (e.g. "1. ", "- ", "* ", "— ", "– ")
+                s_clean = re.sub(r'^(\d+[\.\)]|-|\*|—|–)\s*', '', s).strip()
+                # Clean quotes
+                s_clean = s_clean.strip('"\'«»“”‘’').strip()
+                if not s_clean:
+                    continue
+                    
+                # Check for evaluation/forbidden words
+                s_lower = s_clean.lower()
+                has_forbidden = any(w in s_lower for w in forbidden_words)
+                if has_forbidden:
+                    logger.warning(f"Summary sentence skipped due to forbidden word: {s_clean}")
+                    from app.services.logger_service import logger_service
+                    logger_service.log(
+                        level="WARNING",
+                        action="OPENAI_SUMMARY_FORBIDDEN_WORDS",
+                        message="Una frase del resumen de la IA contiene palabras de puntuación o score y fue omitida.",
+                        isbn=isbn,
+                        detail=json.dumps({
+                            "original_sentence": s,
+                            "forbidden_words_detected": [w for w in forbidden_words if w in s_lower]
+                        }, ensure_ascii=False)
+                    )
+                    continue
+                
+                # Check if s_clean appears literally in article_text
+                def norm(t: str) -> str:
+                    return " ".join(t.split())
+                
+                if s_clean in article_text or norm(s_clean) in norm(article_text):
+                    verified_sentences.append(s_clean)
+                    if len(verified_sentences) >= 3:
+                        break
+                else:
+                    logger.warning(f"Summary sentence skipped because it is not literal: {s_clean}")
             
-            cleaned_summary = " ".join(clean_sentences).strip()
-            # Fallback if too short
-            if not cleaned_summary or len(cleaned_summary.split()) < 5:
-                cleaned_summary = f"El artículo menciona la obra '{book_title}' de {book_author} en el contexto de su análisis y legado."
+            verified_summary = " ".join(verified_sentences).strip()
             
-            raw_result["summary"] = cleaned_summary
-
+        raw_result["summary"] = verified_summary
         return raw_result
 
 openai_analyzer = OpenAIAnalyzer()
