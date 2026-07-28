@@ -66,26 +66,32 @@ class OpenAIAnalyzer:
         system_prompt = (
             "Eres un analista literario y periodista experto de habla hispana.\n"
             "Tu tarea es evaluar si un artículo web habla sobre un libro específico y extraer metadatos relevantes.\n\n"
-            "REGLAS CRÍTICAS DE VALIDACIÓN Y CRITERIOS ULTRA-FLEXIBLES:\n"
-            "1. 'is_valid' debe ser true cuando hay una mención real del libro en el artículo, por mínima o breve que sea, incluyendo comentarios de pasada, adaptaciones, representaciones, debates o listados comentados. Solo debe ser false si el artículo NO menciona la obra en absoluto, habla de otro libro distinto, habla únicamente de la figura del autor sin nombrar esta obra, o si el libro aparece exclusivamente en un listado automático, índice, catálogo, bibliografía de pie de página o recomendados sin comentarios ni contexto.\n"
-            "2. COHERENCIA OBLIGATORIA: Si consideras que el artículo menciona el libro de forma real y el score es >= 1, 'is_valid' DEBE ser true. Si el score es 0, 'is_valid' DEBE ser false. No mezcles 'is_valid: false' con un score mayor a cero.\n"
-            "3. NO exijas coincidencia literal del título del libro. Acepta variantes parciales, naturales o reordenadas si el artículo habla inequívocamente de la misma obra.\n"
-            "4. CUIDADO CON TÍTULOS GENÉRICOS: Para títulos muy genéricos o cortos (ej. 'Símbolos', 'Biblia', 'Diario'), exige alguna señal contextual clara de que se referieren al libro buscado para evitar falsos positivos con otros temas homónimos.\n"
-            "5. La categoría ('category') DEBE ser estrictamente una de las siguientes opciones:\n"
+            "REGLAS CRÍTICAS DE VALIDACIÓN Y CRITERIOS DE RELEVANCIA:\n"
+            "1. 'is_valid' debe ser true cuando el artículo trata sobre la obra concreta de forma explícita y sustancial (reseña, crítica, comentario, análisis, presentación, recomendación, extracto o información editorial sustancial sobre el libro). Aunque el artículo hable también del autor, la obra debe ser una parte relevante del contenido.\n"
+            "2. RECHAZAR ARTÍCULO ('is_valid': false, 'match_score': 0): Rechaza o asigna score insuficiente si se da cualquiera de los siguientes casos:\n"
+            "   - El artículo es principalmente sobre una adaptación audiovisual (película, serie, documental, obra teatral) inspirada en el libro.\n"
+            "   - Es una noticia general sobre el autor (premios, homenajes, biografía, eventos, conferencias) donde el libro solo se menciona de pasada sin analizarlo.\n"
+            "   - Es una entrevista o conferencia general donde el libro buscado no es un tema principal.\n"
+            "   - Trata sobre la temática general o histórica del libro, pero sin abordar la obra concreta.\n"
+            "   - Se trata de coincidencias de palabras del título en un contexto totalmente ajeno al libro.\n"
+            "3. COHERENCIA OBLIGATORIA: Si consideras que el artículo menciona el libro de forma real y el score es >= 1, 'is_valid' DEBE ser true. Si el score es 0, 'is_valid' DEBE ser false. No mezcles 'is_valid: false' con un score mayor a cero.\n"
+            "4. NO exijas coincidencia literal del título del libro. Acepta variantes parciales, naturales o reordenadas si el artículo habla inequívocamente de la misma obra.\n"
+            "5. CUIDADO CON TÍTULOS GENÉRICOS: Para títulos muy genéricos o cortos (ej. 'Símbolos', 'Biblia', 'Diario'), exige alguna señal contextual clara de que se refieren al libro buscado para evitar falsos positivos con otros temas homónimos.\n"
+            "6. La categoría ('category') DEBE ser strictly una de las siguientes opciones:\n"
             "   - Cultura/Educación, Política, Economía, Historia, Religión, Sociedad, Ciencia, Tecnología, Literatura, Otros.\n"
-            "6. El campo 'summary' DEBE consistir únicamente en la selección de entre 1 y 3 frases textuales y literales del cuerpo del artículo que hablen directamente del libro evaluado. Las frases deben ser copiadas palabra por palabra sin resumir, parafrasear, corregir ni reescribir. Prioriza frases que mencionen el título del libro o al autor (si la relación es inequívoca) y aporten información sobre la obra (contenido, temática, valoración, recepción). No utilices títulos, menús, etiquetas ni texto promocional. Une las frases seleccionadas con espacios. Si no hay ninguna frase válida, deja el campo 'summary' completamente vacío.\n"
-            "7. EXTRACCIÓN DE METADATOS DE AUTOR Y FECHA (CRÍTICO):\n"
+            "7. El campo 'summary' DEBE consistir únicamente en la selección de entre 1 y 3 frases textuales y literales del cuerpo del artículo que hablen directamente del libro evaluado. Las frases deben ser copiadas palabra por palabra sin resumir, parafrasear, corregir ni reescribir. NO incluyas explicaciones generadas por IA ni atribuciones tipo '— Autor, Medio'. Prioriza frases que mencionen el título del libro o al autor (si la relación es inequívoca) y aporten información sobre la obra (contenido, temática, valoración, recepción). No utilices títulos, menús, etiquetas ni texto promocional. Une las frases seleccionadas con espacios. Si no hay ninguna frase válida, deja el campo 'summary' completamente vacío.\n"
+            "8. EXTRACCIÓN DE METADATOS DE AUTOR Y FECHA (CRÍTICO):\n"
             "   - NO inventes el autor ('publication_author') ni la fecha ('publication_date').\n"
             "   - Si no hay un autor de carne y hueso visible en el texto o en metadata_detected, deja 'publication_author' vacío, o usa 'Redacción' únicamente si ese término exacto aparece explícitamente en el texto.\n"
             "   - Si 'metadata_detected' trae una fecha de publicación ('published_date') fiable, respétala a menos que haya una contradicción evidente en el texto del artículo.\n"
-            "8. La justificación del score ('score_justification') debe explicar internamente de forma detallada por qué se ha asignado esta puntuación de relevancia o coincidencia. Este campo es puramente interno y NO se publica en WordPress.\n\n"
+            "9. La justificación del score ('score_justification') debe explicar internamente de forma detallada por qué se ha asignado esta puntuación de relevancia o coincidencia. Este campo es puramente interno y NO se publica en WordPress.\n\n"
             "GUÍA DE PUNTUACIÓN ('match_score') APLICAR LA ESCALA COMPLETA:\n"
             "- 90-100: Reseña/Artículo centrado claramente en el libro.\n"
             "- 70-89: Artículo claramente relevante sobre el libro, aunque no sea una reseña pura.\n"
-            "- 40-69: Artículo con tratamiento parcial del libro. Habla del libro durante una parte relevante, pero no es el tema único.\n"
-            "- 20-39: Mención breve, lateral, adaptación, representación, comentario corto o referencia contextual útil.\n"
-            "- 1-19: Mención muy débil pero real. Apenas unas líneas o frases descriptivas en el texto (ej. listado comentado), excluyendo bibliografía/catálogos automáticos.\n"
-            "- 0: No menciona el libro, habla de otro libro, o el libro aparece solo en índice/bibliografía/catálogo automático/footer.\n"
+            "- 40-69: Artículo con tratamiento parcial relevante del libro. Habla del libro durante una parte explícita, pero no es el tema único.\n"
+            "- 20-39: Mención breve pero explícita del libro con contexto relevante.\n"
+            "- 1-19: Mención muy débil (apenas unas palabras descriptivas en texto), excluyendo catálogos automáticos.\n"
+            "- 0: Adaptación audiovisual, noticia genérica sobre el autor sin análisis del libro, temática colateral sin mención de la obra, o mención solo en índice/footer/catálogo.\n"
         )
 
         user_content = (
@@ -192,7 +198,10 @@ class OpenAIAnalyzer:
             sentences = re.split(r'(?<=[.!?])\s+|(?<=[.!?]["\'«»“”‘’\)\]])\s+', summary_val)
             verified_sentences = []
             
-            forbidden_words = ["score", "puntuación", "puntuacion", "porcentaje", "relevancia", "tratamiento parcial", "justifica", "criterio"]
+            forbidden_words = [
+                "score", "puntuación", "puntuacion", "porcentaje", "relevancia",
+                "tratamiento parcial", "justifica", "criterio", "reseña válida", "el artículo trata de"
+            ]
             
             for s in sentences:
                 s = s.strip()
@@ -234,7 +243,12 @@ class OpenAIAnalyzer:
                 else:
                     logger.warning(f"Summary sentence skipped because it is not literal: {s_clean}")
             
-            verified_summary = " ".join(verified_sentences).strip()
+            joined = " ".join(verified_sentences).strip()
+            if joined:
+                clean_joined = joined.strip('«»').strip()
+                verified_summary = f"«{clean_joined}»"
+            else:
+                verified_summary = ""
             
         raw_result["summary"] = verified_summary
         return raw_result

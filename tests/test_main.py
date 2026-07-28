@@ -3373,11 +3373,9 @@ def test_summary_cleaning_filters_forbidden_words():
     from unittest.mock import patch, MagicMock
 
     mock_client = MagicMock()
-    # Structured outputs parse return value mock
     mock_choice = MagicMock()
     mock_choice.message.parsed = MagicMock()
     
-    # We simulate a summary returned by OpenAI that contains forbidden words in some sentences
     mock_choice.message.parsed.model_dump.return_value = {
         "is_valid": True,
         "match_score": 40,
@@ -3410,9 +3408,8 @@ def test_summary_cleaning_filters_forbidden_words():
              article_text="El artículo destaca el nombramiento de Unamuno. Esta mención al libro es muy lateral, justificando así un score de 40 por el tratamiento parcial de la obra. Unamuno es recordado en la Universidad de Salamanca."
          )
          
-         # The second sentence should have been stripped out due to forbidden words: "justificando", "score", "tratamiento parcial"
-         # The remaining sentences should be kept
          summary = res["summary"]
+         assert summary.startswith("«") and summary.endswith("»")
          assert "El artículo destaca el nombramiento de Unamuno." in summary
          assert "Unamuno es recordado en la Universidad de Salamanca." in summary
          assert "score" not in summary.lower()
@@ -3420,10 +3417,8 @@ def test_summary_cleaning_filters_forbidden_words():
          assert "tratamiento parcial" not in summary.lower()
          assert "justificando" not in summary.lower()
          
-         # score_justification remains intact
          assert res["score_justification"] == "Justificación interna del score 40."
          
-         # Verification log was triggered
          warning_calls = [c for c in mock_log.call_args_list if c[1].get("action") == "OPENAI_SUMMARY_FORBIDDEN_WORDS"]
          assert len(warning_calls) == 1
 
@@ -3436,7 +3431,6 @@ def test_summary_cleaning_empty_when_no_valid_literal_sentence():
     mock_choice = MagicMock()
     mock_choice.message.parsed = MagicMock()
     
-    # We simulate a summary that gets completely filtered out because all sentences have forbidden words
     mock_choice.message.parsed.model_dump.return_value = {
         "is_valid": True,
         "match_score": 40,
@@ -3468,7 +3462,6 @@ def test_summary_cleaning_empty_when_no_valid_literal_sentence():
              article_text="Justificando así un score de 40 por el tratamiento parcial de la relevancia."
          )
          
-         # Summary must be empty string as we don't invent content and the sentence contains forbidden words
          summary = res["summary"]
          assert summary == ""
 
@@ -3481,7 +3474,6 @@ def test_literal_summary_verification_success():
     mock_choice = MagicMock()
     mock_choice.message.parsed = MagicMock()
     
-    # We simulate a summary containing literal sentences, some with bullet lists or quotation marks
     mock_choice.message.parsed.model_dump.return_value = {
         "is_valid": True,
         "match_score": 80,
@@ -3500,7 +3492,6 @@ def test_literal_summary_verification_success():
     mock_client.beta.chat.completions.parse.return_value = mock_client
     mock_client.choices = [mock_choice]
 
-    # The article text contains these exact sentences (with some minor whitespace/newlines differences)
     article_text = (
         "El infinito en un junco es una obra maestra.\n\n"
         "El libro nos invita a viajar por la historia de los libros."
@@ -3519,15 +3510,123 @@ def test_literal_summary_verification_success():
              article_text=article_text
          )
          
-         # The summary should clean prefix numbers and quotation marks, 
-         # match against the text (with whitespace normalization), and join them
          summary = res["summary"]
+         assert summary.startswith("«") and summary.endswith("»")
          assert "El infinito en un junco es una obra maestra." in summary
          assert "El libro nos invita a viajar por la historia de los libros." in summary
-         assert '"' not in summary
          assert "1." not in summary
-         assert "«" not in summary
-         assert "»" not in summary
+
+
+def test_section_f_requirements_summary_and_relevance():
+    from app.services.openai_analyzer import openai_analyzer
+    from unittest.mock import patch, MagicMock
+
+    # Helper to mock OpenAI response
+    def create_mock_analyzer(parsed_dict):
+        mock_client = MagicMock()
+        mock_choice = MagicMock()
+        mock_choice.message.parsed = MagicMock()
+        mock_choice.message.parsed.model_dump.return_value = parsed_dict
+        mock_client.beta.chat.completions.parse.return_value = mock_client
+        mock_client.choices = [mock_choice]
+        return mock_client
+
+    article_corpus = (
+        "Esta es la primera frase literal sobre el libro. "
+        "Esta es la segunda frase literal con análisis de la obra. "
+        "Esta es la tercera frase sobre el argumento del libro."
+    )
+
+    # 1. OpenAI devuelve 1 frase literal que existe en article_text
+    dict_1 = {
+        "is_valid": True, "match_score": 85, "reason": "ok",
+        "detected_book_title": "T", "detected_book_author": "A", "content_type": "r",
+        "publication_name": "M", "publication_author": "Au", "publication_date": "2026-01-01",
+        "language": "es", "category": "Literatura",
+        "summary": "Esta es la primera frase literal sobre el libro.",
+        "score_justification": "ok"
+    }
+    with patch.object(openai_analyzer, "get_client", return_value=create_mock_analyzer(dict_1)), \
+         patch("app.services.logger_service.logger_service.log"):
+        res = openai_analyzer.analyze_article("1", "T", "A", "q", "u", "t", article_corpus)
+        assert res["summary"] == "«Esta es la primera frase literal sobre el libro.»"
+
+    # 2. OpenAI devuelve 2 o 3 frases literales válidas
+    dict_2 = dict_1.copy()
+    dict_2["summary"] = (
+        "Esta es la primera frase literal sobre el libro. "
+        "Esta es la segunda frase literal con análisis de la obra. "
+        "Esta es la tercera frase sobre el argumento del libro."
+    )
+    with patch.object(openai_analyzer, "get_client", return_value=create_mock_analyzer(dict_2)), \
+         patch("app.services.logger_service.logger_service.log"):
+        res = openai_analyzer.analyze_article("1", "T", "A", "q", "u", "t", article_corpus)
+        assert res["summary"] == f"«{article_corpus}»"
+
+    # 3. OpenAI devuelve frase que NO existe en article_text -> descartada
+    dict_3 = dict_1.copy()
+    dict_3["summary"] = "Esta frase inventada no existe en el artículo original."
+    with patch.object(openai_analyzer, "get_client", return_value=create_mock_analyzer(dict_3)), \
+         patch("app.services.logger_service.logger_service.log"):
+        res = openai_analyzer.analyze_article("1", "T", "A", "q", "u", "t", article_corpus)
+        assert res["summary"] == ""
+
+    # 4. OpenAI devuelve sólo frases no verificables -> summary queda ""
+    dict_4 = dict_1.copy()
+    dict_4["summary"] = "Frase falsa uno. Frase falsa dos con reseña válida."
+    with patch.object(openai_analyzer, "get_client", return_value=create_mock_analyzer(dict_4)), \
+         patch("app.services.logger_service.logger_service.log"):
+        res = openai_analyzer.analyze_article("1", "T", "A", "q", "u", "t", article_corpus)
+        assert res["summary"] == ""
+
+    # 5. Frases con numeración o viñetas -> limpiadas y verificadas
+    dict_5 = dict_1.copy()
+    dict_5["summary"] = "1. Esta es la primera frase literal sobre el libro. — Esta es la segunda frase literal con análisis de la obra."
+    with patch.object(openai_analyzer, "get_client", return_value=create_mock_analyzer(dict_5)), \
+         patch("app.services.logger_service.logger_service.log"):
+        res = openai_analyzer.analyze_article("1", "T", "A", "q", "u", "t", article_corpus)
+        assert res["summary"] == "«Esta es la primera frase literal sobre el libro. Esta es la segunda frase literal con análisis de la obra.»"
+
+    # 6. Comillas externas -> limpiadas y resultado entrecomillado correctamente en «...»
+    dict_6 = dict_1.copy()
+    dict_6["summary"] = '"Esta es la primera frase literal sobre el libro."'
+    with patch.object(openai_analyzer, "get_client", return_value=create_mock_analyzer(dict_6)), \
+         patch("app.services.logger_service.logger_service.log"):
+        res = openai_analyzer.analyze_article("1", "T", "A", "q", "u", "t", article_corpus)
+        assert res["summary"] == "«Esta es la primera frase literal sobre el libro.»"
+
+    # 7. Resumen redactado / paráfrasis no literal -> rechazado
+    dict_7 = dict_1.copy()
+    dict_7["summary"] = "El artículo analiza en profundidad los temas principales del libro y su trascendencia histórica."
+    with patch.object(openai_analyzer, "get_client", return_value=create_mock_analyzer(dict_7)), \
+         patch("app.services.logger_service.logger_service.log"):
+        res = openai_analyzer.analyze_article("1", "T", "A", "q", "u", "t", article_corpus)
+        assert res["summary"] == ""
+
+    # 8. Artículo sobre adaptación audiovisual o noticia genérica del autor -> rechazado
+    dict_8 = dict_1.copy()
+    dict_8["is_valid"] = False
+    dict_8["match_score"] = 0
+    dict_8["reason"] = "El artículo trata sobre la adaptación cinematográfica y no sobre el libro impreso."
+    dict_8["summary"] = ""
+    with patch.object(openai_analyzer, "get_client", return_value=create_mock_analyzer(dict_8)), \
+         patch("app.services.logger_service.logger_service.log"):
+        res = openai_analyzer.analyze_article("1", "T", "A", "q", "u", "t", article_corpus)
+        assert res["is_valid"] is False
+        assert res["match_score"] == 0
+        assert res["summary"] == ""
+
+    # 9. Artículo que menciona directamente el libro con comentario o información sustancial -> aceptado
+    dict_9 = dict_1.copy()
+    dict_9["is_valid"] = True
+    dict_9["match_score"] = 90
+    dict_9["summary"] = "Esta es la primera frase literal sobre el libro."
+    with patch.object(openai_analyzer, "get_client", return_value=create_mock_analyzer(dict_9)), \
+         patch("app.services.logger_service.logger_service.log"):
+        res = openai_analyzer.analyze_article("1", "T", "A", "q", "u", "t", article_corpus)
+        assert res["is_valid"] is True
+        assert res["match_score"] == 90
+        assert res["summary"] == "«Esta es la primera frase literal sobre el libro.»"
 
 
 def test_query_builder_comma_volume_and_negative_filters():
